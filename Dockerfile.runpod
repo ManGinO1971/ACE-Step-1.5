@@ -1,0 +1,33 @@
+ARG CUDA_VERSION=12.8.1
+ARG PYTHON_VERSION=3.11
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common build-essential git curl wget \
+        libsndfile1 libsndfile1-dev ffmpeg libffi-dev libssl-dev \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+COPY . /app/
+
+RUN uv sync --frozen --no-dev --python python3.11
+
+RUN mkdir -p /app/checkpoints /app/output
+
+ENV TOKENIZERS_PARALLELISM=false
+ENV ACESTEP_API_HOST=0.0.0.0
+
+EXPOSE 5000
+
+CMD ["uv", "run", "python", "runpod_entrypoint.py"]
