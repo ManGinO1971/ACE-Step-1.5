@@ -30,4 +30,4 @@ ENV ACESTEP_API_HOST=0.0.0.0
 
 EXPOSE 5000
 
-CMD ["uv", "run", "python", "runpod_entrypoint.py"]
+CMD ["sh", "-c", "rm -rf /app/checkpoints && ln -s /runpod-volume /app/checkpoints && uv run python runpod_entrypoint.py"]
