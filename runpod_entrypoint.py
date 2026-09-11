@@ -12,7 +12,16 @@ Diese Datei aendert das originale acestep-Paket NICHT - sie macht nur:
      gleicher System-Prompt), nur eben auf der schon warmen GPU statt auf
      dem Mac. Reiner HIELTECH-Zusatz, kein Teil des originalen ACE-Step-
      Projekts,
-  4) startet uvicorn auf dem Port, den RunPod erwartet.
+  4) fuegt eine zusaetzliche Route "/v1/hieltech_translate" hinzu:
+     uebersetzt Songtext (inkl. Jamaica-Patois-Sonderbehandlung) per
+     TranslateGemma-4B direkt auf der RunPod-GPU - inhaltlich identisch
+     zum lokalen translate_lyrics.py (gleiches Modell, gleiche
+     Patois-Sonderlogik/Bereinigung), nur eben auf der schon warmen GPU
+     statt auf dem Mac. Braucht die Umgebungsvariable HF_TOKEN (Hugging-
+     Face-Zugriffstoken mit akzeptierter Lizenz fuer das gated Modell),
+     die ueber die RunPod-Endpoint-Einstellungen gesetzt wird, NICHT im
+     Code steht,
+  5) startet uvicorn auf dem Port, den RunPod erwartet.
 
 Nichts hier hat mit Preisen/Lizenzen/Geschaeftslogik zu tun - es startet
 nur den bestehenden, quelloffenen REST-Server so, dass RunPod damit reden
@@ -191,6 +200,216 @@ async def _hieltech_generate_lyrics(request: Request):
     formatted = _parse_and_reorder(raw, sections)
 
     return {"lyrics": formatted}
+
+
+# =============================================================================
+# HIELTECH: eigene Uebersetzung (inkl. Jamaica-Patois) auf der RunPod-GPU
+# =============================================================================
+
+_TRANSLATE_MODEL_NAME = "google/translategemma-4b-it"
+_translate_lock = threading.Lock()
+_translate_processor = None
+_translate_model = None
+
+# Codepoints 0 bis 591 (dezimal, 0x24F hex) decken Basic Latin, Latin-1
+# Supplement und Latin Extended-A/B ab - reicht fuer Englisch/Patois
+# inkl. gaengiger Sonderzeichen; alles darueber (Devanagari, Kyrillisch,
+# CJK, Arabisch, Thai usw.) zaehlt als Schrift-Ausreisser (siehe
+# _translate_looks_like_wrong_script unten). Identische Logik zum lokalen
+# translate_lyrics.py.
+_TRANSLATE_LATIN_MAX_CODEPOINT = 591
+
+
+def _get_translate_model():
+    """Laedt Prozessor/Modell beim ersten Aufruf und behaelt sie im
+    Speicher (Singleton), genau wie bei der Lyrics-Generierung oben.
+    HF_TOKEN kommt bewusst aus der Umgebung (RunPod-Endpoint-Einstellungen),
+    nicht aus dem Code - das gated Google-Modell braucht einen Hugging-Face-
+    Zugriffstoken mit akzeptierter Lizenz."""
+    global _translate_processor, _translate_model
+    with _translate_lock:
+        if _translate_model is None:
+            import torch
+            from transformers import AutoProcessor, AutoModelForCausalLM
+
+            hf_token = os.environ.get("HF_TOKEN")
+            _translate_processor = AutoProcessor.from_pretrained(_TRANSLATE_MODEL_NAME, token=hf_token)
+            _translate_model = AutoModelForCausalLM.from_pretrained(
+                _TRANSLATE_MODEL_NAME, dtype=torch.float32, token=hf_token
+            )
+            if torch.cuda.is_available():
+                _translate_model = _translate_model.to("cuda")
+    return _translate_processor, _translate_model
+
+
+def _translate_to_model_device(model, inputs):
+    if next(model.parameters()).is_cuda:
+        return {k: v.to("cuda") for k, v in inputs.items()}
+    return inputs
+
+
+def _translate_normal(processor, model, text, target_lang_code, source_lang_code="en", sample=False, temperature=0.7):
+    import torch
+    messages = [
+        {'role': 'user', 'content': [
+            {'type': 'text', 'source_lang_code': source_lang_code, 'target_lang_code': target_lang_code, 'text': text}
+        ]}
+    ]
+    inputs = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors='pt')
+    inputs = _translate_to_model_device(model, inputs)
+    gen_kwargs = {"max_new_tokens": 200}
+    if sample:
+        gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9})
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+    result = processor.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    return result.strip()
+
+
+def _translate_lang_code_candidates(code):
+    """Nutzerfund Sept 2026 (identisch zum lokalen translate_lyrics.py):
+    manche Sprachcodes (z.B. "zh-CN") brechen im Modell-Chat-Template ab,
+    obwohl andere im exakt gleichen Format klappen - deshalb mehrere
+    plausible Schreibweisen der Reihe nach probieren."""
+    seen = []
+
+    def add(c):
+        if c and c not in seen:
+            seen.append(c)
+
+    add(code)
+    if "-" in code:
+        add(code.replace("-", "_"))
+    if "_" in code:
+        add(code.replace("_", "-"))
+    base = code.replace("_", "-").split("-")[0]
+    add(base)
+    if base == "zh":
+        add("zh-Hans")
+        add("zh_Hans")
+        add("zh-Hans-CN")
+    return seen
+
+
+def _translate_normal_with_fallback(processor, model, text, target_lang_code, source_lang_code="en"):
+    last_err = None
+    for code in _translate_lang_code_candidates(target_lang_code):
+        try:
+            result = _translate_normal(processor, model, text, code, source_lang_code)
+            if result:
+                return result
+        except Exception as e:
+            last_err = e
+            continue
+    try:
+        result = _translate_normal(processor, model, text, target_lang_code, source_lang_code, sample=True, temperature=0.7)
+        if result:
+            return result
+    except Exception as e:
+        last_err = e
+    # Letzte Sicherheit: lieber unuebersetzten Text als ein kompletter
+    # Absturz - identisch zum lokalen Verhalten am Mac.
+    return text
+
+
+def _translate_patois(processor, model, text, sample=False, temperature=0.8, num_beams=1):
+    import torch
+    prompt = (
+        f"<start_of_turn>user\nTranslate this English text into authentic Jamaican Patois "
+        f"(Jamaican Creole), using real Patois vocabulary and grammar, not just English with "
+        f"an accent. Output ONLY the translated lines, nothing else -- no explanation, no "
+        f"commentary, no intro phrase:\n{text}<end_of_turn>\n<start_of_turn>model\n"
+    )
+    inputs = processor.tokenizer(prompt, return_tensors='pt')
+    inputs = _translate_to_model_device(model, inputs)
+    gen_kwargs = {"max_new_tokens": 200}
+    if sample:
+        gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9})
+    elif num_beams > 1:
+        gen_kwargs.update({"num_beams": num_beams, "early_stopping": True})
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+    result = processor.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    return _clean_patois_output(result)
+
+
+def _clean_patois_output(text):
+    lines = text.split("\n")
+    cleaned = []
+    skip_rest = False
+    meta_markers = [
+        "explanation of choices", "explanation:", "note:", "alright, listen",
+        "this translation aims", "**explanation", "here's the translation",
+        "translated text:", "patois translation:",
+    ]
+    for line in lines:
+        stripped = line.strip()
+        lower = stripped.lower()
+        if not stripped:
+            continue
+        if any(m in lower for m in meta_markers):
+            skip_rest = True
+            continue
+        if skip_rest:
+            continue
+        if stripped.startswith("*") or stripped.startswith("#"):
+            continue
+        if len(stripped) > 1 and stripped[0] in ('"', chr(39)) and stripped[-1] == stripped[0]:
+            stripped = stripped[1:-1].strip()
+        cleaned.append(stripped)
+    result = "\n".join(cleaned)
+    if len(result) > 1 and result[0] in ('"', chr(39)) and result[-1] == result[0]:
+        result = result[1:-1].strip()
+    return result
+
+
+def _translate_looks_like_wrong_script(text):
+    """Identische Logik zum lokalen translate_lyrics.py: Jamaica-Patois
+    laeuft ueber einen rohen Prompt statt das strukturierte Uebersetzungs-
+    Template und driftet dadurch gelegentlich in eine andere Sprache/
+    Schrift ab - ein hoher Anteil nicht-lateinischer Zeichen ist ein
+    zuverlaessiges Anzeichen dafuer."""
+    stripped = re.sub(r'\s+', '', text)
+    if not stripped:
+        return False
+    non_latin = sum(1 for ch in stripped if ord(ch) > _TRANSLATE_LATIN_MAX_CODEPOINT)
+    return non_latin / len(stripped) > 0.15
+
+
+@app.post("/v1/hieltech_translate")
+async def _hieltech_translate(request: Request):
+    """Uebersetzt Songtext (Abschnitte per '---' getrennt) auf der GPU -
+    identische Logik zum lokalen translate_lyrics.py (Mac).
+
+    Erwartet JSON-Body: {"text": "...---...", "target_lang_code": "jam"}
+    Antwort: {"translated_lyrics": "...uebersetzt, '---'-Struktur bleibt erhalten..."}
+    """
+    body = await request.json()
+    text = body.get("text") or ""
+    target_lang_code = (body.get("target_lang_code") or "en").strip()
+
+    if target_lang_code == "en" or not text.strip():
+        return {"translated_lyrics": text}
+
+    processor, model = _get_translate_model()
+
+    sections = text.split("---")
+    translated_sections = []
+    for section in sections:
+        lines = [l for l in section.split("\n") if l.strip()]
+        section_text = "\n".join(lines)
+        if not section_text.strip():
+            continue
+        if target_lang_code == "jam":
+            translated = _translate_patois(processor, model, section_text, num_beams=4)
+            if _translate_looks_like_wrong_script(translated):
+                retry = _translate_patois(processor, model, section_text, sample=True, temperature=0.8)
+                translated = retry if not _translate_looks_like_wrong_script(retry) else section_text
+        else:
+            translated = _translate_normal_with_fallback(processor, model, section_text, target_lang_code)
+        translated_sections.append(translated)
+
+    return {"translated_lyrics": "\n---\n".join(translated_sections)}
 
 
 if __name__ == "__main__":
