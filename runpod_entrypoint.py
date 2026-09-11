@@ -233,6 +233,19 @@ def _get_translate_model():
             from transformers import AutoProcessor, AutoModelForCausalLM
 
             hf_token = os.environ.get("HF_TOKEN")
+            # Debug-Ausgabe (nur Laenge/erste-letzte Zeichen, NIE der volle
+            # Wert) - hilft zu erkennen ob RunPod versehentlich ein
+            # Leerzeichen/Zeilenumbruch mit reinkopiert hat.
+            if hf_token:
+                print(
+                    f"[DEBUG hieltech_translate] HF_TOKEN vorhanden, "
+                    f"Laenge={len(hf_token)}, "
+                    f"repr_anfang={hf_token[:6]!r}, repr_ende={hf_token[-4:]!r}",
+                    flush=True,
+                )
+                hf_token = hf_token.strip()
+            else:
+                print("[DEBUG hieltech_translate] HF_TOKEN ist LEER/None in os.environ!", flush=True)
             _translate_processor = AutoProcessor.from_pretrained(_TRANSLATE_MODEL_NAME, token=hf_token)
             _translate_model = AutoModelForCausalLM.from_pretrained(
                 _TRANSLATE_MODEL_NAME, dtype=torch.float32, token=hf_token
