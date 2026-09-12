@@ -29,6 +29,7 @@ kann.
 """
 import os
 import re
+import sys
 import threading
 
 from fastapi import Response, Request
@@ -236,20 +237,37 @@ def _get_translate_model():
             # Debug-Ausgabe (nur Laenge/erste-letzte Zeichen, NIE der volle
             # Wert) - hilft zu erkennen ob RunPod versehentlich ein
             # Leerzeichen/Zeilenumbruch mit reinkopiert hat.
+            # Bewusst auf sys.stderr statt print()/stdout, weil stdout im
+            # RunPod-Log-Viewer offenbar nicht zuverlaessig ankommt,
+            # waehrend unbehandelte Tracebacks (die auch ueber stderr
+            # laufen) sichtbar sind.
             if hf_token:
                 print(
                     f"[DEBUG hieltech_translate] HF_TOKEN vorhanden, "
                     f"Laenge={len(hf_token)}, "
                     f"repr_anfang={hf_token[:6]!r}, repr_ende={hf_token[-4:]!r}",
-                    flush=True,
+                    file=sys.stderr, flush=True,
                 )
                 hf_token = hf_token.strip()
             else:
-                print("[DEBUG hieltech_translate] HF_TOKEN ist LEER/None in os.environ!", flush=True)
-            _translate_processor = AutoProcessor.from_pretrained(_TRANSLATE_MODEL_NAME, token=hf_token)
-            _translate_model = AutoModelForCausalLM.from_pretrained(
-                _TRANSLATE_MODEL_NAME, dtype=torch.float32, token=hf_token
+                print("[DEBUG hieltech_translate] HF_TOKEN ist LEER/None in os.environ!", file=sys.stderr, flush=True)
+            token_debug = (
+                f"HF_TOKEN-Debug: vorhanden={bool(hf_token)}, "
+                f"Laenge={len(hf_token) if hf_token else 0}, "
+                f"anfang={(hf_token[:6] if hf_token else None)!r}, "
+                f"ende={(hf_token[-4:] if hf_token else None)!r}"
             )
+            try:
+                _translate_processor = AutoProcessor.from_pretrained(_TRANSLATE_MODEL_NAME, token=hf_token)
+                _translate_model = AutoModelForCausalLM.from_pretrained(
+                    _TRANSLATE_MODEL_NAME, dtype=torch.float32, token=hf_token
+                )
+            except Exception as e:
+                # token_debug wird bewusst der Fehlermeldung angehaengt,
+                # damit die Info auch dann in der RunPod-Traceback-Ausgabe
+                # landet, wenn separate print()/stderr-Zeilen im Log-Viewer
+                # aus irgendeinem Grund nicht ankommen.
+                raise RuntimeError(f"{token_debug} | Original-Fehler: {e}") from e
             if torch.cuda.is_available():
                 _translate_model = _translate_model.to("cuda")
     return _translate_processor, _translate_model
