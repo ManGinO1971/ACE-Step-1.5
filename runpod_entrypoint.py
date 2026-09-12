@@ -268,8 +268,13 @@ def _get_translate_model():
                 # landet, wenn separate print()/stderr-Zeilen im Log-Viewer
                 # aus irgendeinem Grund nicht ankommen.
                 raise RuntimeError(f"{token_debug} | Original-Fehler: {e}") from e
-            if torch.cuda.is_available():
-                _translate_model = _translate_model.to("cuda")
+            # Bewusst NICHT auf die GPU verschieben: die ACE-Step-Musikmodelle
+            # (DiT + 5Hz-LM) belegen bereits fast den kompletten GPU-Speicher
+            # (~19 von 19.6 GB), sodass fuer TranslateGemma-4B (~16 GB in
+            # float32) kein Platz mehr bleibt - fuehrt sonst zu
+            # torch.OutOfMemoryError. Uebersetzung laeuft daher bewusst auf
+            # der CPU (etwas langsamer, aber zuverlaessig, keine Konkurrenz
+            # um GPU-Speicher mit der Song-Erzeugung).
     return _translate_processor, _translate_model
 
 
