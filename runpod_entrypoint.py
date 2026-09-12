@@ -437,7 +437,13 @@ async def _hieltech_translate(request: Request):
         if not section_text.strip():
             continue
         if target_lang_code == "jam":
-            translated = _translate_patois(processor, model, section_text, num_beams=4)
+            # num_beams=1 (statt 4) bewusst hier auf der CPU-Interimsloesung:
+            # Beam-Search mit mehreren Kandidaten ist auf der CPU deutlich
+            # langsamer als auf der GPU und fuehrte zu Zeitueberschreitungen.
+            # Sobald die Uebersetzung wieder auf der GPU laeuft (TODO, siehe
+            # Projektnotizen), kann hier wieder num_beams=4 fuer bessere
+            # Patois-Qualitaet verwendet werden.
+            translated = _translate_patois(processor, model, section_text, num_beams=1)
             if _translate_looks_like_wrong_script(translated):
                 retry = _translate_patois(processor, model, section_text, sample=True, temperature=0.8)
                 translated = retry if not _translate_looks_like_wrong_script(retry) else section_text
