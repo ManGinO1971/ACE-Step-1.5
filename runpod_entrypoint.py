@@ -259,22 +259,28 @@ def _get_translate_model():
             )
             try:
                 _translate_processor = AutoProcessor.from_pretrained(_TRANSLATE_MODEL_NAME, token=hf_token)
+                # Update (12. Sept): laeuft jetzt wieder bewusst auf der GPU,
+                # in bfloat16 statt float32 (halbiert den Speicherbedarf auf
+                # ca. 8GB statt ca. 16GB). Vorher (CPU/float32) war nur eine
+                # Interimsloesung, weil die ACE-Step-Musikmodelle (DiT+5Hz-LM,
+                # ~19GB) den alten 19,6GB-GPU-Tier (A4500) bereits komplett
+                # ausgelastet hatten - CPU-Inferenz eines 4B-Modells war fuer
+                # echte (v.a. mobile) Nutzer unzumutbar langsam. Loesung:
+                # Umstellung des gesamten RunPod-Endpoints auf einen 48GB-
+                # GPU-Tier (A6000/A40), dadurch ist jetzt genug Platz fuer
+                # beide Modelle gleichzeitig auf der GPU (~19GB + ~8GB =
+                # ~27GB von 48GB, komfortabler Puffer fuer KV-Cache etc.).
                 _translate_model = AutoModelForCausalLM.from_pretrained(
-                    _TRANSLATE_MODEL_NAME, dtype=torch.float32, token=hf_token
+                    _TRANSLATE_MODEL_NAME, dtype=torch.bfloat16, token=hf_token
                 )
+                if torch.cuda.is_available():
+                    _translate_model = _translate_model.to("cuda")
             except Exception as e:
                 # token_debug wird bewusst der Fehlermeldung angehaengt,
                 # damit die Info auch dann in der RunPod-Traceback-Ausgabe
                 # landet, wenn separate print()/stderr-Zeilen im Log-Viewer
                 # aus irgendeinem Grund nicht ankommen.
                 raise RuntimeError(f"{token_debug} | Original-Fehler: {e}") from e
-            # Bewusst NICHT auf die GPU verschieben: die ACE-Step-Musikmodelle
-            # (DiT + 5Hz-LM) belegen bereits fast den kompletten GPU-Speicher
-            # (~19 von 19.6 GB), sodass fuer TranslateGemma-4B (~16 GB in
-            # float32) kein Platz mehr bleibt - fuehrt sonst zu
-            # torch.OutOfMemoryError. Uebersetzung laeuft daher bewusst auf
-            # der CPU (etwas langsamer, aber zuverlaessig, keine Konkurrenz
-            # um GPU-Speicher mit der Song-Erzeugung).
     return _translate_processor, _translate_model
 
 
@@ -437,13 +443,12 @@ async def _hieltech_translate(request: Request):
         if not section_text.strip():
             continue
         if target_lang_code == "jam":
-            # num_beams=1 (statt 4) bewusst hier auf der CPU-Interimsloesung:
-            # Beam-Search mit mehreren Kandidaten ist auf der CPU deutlich
-            # langsamer als auf der GPU und fuehrte zu Zeitueberschreitungen.
-            # Sobald die Uebersetzung wieder auf der GPU laeuft (TODO, siehe
-            # Projektnotizen), kann hier wieder num_beams=4 fuer bessere
-            # Patois-Qualitaet verwendet werden.
-            translated = _translate_patois(processor, model, section_text, num_beams=1)
+            # num_beams=4 (Update 12. Sept, zurueckgestellt): jetzt wieder
+            # auf der GPU (siehe _get_translate_model), Beam-Search mit
+            # mehreren Kandidaten ist dort schnell genug und liefert
+            # bessere Patois-Qualitaet als num_beams=1 (das war nur die
+            # CPU-Interimsloesung).
+            translated = _translate_patois(processor, model, section_text, num_beams=4)
             if _translate_looks_like_wrong_script(translated):
                 retry = _translate_patois(processor, model, section_text, sample=True, temperature=0.8)
                 translated = retry if not _translate_looks_like_wrong_script(retry) else section_text
