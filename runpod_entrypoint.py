@@ -375,6 +375,52 @@ def _translate_patois(processor, model, text, sample=False, temperature=0.8, num
     return _clean_patois_output(result)
 
 
+def _translate_darija(processor, model, text, sample=False, temperature=0.8, num_beams=1):
+    """Nutzerwunsch (15. Sept): Darija (gesprochenes Marokkanisch/Algerisch),
+    wichtig fuer Raï- und Gnawa-Songtexte. Genau wie Jamaica Patois ist
+    Darija KEIN offizieller Zielsprachcode, den TranslateGemma ueber das
+    strukturierte Uebersetzungs-Template kennt (das liefert bestenfalls
+    Hocharabisch/Fus'ha) - deshalb hier derselbe Ansatz wie bei
+    _translate_patois oben: ein roher Prompt, der das Modell explizit auf
+    authentisches Darija in arabischer Schrift festlegt (nicht Hocharabisch,
+    nicht lateinische Umschrift/Arabizi)."""
+    import torch
+    prompt = (
+        f"<start_of_turn>user\nTranslate this English text into authentic Moroccan/Algerian "
+        f"Darija (the everyday spoken Maghrebi Arabic dialect), written in Arabic script. "
+        f"Use real Darija vocabulary and grammar (including common French/Berber loanwords "
+        f"where that is how Darija is actually spoken) -- NOT Modern Standard Arabic (Fus'ha) "
+        f"and NOT a Latin-letter transcription. Output ONLY the translated lines, nothing "
+        f"else -- no explanation, no commentary, no intro phrase:\n{text}<end_of_turn>\n"
+        f"<start_of_turn>model\n"
+    )
+    inputs = processor.tokenizer(prompt, return_tensors='pt')
+    inputs = _translate_to_model_device(model, inputs)
+    gen_kwargs = {"max_new_tokens": 200}
+    if sample:
+        gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9})
+    elif num_beams > 1:
+        gen_kwargs.update({"num_beams": num_beams, "early_stopping": True})
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+    result = processor.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    return _clean_patois_output(result)
+
+
+def _translate_looks_untranslated(text):
+    """Gegenstueck zu _translate_looks_like_wrong_script (dort: Patois soll
+    lateinisch bleiben, viel Nicht-Latein ist verdaechtig). Darija soll
+    dagegen in arabischer Schrift zurueckkommen - bleibt die Ausgabe
+    ueberwiegend lateinisch/ASCII, hat das Modell vermutlich nur den
+    englischen Text wiederholt oder ignoriert die Sonderanweisung. Ein
+    hoher Lateinanteil ist hier also das Fehler-Anzeichen, nicht Nicht-Latein."""
+    stripped = re.sub(r'\s+', '', text)
+    if not stripped:
+        return False
+    latin = sum(1 for ch in stripped if ch.isascii() and ch.isalpha())
+    return latin / len(stripped) > 0.5
+
+
 def _clean_patois_output(text):
     lines = text.split("\n")
     cleaned = []
@@ -452,6 +498,15 @@ async def _hieltech_translate(request: Request):
             if _translate_looks_like_wrong_script(translated):
                 retry = _translate_patois(processor, model, section_text, sample=True, temperature=0.8)
                 translated = retry if not _translate_looks_like_wrong_script(retry) else section_text
+        elif target_lang_code == "ary":
+            # Darija (Nutzerwunsch 15. Sept) - gleiches Muster wie Jamaica
+            # Patois oben, nur mit umgekehrter Skript-Erwartung (siehe
+            # _translate_looks_untranslated): hier ist viel LATEIN das
+            # Fehler-Anzeichen, nicht Nicht-Latein.
+            translated = _translate_darija(processor, model, section_text, num_beams=4)
+            if _translate_looks_untranslated(translated):
+                retry = _translate_darija(processor, model, section_text, sample=True, temperature=0.8)
+                translated = retry if not _translate_looks_untranslated(retry) else section_text
         else:
             translated = _translate_normal_with_fallback(processor, model, section_text, target_lang_code)
         translated_sections.append(translated)
