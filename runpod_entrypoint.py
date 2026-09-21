@@ -354,11 +354,17 @@ def _translate_normal_with_fallback(processor, model, text, target_lang_code, so
     return text
 
 
-def _translate_patois(processor, model, text, sample=False, temperature=0.8, num_beams=1):
+def _translate_patois(processor, model, text, sample=False, temperature=0.8, num_beams=1, source_lang_name="English"):
     import torch
+    # source_lang_name (Runde 75): Standard bleibt "English", da die
+    # Songtext-Uebersetzung (Haupt-Anwendungsfall dieser Funktion) den
+    # Songtext immer zuerst auf Englisch erzeugt. Der Admin-Systemhinweis
+    # (siehe /v1/hieltech_translate_text) schreibt dagegen auf Deutsch und
+    # gibt hier "German" durch, damit der Prompt korrekt beschreibt, aus
+    # welcher Sprache tatsaechlich uebersetzt wird.
     prompt = (
-        f"<start_of_turn>user\nTranslate this English text into authentic Jamaican Patois "
-        f"(Jamaican Creole), using real Patois vocabulary and grammar, not just English with "
+        f"<start_of_turn>user\nTranslate this {source_lang_name} text into authentic Jamaican Patois "
+        f"(Jamaican Creole), using real Patois vocabulary and grammar, not just {source_lang_name} with "
         f"an accent. Output ONLY the translated lines, nothing else -- no explanation, no "
         f"commentary, no intro phrase:\n{text}<end_of_turn>\n<start_of_turn>model\n"
     )
@@ -547,6 +553,55 @@ async def _hieltech_translate(request: Request):
         translated_sections.append(translated)
 
     return {"translated_lyrics": "\n---\n".join(translated_sections)}
+
+
+# Menschlicher Name je Sprachcode, NUR fuer die Prompt-Formulierung unten
+# (_translate_patois braucht "Translate this <X> text..." - das eigentliche
+# NLLB-artige Modell (_translate_normal_with_fallback) nutzt stattdessen den
+# rohen source_lang_code direkt, keine Namen noetig).
+_PROMPT_LANG_NAME = {
+    "de": "German", "en": "English", "fr": "French", "es": "Spanish",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "tr": "Turkish",
+    "pl": "Polish", "el": "Greek", "ru": "Russian", "ar": "Arabic",
+    "hi": "Hindi", "sw": "Swahili", "zh": "Chinese", "ja": "Japanese",
+    "ko": "Korean", "vi": "Vietnamese", "th": "Thai",
+}
+
+
+@app.post("/v1/hieltech_translate_text")
+async def _hieltech_translate_text(request: Request):
+    """Einfache, generische Text-Uebersetzung - KEIN Songtext (keine '---'-
+    Abschnitte, keine Patois/Darija-Sonderpfade fuer kreative Songtext-
+    Formulierung). Eingefuehrt fuer den Admin-Systemhinweis (Nutzerwunsch,
+    21. Sept, Runde 75): der Admin schreibt IMMER auf Deutsch, der Text wird
+    hier in jede App-UI-Sprache uebersetzt (inkl. "jam"/Jamaica Patois, das
+    als einzige der 20 UI-Sprachen eine eigene kreative Vorlage statt des
+    normalen Uebersetzungsmodells braucht - "ary"/Darija ist dagegen KEINE
+    App-UI-Sprache und taucht hier nie als Zielsprache auf).
+
+    Erwartet JSON-Body: {"text": "...", "source_lang_code": "de", "target_lang_code": "fr"}
+    Antwort: {"translated_text": "..."}
+    """
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    source_lang_code = (body.get("source_lang_code") or "de").strip().lower()
+    target_lang_code = (body.get("target_lang_code") or "en").strip().lower()
+
+    if not text or target_lang_code == source_lang_code:
+        return {"translated_text": text}
+
+    processor, model = _get_translate_model()
+
+    if target_lang_code == "jam":
+        source_name = _PROMPT_LANG_NAME.get(source_lang_code, "English")
+        translated = _translate_patois(processor, model, text, num_beams=4, source_lang_name=source_name)
+        if _translate_looks_like_wrong_script(translated):
+            retry = _translate_patois(processor, model, text, sample=True, temperature=0.8, source_lang_name=source_name)
+            translated = retry if not _translate_looks_like_wrong_script(retry) else text
+    else:
+        translated = _translate_normal_with_fallback(processor, model, text, target_lang_code, source_lang_code=source_lang_code)
+
+    return {"translated_text": translated}
 
 
 if __name__ == "__main__":
