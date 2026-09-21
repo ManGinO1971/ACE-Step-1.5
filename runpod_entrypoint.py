@@ -375,52 +375,6 @@ def _translate_patois(processor, model, text, sample=False, temperature=0.8, num
     return _clean_patois_output(result)
 
 
-def _translate_darija(processor, model, text, sample=False, temperature=0.8, num_beams=1):
-    """Nutzerwunsch (15. Sept): Darija (gesprochenes Marokkanisch/Algerisch),
-    wichtig fuer Raï- und Gnawa-Songtexte. Genau wie Jamaica Patois ist
-    Darija KEIN offizieller Zielsprachcode, den TranslateGemma ueber das
-    strukturierte Uebersetzungs-Template kennt (das liefert bestenfalls
-    Hocharabisch/Fus'ha) - deshalb hier derselbe Ansatz wie bei
-    _translate_patois oben: ein roher Prompt, der das Modell explizit auf
-    authentisches Darija in arabischer Schrift festlegt (nicht Hocharabisch,
-    nicht lateinische Umschrift/Arabizi)."""
-    import torch
-    prompt = (
-        f"<start_of_turn>user\nTranslate this English text into authentic Moroccan/Algerian "
-        f"Darija (the everyday spoken Maghrebi Arabic dialect), written in Arabic script. "
-        f"Use real Darija vocabulary and grammar (including common French/Berber loanwords "
-        f"where that is how Darija is actually spoken) -- NOT Modern Standard Arabic (Fus'ha) "
-        f"and NOT a Latin-letter transcription. Output ONLY the translated lines, nothing "
-        f"else -- no explanation, no commentary, no intro phrase:\n{text}<end_of_turn>\n"
-        f"<start_of_turn>model\n"
-    )
-    inputs = processor.tokenizer(prompt, return_tensors='pt')
-    inputs = _translate_to_model_device(model, inputs)
-    gen_kwargs = {"max_new_tokens": 200}
-    if sample:
-        gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9})
-    elif num_beams > 1:
-        gen_kwargs.update({"num_beams": num_beams, "early_stopping": True})
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **gen_kwargs)
-    result = processor.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-    return _clean_patois_output(result)
-
-
-def _translate_looks_untranslated(text):
-    """Gegenstueck zu _translate_looks_like_wrong_script (dort: Patois soll
-    lateinisch bleiben, viel Nicht-Latein ist verdaechtig). Darija soll
-    dagegen in arabischer Schrift zurueckkommen - bleibt die Ausgabe
-    ueberwiegend lateinisch/ASCII, hat das Modell vermutlich nur den
-    englischen Text wiederholt oder ignoriert die Sonderanweisung. Ein
-    hoher Lateinanteil ist hier also das Fehler-Anzeichen, nicht Nicht-Latein."""
-    stripped = re.sub(r'\s+', '', text)
-    if not stripped:
-        return False
-    latin = sum(1 for ch in stripped if ch.isascii() and ch.isalpha())
-    return latin / len(stripped) > 0.5
-
-
 def _clean_patois_output(text):
     lines = text.split("\n")
     cleaned = []
@@ -451,6 +405,79 @@ def _clean_patois_output(text):
     return result
 
 
+# Nutzerwunsch (21. Sept, Runde 73): Darija ("ary") hatte bisher UEBERHAUPT
+# keine Sonderbehandlung (lief einfach durch den generischen
+# _translate_normal_with_fallback-Zweig unten) - das produziert bestenfalls
+# formelles Hocharabisch in arabischer Schrift, aber niemals die im Norden
+# Afrikas beim Schreiben (Chat/SMS/Songtexte) tatsaechlich gebraeuchliche
+# "Arabizi"-Umschrift mit lateinischen Buchstaben + Ziffern fuer Laute ohne
+# lateinische Entsprechung (3=Ain, 2=Hamza, 7=Ha, 9=Qaf, 5=Kha). Nutzer
+# wollte hier ausdruecklich eine Wahlmoeglichkeit - script_style ("latin"
+# Standard laut Nutzerentscheidung, oder "arabic") kommt vom Frontend durch
+# server.js/runpod-handler.js bis hierher durchgereicht. Gleiches
+# Prompt-basiertes Vorgehen wie bei Jamaica-Patois oben (TranslateGemma kennt
+# den ary-Sprachcode zwar, aber weder Darija-Umgangssprache noch erst recht
+# nicht die Arabizi-Konvention zuverlaessig als eigenstaendiges Sprachziel).
+def _translate_darija(processor, model, text, script_style="latin", sample=False, temperature=0.8, num_beams=1):
+    import torch
+    if script_style == "arabic":
+        prompt = (
+            f"<start_of_turn>user\nTranslate this English text into authentic Moroccan/Algerian "
+            f"Darija (North African Arabic dialect), written in Arabic script - real spoken Darija "
+            f"vocabulary and grammar, not formal Modern Standard Arabic. Output ONLY the translated "
+            f"lines, nothing else -- no explanation, no commentary, no intro phrase:\n{text}<end_of_turn>\n"
+            f"<start_of_turn>model\n"
+        )
+    else:
+        prompt = (
+            f"<start_of_turn>user\nTranslate this English text into authentic Moroccan/Algerian "
+            f"Darija (North African Arabic dialect), written in the Latin \"Arabizi\" chat alphabet - "
+            f"the way North Africans actually write it online and in song lyrics: plain Latin letters, "
+            f"using the digit 3 for the letter ain, 2 for hamza, 7 for ha, 9 for qaf, and 5 for kha "
+            f"wherever those sounds occur. Do not use Arabic script. Use real Darija vocabulary and "
+            f"grammar, not just French or English with an accent. Match this exact style:\n"
+            f"Rami ya weldi, lyoum far7ana bik\nKol l3ayla tghanni w tfar7 m3ak\nKbert chwiya, w zadt "
+            f"lfar7a fik\nAllah y7afdek w ykhalik lya\n"
+            f"Output ONLY the translated lines, nothing else -- no explanation, no commentary, no intro "
+            f"phrase:\n{text}<end_of_turn>\n<start_of_turn>model\n"
+        )
+    inputs = processor.tokenizer(prompt, return_tensors='pt')
+    inputs = _translate_to_model_device(model, inputs)
+    gen_kwargs = {"max_new_tokens": 200}
+    if sample:
+        gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9})
+    elif num_beams > 1:
+        gen_kwargs.update({"num_beams": num_beams, "early_stopping": True})
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+    result = processor.tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+    return _clean_patois_output(result)
+
+
+# Arabische Schrift liegt im Unicode-Block U+0600-U+06FF (Basic Arabic -
+# deckt fuer diese Pruefung ausreichend ab, Praesentationsformen/Supplement
+# nicht extra noetig).
+_ARABIC_SCRIPT_MIN = 0x0600
+_ARABIC_SCRIPT_MAX = 0x06FF
+
+
+def _translate_darija_wrong_script(text, script_style):
+    """Wie _translate_looks_like_wrong_script, aber script-bewusst: im
+    Arabizi-Modus (script_style='latin') zaehlt zu VIEL Nicht-Latein als
+    Fehler (wie beim Patois-Check); im Arabisch-Modus ist es genau
+    umgekehrt - dort zaehlt zu WENIG arabische Schrift als Fehler (Modell
+    hat die Anweisung ignoriert und z.B. auf Englisch/Franzoesisch
+    geantwortet)."""
+    stripped = re.sub(r'\s+', '', text)
+    if not stripped:
+        return False
+    if script_style == "arabic":
+        arabic_chars = sum(1 for ch in stripped if _ARABIC_SCRIPT_MIN <= ord(ch) <= _ARABIC_SCRIPT_MAX)
+        return (arabic_chars / len(stripped)) < 0.3
+    non_latin = sum(1 for ch in stripped if ord(ch) > _TRANSLATE_LATIN_MAX_CODEPOINT)
+    return non_latin / len(stripped) > 0.15
+
+
 def _translate_looks_like_wrong_script(text):
     """Identische Logik zum lokalen translate_lyrics.py: Jamaica-Patois
     laeuft ueber einen rohen Prompt statt das strukturierte Uebersetzungs-
@@ -475,6 +502,15 @@ async def _hieltech_translate(request: Request):
     body = await request.json()
     text = body.get("text") or ""
     target_lang_code = (body.get("target_lang_code") or "en").strip()
+    # script_style (Runde 73): nur fuer target_lang_code=="ary" relevant,
+    # "latin" (Arabizi mit 3/2/7/9/5) oder "arabic" (arabische Schrift).
+    # Unbekannter/leerer Wert faellt sicherheitshalber auf "latin" zurueck
+    # (Nutzerentscheidung fuer den Standard), statt den Request abzulehnen -
+    # so bleibt auch ein aelteres Frontend, das das Feld noch gar nicht
+    # mitschickt, funktionsfaehig.
+    script_style = (body.get("script_style") or "latin").strip().lower()
+    if script_style not in ("latin", "arabic"):
+        script_style = "latin"
 
     if target_lang_code == "en" or not text.strip():
         return {"translated_lyrics": text}
@@ -499,14 +535,13 @@ async def _hieltech_translate(request: Request):
                 retry = _translate_patois(processor, model, section_text, sample=True, temperature=0.8)
                 translated = retry if not _translate_looks_like_wrong_script(retry) else section_text
         elif target_lang_code == "ary":
-            # Darija (Nutzerwunsch 15. Sept) - gleiches Muster wie Jamaica
-            # Patois oben, nur mit umgekehrter Skript-Erwartung (siehe
-            # _translate_looks_untranslated): hier ist viel LATEIN das
-            # Fehler-Anzeichen, nicht Nicht-Latein.
-            translated = _translate_darija(processor, model, section_text, num_beams=4)
-            if _translate_looks_untranslated(translated):
-                retry = _translate_darija(processor, model, section_text, sample=True, temperature=0.8)
-                translated = retry if not _translate_looks_untranslated(retry) else section_text
+            # Nutzerwunsch (21. Sept, Runde 73): siehe _translate_darija-
+            # Kommentar oben - gleiches Retry-Muster wie bei Jamaica-Patois,
+            # nur script-bewusst statt immer "erwarte Latein".
+            translated = _translate_darija(processor, model, section_text, script_style=script_style, num_beams=4)
+            if _translate_darija_wrong_script(translated, script_style):
+                retry = _translate_darija(processor, model, section_text, script_style=script_style, sample=True, temperature=0.8)
+                translated = retry if not _translate_darija_wrong_script(retry, script_style) else section_text
         else:
             translated = _translate_normal_with_fallback(processor, model, section_text, target_lang_code)
         translated_sections.append(translated)
