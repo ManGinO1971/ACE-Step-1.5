@@ -179,10 +179,15 @@ async def _hieltech_generate_lyrics(request: Request):
         "Write plain lyrics only, no chords, no explanations, no comments about the song. "
         "Label each section clearly on its own line using parentheses, e.g. (Verse), (Chorus). "
         "Do not use markdown bold or asterisks. "
-        "Only write the sections requested, nothing extra, and stop immediately after the last section."
+        "Only write the sections requested, nothing extra, and stop immediately after the last section. "
+        "IMPORTANT: Always write the lyrics in English, no matter what language the theme below is "
+        "written in. If the theme is given in German, Spanish, Arabic, Chinese, or any other "
+        "language, first understand its meaning, then write the lyrics only in English - never mix "
+        "languages within the lyrics."
     )
     user_prompt = (
-        f"Write song lyrics about: {theme}\n"
+        f"Write song lyrics about (this theme may be written in any language - understand it, "
+        f"but write the lyrics only in English): {theme}\n"
         f"Write EXACTLY these sections, in this exact order, each labeled: {section_list}\n"
         f"Each section should be 2-3 lines. Keep sentences short and simple, 5-8 words per line. Do not include a title. Do not wrap lines in parentheses."
     )
