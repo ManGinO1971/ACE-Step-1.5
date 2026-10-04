@@ -238,6 +238,15 @@ def build_generation_setup(
         use_random_seed=req.use_random_seed,
         seeds=_resolve_generation_seeds(req),
         audio_format=req.audio_format,
+        # FIX (4. Okt, Runde 124): mp3_bitrate wurde hier nie an
+        # GenerationConfig durchgereicht, obwohl inference.py's AudioSaver
+        # es laengst unterstuetzt - dadurch lief JEDE MP3-Ausgabe (der
+        # audio_format-Default!) immer mit dem AudioSaver-Hardcode-Default
+        # 128kbps, egal was der Aufrufer anfragte. Das erklaert den
+        # "klingt wie eine alte Kassette"-Qualitaetsverlust im
+        # Instrumental-Pfad gegenueber dem verlustfreien FLAC-Output des
+        # Terminal-Tests. Jetzt ergaenzt.
+        mp3_bitrate=getattr(req, "mp3_bitrate", "128k"),
         constrained_decoding_debug=req.constrained_decoding_debug,
     )
 

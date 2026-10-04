@@ -134,6 +134,19 @@ class GenerateMusicRequest(BaseModel):
         default="mp3",
         description="Output audio format. Supported formats: 'flac', 'mp3', 'opus', 'aac', 'wav', 'wav32'. Default: 'mp3'",
     )
+    # FIX (4. Okt, Runde 124): mp3_bitrate existierte in inference.py's
+    # GenerationConfig und AudioSaver schon immer (Default "128k"), wurde
+    # aber nie durch die HTTP-API-Schicht durchgereicht - jeder /release_task
+    # mit audio_format="mp3" (der Default!) bekam dadurch IMMER 128kbps, egal
+    # was der Aufrufer wollte (Pydantic verwirft unbekannte Felder
+    # standardmaessig, genau wie beim flow_edit_morph-Fix oben). Jetzt
+    # ergaenzt, damit ein Aufrufer explizit eine hoehere Bitrate anfordern
+    # kann (z.B. 320k fuer den Instrumental-Pfad statt des dumpfen
+    # 128k-Defaults).
+    mp3_bitrate: str = Field(
+        default="128k",
+        description="MP3 bitrate when audio_format='mp3'. One of '128k'/'192k'/'256k'/'320k'. Default: '128k'",
+    )
     use_tiled_decode: bool = True
 
     # 5Hz LM (server-side): used for metadata completion and (when thinking=True) codes generation.

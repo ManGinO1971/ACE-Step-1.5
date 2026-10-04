@@ -38,6 +38,7 @@ PARAM_ALIASES: Dict[str, list[str]] = {
     "flow_edit_n_min": ["flow_edit_n_min", "flowEditNMin"],
     "flow_edit_n_max": ["flow_edit_n_max", "flowEditNMax"],
     "flow_edit_n_avg": ["flow_edit_n_avg", "flowEditNAvg"],
+    "mp3_bitrate": ["mp3_bitrate", "mp3Bitrate"],
     "infer_method": ["infer_method", "inferMethod"],
     "use_tiled_decode": ["use_tiled_decode", "useTiledDecode"],
     "constrained_decoding": ["constrained_decoding", "constrainedDecoding", "constrained"],
