@@ -62,6 +62,24 @@ class GenerateMusicRequest(BaseModel):
         description="User-provided audio semantic codes string for code-control generation. When non-empty, skips LM code generation.",
     )
     task_type: str = "text2music"
+    # Flow-edit overlay (issue #1156): when flow_edit_morph=True on a
+    # text2music task, "paint" src_audio_path toward prompt/lyrics instead
+    # of regenerating from scratch. flow_edit_source_caption/_lyrics
+    # describe src_audio_path as it currently is (V_src); prompt/lyrics
+    # describe the target (V_tar). See acestep/inference.py GenerationParams
+    # for the full mechanism docstring.
+    # FIX (4. Okt): dieses Fork hatte inference.py's flow_edit_morph-Support
+    # bereits (GenerationParams kennt alle diese Felder), aber die HTTP-API-
+    # Schicht hier hat sie nie durchgereicht - dadurch wurden sie von jedem
+    # /release_task-Aufruf stillschweigend ignoriert (Pydantic verwirft
+    # unbekannte Felder standardmaessig). Jetzt ergaenzt, 1:1 wie im
+    # Original-Upstream-Repo (ace-step/ACE-Step-1.5).
+    flow_edit_morph: bool = False
+    flow_edit_source_caption: str = ""
+    flow_edit_source_lyrics: str = ""
+    flow_edit_n_min: float = 0.0
+    flow_edit_n_max: float = 1.0
+    flow_edit_n_avg: int = 1
     chunk_mask_mode: Literal["explicit", "auto"] = "auto"
     repaint_latent_crossfade_frames: int = Field(
         default=10,

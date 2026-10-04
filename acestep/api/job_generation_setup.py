@@ -202,6 +202,18 @@ def build_generation_setup(
         repaint_strength=getattr(req, "repaint_strength", 0.5),
         audio_cover_strength=req.audio_cover_strength,
         cover_noise_strength=req.cover_noise_strength,
+        # FIX (4. Okt): flow_edit_morph-Felder wurden hier nie an
+        # GenerationParams durchgereicht, obwohl inference.py sie laengst
+        # unterstuetzt - dadurch lief JEDER /release_task-Aufruf mit
+        # flow_edit_morph=True faktisch als normale, unabhaengige
+        # text2music-Neugenerierung (das Original-Audio wurde nicht
+        # "gemorpht"). Jetzt ergaenzt, 1:1 wie im Original-Upstream-Repo.
+        flow_edit_morph=getattr(req, "flow_edit_morph", False),
+        flow_edit_source_caption=getattr(req, "flow_edit_source_caption", ""),
+        flow_edit_source_lyrics=getattr(req, "flow_edit_source_lyrics", ""),
+        flow_edit_n_min=getattr(req, "flow_edit_n_min", 0.0),
+        flow_edit_n_max=getattr(req, "flow_edit_n_max", 1.0),
+        flow_edit_n_avg=getattr(req, "flow_edit_n_avg", 1),
         thinking=thinking,
         lm_temperature=req.lm_temperature,
         lm_cfg_scale=req.lm_cfg_scale,
@@ -211,7 +223,12 @@ def build_generation_setup(
         use_cot_metas=not sample_mode,
         use_cot_caption=use_cot_caption,
         use_cot_language=use_cot_language,
-        use_constrained_decoding=True,
+        # FIX (4. Okt): war fest auf True verdrahtet - das verhinderte, dass
+        # ein Aufrufer (hier: der flow_edit_morph-Instrumental-Pfad)
+        # use_constrained_decoding=False anfordern konnte, obwohl
+        # req.constrained_decoding dafuer bereits existiert. Standard bleibt
+        # True (bestehendes Verhalten fuer alle anderen Aufrufer unveraendert).
+        use_constrained_decoding=req.constrained_decoding,
     )
 
     batch_size = req.batch_size if req.batch_size is not None else 2
