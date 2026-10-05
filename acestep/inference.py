@@ -22,6 +22,7 @@ import torch
 
 from acestep.audio_utils import AudioSaver, apply_fade, generate_uuid_from_params, normalize_audio, get_lora_weights_hash
 from acestep.constants import BPM_MIN, BPM_MAX, DURATION_MAX, TASK_TYPES, VALID_TIME_SIGNATURES
+from acestep.core.generation.handler.stem_layer_overlay import apply_stem_layering, should_apply_stem_layering
 
 # HuggingFace Space environment detection
 IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
@@ -994,6 +995,14 @@ def generate_music(
             # Get audio tensor and metadata
             audio_tensor = dit_audio.get("tensor")
             sample_rate = dit_audio.get("sample_rate", 48000)
+
+            # Background-stem overlay (Oct 2026): for flow_edit_morph
+            # instrumentals, layer the original song's drums/bass/other back
+            # on top via htdemucs_ft separation of src_audio - see
+            # stem_layer_overlay module docstring for the full rationale.
+            # Runs before normalization/fade so those steps see the final mix.
+            if audio_tensor is not None and should_apply_stem_layering(params):
+                audio_tensor = apply_stem_layering(audio_tensor, sample_rate, params.src_audio)
 
             # --- NORMALIZATION & LOGGING ---
             if params.enable_normalization and params.normalization_db <= 0.0:

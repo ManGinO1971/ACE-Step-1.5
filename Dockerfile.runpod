@@ -21,6 +21,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 COPY . /app/
 
+# Re-resolve the lock before syncing: a new dependency (demucs, for the
+# background-stem overlay feature) was added to pyproject.toml without a
+# matching uv.lock regeneration here, since that needs the PyTorch wheel
+# index which isn't reachable from every environment that edits this file.
+# `uv lock` on the actual build machine (which does have that access) keeps
+# `--frozen` meaningful again instead of failing on a stale lockfile.
+RUN uv lock
 RUN uv sync --frozen --no-dev --python python3.11
 
 RUN mkdir -p /app/checkpoints /app/output
