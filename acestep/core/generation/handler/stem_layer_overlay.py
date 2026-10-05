@@ -25,6 +25,7 @@ import torch
 from loguru import logger
 
 from acestep.core.generation.handler.stem_layer_align import align_to_length, measure_offset_samples
+from acestep.core.generation.handler.stem_layer_gate import apply_boundary_fade, compute_stem_gate_envelope
 from acestep.core.generation.handler.stem_layer_mix import apply_safety_limiter, mix_stems_into_instrumental
 from acestep.core.generation.handler.stem_layer_separate import (
     get_separator_sample_rate,
@@ -111,13 +112,22 @@ def apply_stem_layering(
         # separator instance from the call above), not a second separation.
         stem_sr = get_separator_sample_rate()
 
+        # Ducks the stems wherever the instrumental itself is quiet (htdemucs_ft
+        # separation residual noise in them would otherwise become audible in
+        # an intro/outro silence that used to mask nothing before this feature
+        # added real stem material there) - see stem_layer_gate's module docstring.
+        gate = compute_stem_gate_envelope(instrumental_mono, sample_rate)[:, None]
+
         aligned_stems: dict[str, np.ndarray] = {}
         for name, stem in stems.items():
             resampled = _resample_if_needed(stem, stem_sr, sample_rate)
-            aligned_stems[name] = _align_stem(resampled, instrumental_mono, sample_rate, target_len)
+            aligned = _align_stem(resampled, instrumental_mono, sample_rate, target_len)
+            aligned_stems[name] = aligned * gate
 
         mixed = mix_stems_into_instrumental(instrumental_np, aligned_stems, gains)
         limited = apply_safety_limiter(mixed)
+        # Click-safety net, independent of the gate above - see apply_boundary_fade.
+        limited = apply_boundary_fade(limited, sample_rate)
 
         result = torch.from_numpy(limited.T.copy()).to(dtype=audio_tensor.dtype)
         logger.info(
