@@ -77,6 +77,21 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv]
+# Restrict universal resolution to the platforms this project actually
+# supports (same list as required-environments below). Without this,
+# `uv lock`/`uv sync` also tries to solve for environments nobody uses,
+# e.g. Intel Mac (darwin x86_64) -- which has no torch entry anywhere in
+# this file's own dependencies to begin with. demucs (added for the
+# background-stem overlay feature) declares its own torch<2.3 pin just
+# for that one unused environment, which collides with nano-vllm's
+# torch>=2.4 pin there and made the whole lockfile unsolvable even
+# though nothing in this project is ever built for Intel Mac.
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 required-environments = [
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
