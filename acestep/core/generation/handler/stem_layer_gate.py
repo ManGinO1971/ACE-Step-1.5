@@ -30,9 +30,9 @@ def compute_stem_gate_envelope(
     instrumental_mono: np.ndarray,
     sr: int,
     threshold_db: float = -36.0,
-    floor: float = 0.15,
+    floor: float = 0.5,
     attack_ms: float = 20.0,
-    release_ms: float = 300.0,
+    release_ms: float = 900.0,
 ) -> np.ndarray:
     """Per-sample gain in ``[floor, 1.0]``, keyed by the instrumental's own loudness.
 
