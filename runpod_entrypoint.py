@@ -21,18 +21,39 @@ Diese Datei aendert das originale acestep-Paket NICHT - sie macht nur:
      Face-Zugriffstoken mit akzeptierter Lizenz fuer das gated Modell),
      die ueber die RunPod-Endpoint-Einstellungen gesetzt wird, NICHT im
      Code steht,
-  5) startet uvicorn auf dem Port, den RunPod erwartet.
+  5) startet uvicorn auf dem Port, den RunPod erwartet,
+  6) fuegt eine zusaetzliche Route "/v1/hieltech_vocals_postprocess" hinzu
+     (7. Okt, "Vocals erzeugen" fuer die PWA): nimmt das Ergebnis des
+     bereits per /release_task erzeugten flow_edit_morph-Schritts (Schritt 2
+     der 7-Schritte-Kette, siehe runpod-handler.js buildVocalsReleaseTaskBody)
+     entgegen und haengt Schritt 3-7 (Demucs-Nachtrennung, ffmpeg-Waermekette,
+     WORLD-Resynthese, optional RVC+Denoise+Gate, optional gemessener
+     Studio-Reverb) daran - 1:1 dieselben, bereits am Mac einen ganzen Testtag
+     lang bestaetigten Skripte (reseparate_vocal_step.py/vocal_warmth_step.py/
+     world_resynth_step.py/rvc_convert_step.py/denoise_step.py/
+     gate_vocal_stem.py/stem_clean_step.py/apply_measured_reverb.py), hier nur
+     per subprocess auf der RunPod-GPU statt auf dem Mac ausgefuehrt. Jeder
+     Teilschritt, dessen Python-Paket auf diesem RunPod-Image (noch) fehlt
+     (pyworld/rvc-python+fairseq/DeepFilterNet/pedalboard - siehe deren
+     eigene requirements), wird NICHT hart abgebrochen, sondern ueberspringt
+     sich selbst mit einer Warnung in der Antwort ("warnings") - das Ergebnis
+     bleibt dadurch nutzbar, auch bevor/falls das Image noch nicht alle
+     optionalen Pakete enthaelt.
 
 Nichts hier hat mit Preisen/Lizenzen/Geschaeftslogik zu tun - es startet
 nur den bestehenden, quelloffenen REST-Server so, dass RunPod damit reden
 kann.
 """
+import base64
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 
-from fastapi import Response, Request
+from fastapi import Response, Request, UploadFile, Form
 from acestep.api_server import app
 
 
@@ -179,15 +200,10 @@ async def _hieltech_generate_lyrics(request: Request):
         "Write plain lyrics only, no chords, no explanations, no comments about the song. "
         "Label each section clearly on its own line using parentheses, e.g. (Verse), (Chorus). "
         "Do not use markdown bold or asterisks. "
-        "Only write the sections requested, nothing extra, and stop immediately after the last section. "
-        "IMPORTANT: Always write the lyrics in English, no matter what language the theme below is "
-        "written in. If the theme is given in German, Spanish, Arabic, Chinese, or any other "
-        "language, first understand its meaning, then write the lyrics only in English - never mix "
-        "languages within the lyrics."
+        "Only write the sections requested, nothing extra, and stop immediately after the last section."
     )
     user_prompt = (
-        f"Write song lyrics about (this theme may be written in any language - understand it, "
-        f"but write the lyrics only in English): {theme}\n"
+        f"Write song lyrics about: {theme}\n"
         f"Write EXACTLY these sections, in this exact order, each labeled: {section_list}\n"
         f"Each section should be 2-3 lines. Keep sentences short and simple, 5-8 words per line. Do not include a title. Do not wrap lines in parentheses."
     )
@@ -607,6 +623,280 @@ async def _hieltech_translate_text(request: Request):
         translated = _translate_normal_with_fallback(processor, model, text, target_lang_code, source_lang_code=source_lang_code)
 
     return {"translated_text": translated}
+
+
+# =============================================================================
+# HIELTECH: "Vocals erzeugen" Schritt 3-7 (Nachbearbeitung der Schritt-2-
+# flow_edit_morph-Ausgabe) auf der RunPod-GPU (7. Okt)
+# =============================================================================
+#
+# Projekt-Wurzel: dieselbe wie diese Datei (runpod_entrypoint.py liegt immer
+# im ACE-Step-1.5-Projektordner, genau wie reseparate_vocal_step.py usw. auf
+# dem Mac) - damit funktionieren alle relativen Pfade (z.B. rvc_convert_step.py
+# -> rvc_models/voices/<modell>.pth) unveraendert, sofern diese Dateien beim
+# Docker-Image-Build/Deploy in denselben Ordner wie diese Datei kopiert werden.
+_HIELTECH_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _hieltech_run_step(args, timeout=1800):
+    """Fuehrt ein Schritt-Skript per subprocess aus (derselbe Python-
+    Interpreter wie dieser Server, kein Conda-Umgebungswechsel wie auf dem
+    Mac noetig - ein Docker-Image hat nur eine Umgebung). Gibt
+    (erfolgreich, stdout+stderr) zurueck, wirft NIE eine Exception - ein
+    fehlendes optionales Paket (ImportError in dem jeweiligen Skript) soll
+    diesen Teilschritt nur ueberspringen, nicht die ganze Anfrage abbrechen.
+    """
+    cmd = [sys.executable] + args
+    try:
+        result = subprocess.run(
+            cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout
+        )
+        ok = result.returncode == 0
+        return ok, (result.stdout or "") + (result.stderr or "")
+    except Exception as e:  # noqa: BLE001 - bewusst breit, siehe Docstring
+        return False, str(e)
+
+
+@app.post("/v1/hieltech_vocals_postprocess")
+async def _hieltech_vocals_postprocess(
+    audio: UploadFile,
+    voice_model: str = Form(default=""),
+    apply_reverb: str = Form(default="false"),
+):
+    """Schritt 3-7 der "Vocals erzeugen"-Kette, siehe Modul-Docstring oben.
+
+    Erwartet multipart/form-data:
+      audio         - die bereits per flow_edit_morph erzeugte Schritt-2-Datei
+      voice_model   - Dateiname (ohne .pth) eines bereits auf dieses RunPod-
+                      Volume hochgeladenen RVC-Stimmmodells (rvc_models/voices/).
+                      Leer = kein Stimmwechsel (nur WORLD-Resynthese) - das ist
+                      der Pfad fuer normale Kunden, Admin-only in der PWA
+                      (server.js prueft is_owner, BEVOR dieses Feld ueberhaupt
+                      hier ankommt - diese Route selbst vertraut server.js).
+      apply_reverb  - "true"/"false" (als String, multipart kennt kein echtes
+                      Bool) - gemessener Studio-Reverb (Schritt 7), siehe unten.
+
+    Antwort (JSON): {"ok": true, "audio_base64": "...", "audio_ext": "wav",
+                      "steps_applied": [...], "warnings": [...]}
+    """
+    steps_applied = []
+    warnings = []
+    reverb_wanted = str(apply_reverb).strip().lower() in {"1", "true", "yes", "y", "on"}
+    voice_model = (voice_model or "").strip()
+    # "Eigene Stimmmodelle" (7. Okt, Runde 144): voice_model kommt jetzt nicht
+    # mehr nur vom vertrauenswuerdigen Admin-Feld, sondern (ueber server.js,
+    # siehe dortigen Kommentar) auch aus vom Kunden selbst gewaehlten
+    # "custom/<storage_filename>"-Werten. storage_filename ist zwar immer
+    # server-generiert, trotzdem hier zusaetzlich (Verteidigung in der Tiefe,
+    # Projekt-Konvention) ein billiger Schutz gegen Pfad-Ausbrueche, BEVOR der
+    # Wert unten an rvc_convert_step.py weitergegeben wird.
+    if ".." in voice_model or voice_model.startswith("/"):
+        voice_model = ""
+        warnings.append("Ungültiger Stimmmodell-Name verworfen (Sicherheitsprüfung)")
+
+    work_dir = tempfile.mkdtemp(prefix="hieltech_vocals_")
+    try:
+        src_ext = os.path.splitext(audio.filename or "step2.wav")[1] or ".wav"
+        step2_path = os.path.join(work_dir, f"step2{src_ext}")
+        with open(step2_path, "wb") as f:
+            f.write(await audio.read())
+
+        # --- Schritt 3: Demucs-Nachtrennung (reseparate_vocal_step.py,
+        # htdemucs_ft, --shifts 5 --overlap 0.5, 1:1 wie auf dem Mac
+        # bestaetigt) ---
+        ok, log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "reseparate_vocal_step.py"),
+            step2_path, work_dir,
+        ])
+        vocals_reseparated = os.path.join(work_dir, "vocals_reseparated.wav")
+        if not ok or not os.path.isfile(vocals_reseparated):
+            return {
+                "ok": False,
+                "error": "demucs_reseparation_failed",
+                "message": "Schritt 3 (Demucs-Nachtrennung) fehlgeschlagen - ohne dieses Ergebnis kann die Kette nicht weiterlaufen.",
+                "log": log[-2000:],
+            }
+        steps_applied.append("demucs_reseparation")
+        current = vocals_reseparated
+
+        # --- Schritt 4: ffmpeg-Waermekette (vocal_warmth_step.py) ---
+        warm_path = os.path.join(work_dir, "vocals_warm.wav")
+        ok, log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "vocal_warmth_step.py"),
+            current, warm_path,
+        ])
+        if ok and os.path.isfile(warm_path):
+            steps_applied.append("ffmpeg_warmth")
+            current = warm_path
+        else:
+            warnings.append("Schritt 4 (ffmpeg-Wärmekette) übersprungen: " + log[-300:])
+
+        # --- Schritt 5: WORLD-Resynthese (world_resynth_step.py,
+        # f0_method=harvest/d4c_threshold=0.7/mix=1.0, bestaetigte Werte) ---
+        world_path = os.path.join(work_dir, "vocals_world.wav")
+        ok, log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
+            "--input", current, "--output", world_path,
+            "--f0_method", "harvest", "--d4c_threshold", "0.7", "--mix", "1.0",
+        ])
+        if ok and os.path.isfile(world_path):
+            steps_applied.append("world_resynthesis")
+            current = world_path
+        else:
+            warnings.append(
+                "Schritt 5 (WORLD-Resynthese) übersprungen (vermutlich fehlt 'pyworld' auf "
+                "diesem RunPod-Image - siehe Deployment-Hinweise): " + log[-300:]
+            )
+
+        # --- Schritt 6: RVC + Denoise + Gate (NUR falls ein Stimmmodell
+        # gewaehlt wurde - Admin-only, siehe server.js) ---
+        if voice_model:
+            rvc_path = os.path.join(work_dir, "vocals_rvc.wav")
+            ok, log = _hieltech_run_step([
+                os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"),
+                current, rvc_path, voice_model,
+            ])
+            if ok and os.path.isfile(rvc_path):
+                steps_applied.append("rvc_convert")
+                current = rvc_path
+
+                denoised_path = os.path.join(work_dir, "vocals_rvc_denoised.wav")
+                ok, log = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "denoise_step.py"),
+                    "--input", current, "--output", denoised_path,
+                ])
+                if ok and os.path.isfile(denoised_path):
+                    steps_applied.append("rvc_denoise")
+                    current = denoised_path
+                else:
+                    warnings.append(
+                        "RVC-Denoise übersprungen (vermutlich fehlt 'DeepFilterNet' auf diesem "
+                        "RunPod-Image): " + log[-300:]
+                    )
+
+                gated_path = os.path.join(work_dir, "vocals_rvc_gated.wav")
+                ok, log = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"),
+                    "--input", current, "--output", gated_path,
+                ])
+                if ok and os.path.isfile(gated_path):
+                    steps_applied.append("rvc_gate")
+                    current = gated_path
+                else:
+                    warnings.append("RVC-Gate übersprungen: " + log[-300:])
+            else:
+                warnings.append(
+                    f"RVC-Stimmwechsel ('{voice_model}') übersprungen (Modell nicht gefunden oder "
+                    "'rvc-python'/fairseq fehlt auf diesem RunPod-Image - siehe Deployment-Hinweise): "
+                    + log[-300:]
+                )
+
+        # --- Schritt 7: gemessener Studio-Reverb (NUR falls vom Kunden
+        # aktiviert) - braucht eine zusaetzliche Referenz-Extraktion
+        # (stem_clean_step.py, Demucs+DeepFilterNet) fuer die Nachhall-
+        # Staerke-Messung, exakt wie bereits auf dem Mac umgesetzt. Schlaegt
+        # diese Referenz-Extraktion fehl (z.B. DeepFilterNet fehlt), wird
+        # Schritt 7 uebersprungen statt die ganze Anfrage abzubrechen -
+        # dieselbe "graceful degradation" wie am Mac.
+        if reverb_wanted:
+            ref_ok, ref_log = _hieltech_run_step([
+                os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
+                step2_path, work_dir,
+            ])
+            vocals_clean_ref = os.path.join(work_dir, "vocals_clean.wav")
+            residue_ref = os.path.join(work_dir, "residue.wav")
+            if ref_ok and os.path.isfile(vocals_clean_ref) and os.path.isfile(residue_ref):
+                reverb_path = os.path.join(work_dir, "vocals_reverb.wav")
+                ok, log = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "apply_measured_reverb.py"),
+                    current, residue_ref, vocals_clean_ref, reverb_path,
+                ])
+                if ok and os.path.isfile(reverb_path):
+                    steps_applied.append("studio_reverb")
+                    current = reverb_path
+                else:
+                    warnings.append(
+                        "Studio-Reverb übersprungen (vermutlich fehlt 'pedalboard' auf diesem "
+                        "RunPod-Image): " + log[-300:]
+                    )
+            else:
+                warnings.append(
+                    "Studio-Reverb übersprungen: Referenz-Extraktion (Demucs+DeepFilterNet) "
+                    "fehlgeschlagen: " + ref_log[-300:]
+                )
+
+        with open(current, "rb") as f:
+            final_bytes = f.read()
+        final_ext = os.path.splitext(current)[1].lstrip(".") or "wav"
+
+        return {
+            "ok": True,
+            "audio_base64": base64.b64encode(final_bytes).decode("ascii"),
+            "audio_ext": final_ext,
+            "steps_applied": steps_applied,
+            "warnings": warnings,
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# "Eigene Stimmmodelle" (7. Okt, Runde 144): 2 neue Routen, mit denen
+# server.js .pth-Dateien in einen eigenen Unterordner
+# rvc_models/voices/custom/ hochladen/wieder entfernen kann - getrennt vom
+# flachen rvc_models/voices/ (dort liegt weiterhin NUR das Admin-eigene
+# "Hicham.pth" direkt). rvc_convert_step.py (unveraendert) bekommt fuer
+# eigene Modelle einfach "custom/<name>" als model_name uebergeben (siehe
+# server.js) - os.path.join haengt das als normalen Unterordner an, kein
+# Code dort musste dafuer angepasst werden.
+_HIELTECH_CUSTOM_VOICES_DIR = os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_models", "voices", "custom")
+# Streng: nur das Muster, das server.js selbst erzeugt (u<license_id>_<16 Hex-
+# Zeichen>.pth) - alles andere wird abgelehnt, BEVOR ein Dateiname den
+# Dateisystem-Aufruf erreicht (Verteidigung in der Tiefe - server.js prueft
+# zwar bereits Ownership/erzeugt den Namen selbst, aber diese Route soll
+# auch fuer sich allein sicher sein).
+_HIELTECH_STORAGE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}\.pth$")
+
+
+@app.post("/v1/hieltech_vocals_upload_model")
+async def _hieltech_vocals_upload_model(
+    model: UploadFile,
+    storage_filename: str = Form(...),
+):
+    """Speichert ein von einem Kunden hochgeladenes RVC-.pth-Modell unter
+    rvc_models/voices/custom/<storage_filename> auf dem RunPod-Volume.
+    storage_filename wird von server.js server-seitig erzeugt (nie aus einer
+    Nutzereingabe abgeleitet) - hier zusaetzlich per Muster geprueft.
+    """
+    storage_filename = (storage_filename or "").strip()
+    if not _HIELTECH_STORAGE_FILENAME_RE.match(storage_filename):
+        return {"ok": False, "error": "invalid_filename", "message": "Ungültiger Dateiname"}
+    os.makedirs(_HIELTECH_CUSTOM_VOICES_DIR, exist_ok=True)
+    target_path = os.path.join(_HIELTECH_CUSTOM_VOICES_DIR, storage_filename)
+    try:
+        with open(target_path, "wb") as f:
+            f.write(await model.read())
+    except Exception as e:  # noqa: BLE001 - soll nie den ganzen Server crashen
+        return {"ok": False, "error": "write_failed", "message": str(e)}
+    return {"ok": True}
+
+
+@app.post("/v1/hieltech_vocals_delete_model")
+async def _hieltech_vocals_delete_model(
+    storage_filename: str = Form(...),
+):
+    """Gegenstueck zum Upload - entfernt die Datei wieder, falls vorhanden.
+    Kein Fehler, falls die Datei schon nicht (mehr) existiert (idempotent)."""
+    storage_filename = (storage_filename or "").strip()
+    if not _HIELTECH_STORAGE_FILENAME_RE.match(storage_filename):
+        return {"ok": False, "error": "invalid_filename", "message": "Ungültiger Dateiname"}
+    target_path = os.path.join(_HIELTECH_CUSTOM_VOICES_DIR, storage_filename)
+    try:
+        os.remove(target_path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "delete_failed", "message": str(e)}
+    return {"ok": True}
 
 
 if __name__ == "__main__":

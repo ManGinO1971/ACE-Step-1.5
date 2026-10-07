@@ -42,6 +42,18 @@ dependencies = [
     # install is needed (its "train" extra pulls in dora-search/hydra-core/
     # musdb and friends, deliberately not requested here).
     "demucs>=4.1.0",
+    # Vocals-Nachbearbeitungskette (Runde 144): WORLD-Resynthese (Schritt 5,
+    # world_resynth_step.py), Post-RVC-Denoising (Schritt 6, denoise_step.py)
+    # und Studio-Reverb (Schritt 7, apply_measured_reverb.py -- "from
+    # pedalboard import Pedalboard, Reverb" ist dort ein Hard-Import). Alle
+    # drei Pakete sind aktiv gepflegt (pyworld seit Jahren stabil, pedalboard
+    # von Spotify) und bauen ohne Legacy-Build-Tooling -- anders als
+    # fairseq/rvc-python für die eigentliche Stimmumwandlung in Schritt 6,
+    # die deshalb bewusst noch NICHT hier aufgenommen sind (separat zu
+    # testen, siehe README).
+    "pyworld",
+    "pedalboard",
+    "deepfilternet",
     "vector-quantize-pytorch>=1.27.15",
     "torchcodec>=0.9.1; platform_machine != 'aarch64'",
     "torchao>=0.16.0,<0.17.0; platform_machine != 'aarch64'",
