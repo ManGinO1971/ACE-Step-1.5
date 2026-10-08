@@ -626,8 +626,9 @@ async def _hieltech_translate_text(request: Request):
 
 
 # =============================================================================
-# HIELTECH: "Vocals erzeugen" Schritt 3-7 (Nachbearbeitung der Schritt-2-
-# flow_edit_morph-Ausgabe) auf der RunPod-GPU (7. Okt)
+# HIELTECH: "Vocals erzeugen" Schritt 1 (Vortrennung+Bereinigung, _hieltech_
+# vocals_preprocess) + Schritt 3-7 (Nachbearbeitung der Schritt-2-flow_edit_
+# morph-Ausgabe, _hieltech_vocals_postprocess) auf der RunPod-GPU (7.-8. Okt)
 # =============================================================================
 #
 # Projekt-Wurzel: dieselbe wie diese Datei (runpod_entrypoint.py liegt immer
@@ -681,6 +682,107 @@ def _hieltech_run_step(args, timeout=1800, python_path=None):
         return ok, (result.stdout or "") + (result.stderr or "")
     except Exception as e:  # noqa: BLE001 - bewusst breit, siehe Docstring
         return False, str(e)
+
+
+@app.post("/v1/hieltech_vocals_preprocess")
+async def _hieltech_vocals_preprocess(audio: UploadFile):
+    """Schritt 1 der "Vocals erzeugen"-Kette auf dem ROHEN Original-Song,
+    BEVOR Schritt 2 (flow_edit_morph, per /release_task) ueberhaupt laeuft.
+
+    Zweite Nutzer-Korrektur (8. Okt 2026, Projektnotiz Runde 150, ersetzt die
+    erste Korrektur aus Runde 149): nicht Demucs+DeepFilterNet allein,
+    sondern Demucs htdemucs_ft (--two-stems=vocals) -> UVR-DeEcho-DeReverb
+    (Hall raus) -> UVR-De-Echo-Aggressive (Echo raus) -> Noise-Gate liefert
+    die tatsaechlich am Testtag (7. Okt, vor dieser Session) bestaetigte
+    Eingabe fuer Schritt 2 (vocal_separate_uvr_clean_step.py+gate_vocal_
+    stem.py, identisch zur Kette in ace_step_web_server.py auf dem Mac,
+    siehe _isolate_vocals_flow_edit). Woertlich vom Nutzer: "was gut ist
+    soll kein reverb im vocals sein, damit den reconstruktion besser
+    klappt, und nicht was schief laeuft wegen den hall." stem_clean_step.py
+    (Demucs htdemucs PLAIN+DeepFilterNet) laeuft weiterhin parallel, nur
+    noch fuer instrumental_full/residue (optional, aktuell von keinem
+    PWA-Schritt ausgewertet) bzw. als zweite Rueckfallstufe, falls die
+    UVR-Kette fehlschlaegt.
+
+    Erwartet multipart/form-data: audio - der rohe Original-Song (noch kein
+    flow_edit_morph gelaufen).
+
+    Antwort (JSON) bei Erfolg: {"ok": true, "vocals_clean_base64": "...",
+      "instrumental_full_base64": "..."|null, "residue_base64": "..."|null,
+      "audio_ext": "wav"}. vocals_clean_base64 ist die UVR-gegatete Spur,
+      bei deren Fehlschlag ersatzweise die DeepFilterNet-Spur aus stem_
+      clean_step.py. instrumental_full/residue sind best-effort (None bei
+      Fehlschlag), da aktuell kein nachgeschalteter Schritt sie zwingend
+      braucht - sie blockieren die Antwort daher nicht.
+    Bei Fehlschlag BEIDER Ketten (UVR und DeepFilterNet):
+      {"ok": false, "error": "...", "log": "..."} - der Aufrufer
+      (runpod-handler.js) faellt dann auf das rohe Original als Schritt-2-
+      Eingabe zurueck, bricht die Anfrage NICHT ab (gleiche "graceful
+      degradation" wie bei Schritt 3-7 unten).
+    """
+    work_dir = tempfile.mkdtemp(prefix="hieltech_vocals_pre_")
+    try:
+        src_ext = os.path.splitext(audio.filename or "source.wav")[1] or ".wav"
+        src_path = os.path.join(work_dir, f"source{src_ext}")
+        with open(src_path, "wb") as f:
+            f.write(await audio.read())
+
+        def _hieltech_b64_file(path):
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode("ascii")
+
+        # Nebenprodukte instrumental_full/residue + zweite Rueckfallstufe,
+        # falls die UVR-Kette unten fehlschlaegt - best effort, blockiert
+        # nicht (siehe Docstring).
+        clean_ok, clean_log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
+            src_path, work_dir,
+        ])
+        vocals_clean_fallback = os.path.join(work_dir, "vocals_clean.wav")
+        instrumental_full = os.path.join(work_dir, "instrumental_full.wav")
+        residue = os.path.join(work_dir, "residue.wav")
+        if not clean_ok or not os.path.isfile(vocals_clean_fallback):
+            vocals_clean_fallback = None
+        if not clean_ok or not os.path.isfile(instrumental_full):
+            instrumental_full = None
+        if not clean_ok or not os.path.isfile(residue):
+            residue = None
+
+        uvr_dir = os.path.join(work_dir, "uvr_clean")
+        uvr_ok, uvr_log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "vocal_separate_uvr_clean_step.py"),
+            src_path, uvr_dir,
+        ], timeout=2400)
+        vocals_uvr_clean = os.path.join(uvr_dir, "vocals_uvr_clean.wav")
+        final_vocals = None
+        if uvr_ok and os.path.isfile(vocals_uvr_clean):
+            vocals_gated = os.path.join(uvr_dir, "vocals_gated.wav")
+            gate_ok, gate_log = _hieltech_run_step([
+                os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"),
+                "--input", vocals_uvr_clean, "--output", vocals_gated,
+            ], timeout=300)
+            final_vocals = vocals_gated if gate_ok and os.path.isfile(vocals_gated) else vocals_uvr_clean
+
+        if not final_vocals:
+            final_vocals = vocals_clean_fallback
+
+        if not final_vocals:
+            return {
+                "ok": False,
+                "error": "vocal_preprocess_failed",
+                "message": "Schritt 1 (UVR-Dereverb/Deecho und DeepFilterNet-Bereinigung) fehlgeschlagen.",
+                "log": (uvr_log[-1000:] + "\n---\n" + clean_log[-1000:]),
+            }
+
+        return {
+            "ok": True,
+            "vocals_clean_base64": _hieltech_b64_file(final_vocals),
+            "instrumental_full_base64": _hieltech_b64_file(instrumental_full) if instrumental_full else None,
+            "residue_base64": _hieltech_b64_file(residue) if residue else None,
+            "audio_ext": "wav",
+        }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.post("/v1/hieltech_vocals_postprocess")
