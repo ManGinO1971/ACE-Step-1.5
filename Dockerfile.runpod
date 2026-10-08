@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3.11-venv \
+        python3.10 python3.10-dev python3.10-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -29,6 +30,35 @@ COPY . /app/
 # `--frozen` meaningful again instead of failing on a stale lockfile.
 RUN uv lock
 RUN uv sync --frozen --no-dev --python python3.11
+
+# Separate, isolierte Python-3.10-venv NUR fuer die RVC-Stimmwechsel-
+# Abhaengigkeiten von rvc_convert_step.py (fairseq==0.12.2, rvc-python,
+# hydra-core==1.0.7, omegaconf==2.0.6). Per isoliertem Test bestaetigt
+# (8. Okt, ohne jede GPU-Erzeugung): dieser exakte, von rvc-python
+# verlangte Stack importiert unter Python 3.11 (der Hauptumgebung oben)
+# NICHT - hydra-core 1.0.7 nutzt ein Dataclass-Feld mit "mutable default",
+# das Python 3.11 strikter prueft als 3.10 und das deshalb beim Import von
+# "fairseq" (initialisiert beim Laden automatisch Hydra) mit einem
+# ValueError abbricht. fairseq selbst baut unter 3.11 einwandfrei - das
+# urspruenglich vermutete "fehlendes version.txt"-Problem betraf nur die
+# veraltete PyPI-Version 0.12.1, nicht die hier noetige 0.12.2. Deshalb
+# bewusst eine zweite, komplett getrennte venv statt die Hauptumgebung
+# herunterzustufen - siehe _HIELTECH_RVC_VENV_PYTHON in
+# runpod_entrypoint.py, die diese venv gezielt fuer genau diesen einen
+# Schritt per subprocess aufruft.
+#
+# torch/torchaudio kommen hier bewusst aus dem CPU-Index (nicht dem
+# riesigen CUDA-Torch der Hauptumgebung) - rvc_convert_step.py instanziiert
+# RVCInference() ohnehin fest mit device="cpu" (unveraendert von der
+# Mac-Version uebernommen), ein zweiter mehrere GB grosser CUDA-Torch waere
+# hier reine Platz-/Build-Zeit-Verschwendung.
+RUN python3.10 -m venv /opt/acestep_rvc_venv \
+    && /opt/acestep_rvc_venv/bin/pip install --no-cache-dir "pip==24.0" \
+    && /opt/acestep_rvc_venv/bin/pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple \
+        "numpy<=1.23.5" "omegaconf==2.0.6" "hydra-core==1.0.7" \
+        "fairseq==0.12.2" "rvc-python==0.1.5"
 
 RUN mkdir -p /app/checkpoints /app/output
 

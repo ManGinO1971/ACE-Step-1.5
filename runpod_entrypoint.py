@@ -637,16 +637,42 @@ async def _hieltech_translate_text(request: Request):
 # Docker-Image-Build/Deploy in denselben Ordner wie diese Datei kopiert werden.
 _HIELTECH_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+# Separate, isolierte Python-3.10-venv NUR fuer rvc_convert_step.py (siehe
+# Dockerfile.runpod) - durch einen isolierten Abhaengigkeits-Test (8. Okt,
+# ohne jede GPU-Erzeugung, siehe Projektnotiz Runde 148) bestaetigt: der von
+# "rvc-python" verlangte Stack (fairseq==0.12.2 + hydra-core==1.0.7 +
+# omegaconf==2.0.6) importiert unter Python 3.11 NICHT - hydra-core 1.0.7
+# nutzt ein Dataclass-Feld mit "mutable default", das Python 3.11 strikter
+# prueft als 3.10 (ValueError beim Import von "fairseq", weil fairseq beim
+# Laden automatisch Hydra initialisiert - sys.executable ist hier aber
+# Python 3.11, siehe pyproject.toml requires-python). fairseq selbst baut
+# unter 3.11 einwandfrei (das urspruenglich vermutete "version.txt"-Problem
+# betraf nur die veraltete Version 0.12.1, NICHT die hier benoetigte
+# 0.12.2) - das eigentliche Problem ist ausschliesslich diese
+# Hydra/Python-3.11-Inkompatibilitaet. Deshalb bewusst eine zweite, komplett
+# getrennte venv mit Python 3.10 statt die ganze Hauptumgebung
+# herunterzustufen. Existiert diese venv auf einem (noch nicht
+# neugebauten) Image nicht, faellt _hieltech_run_step() automatisch auf
+# sys.executable zurueck - das schlaegt dann wie bisher nur mit der
+# bestehenden Warnung fehl, bricht die Anfrage nicht ab.
+_HIELTECH_RVC_VENV_PYTHON = "/opt/acestep_rvc_venv/bin/python"
 
-def _hieltech_run_step(args, timeout=1800):
-    """Fuehrt ein Schritt-Skript per subprocess aus (derselbe Python-
-    Interpreter wie dieser Server, kein Conda-Umgebungswechsel wie auf dem
-    Mac noetig - ein Docker-Image hat nur eine Umgebung). Gibt
-    (erfolgreich, stdout+stderr) zurueck, wirft NIE eine Exception - ein
-    fehlendes optionales Paket (ImportError in dem jeweiligen Skript) soll
-    diesen Teilschritt nur ueberspringen, nicht die ganze Anfrage abbrechen.
+
+def _hieltech_run_step(args, timeout=1800, python_path=None):
+    """Fuehrt ein Schritt-Skript per subprocess aus. Nutzt standardmaessig
+    denselben Python-Interpreter wie dieser Server (kein Conda-
+    Umgebungswechsel wie auf dem Mac noetig - ein Docker-Image hat fuer die
+    meisten Schritte nur eine Umgebung); `python_path` erlaubt optional
+    einen ANDEREN Interpreter fuer einzelne Schritte mit eigener,
+    inkompatibler Abhaengigkeit (siehe _HIELTECH_RVC_VENV_PYTHON oben) - ist
+    der angegebene Pfad nicht vorhanden, wird transparent auf
+    sys.executable zurueckgefallen. Gibt (erfolgreich, stdout+stderr)
+    zurueck, wirft NIE eine Exception - ein fehlendes optionales Paket
+    (ImportError in dem jeweiligen Skript) soll diesen Teilschritt nur
+    ueberspringen, nicht die ganze Anfrage abbrechen.
     """
-    cmd = [sys.executable] + args
+    interpreter = python_path if python_path and os.path.isfile(python_path) else sys.executable
+    cmd = [interpreter] + args
     try:
         result = subprocess.run(
             cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout
@@ -755,7 +781,7 @@ async def _hieltech_vocals_postprocess(
             ok, log = _hieltech_run_step([
                 os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"),
                 current, rvc_path, voice_model,
-            ])
+            ], python_path=_HIELTECH_RVC_VENV_PYTHON)
             if ok and os.path.isfile(rvc_path):
                 steps_applied.append("rvc_convert")
                 current = rvc_path
