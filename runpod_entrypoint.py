@@ -55,6 +55,8 @@ import tempfile
 import threading
 import time
 import uuid
+import asyncio
+import concurrent.futures
 
 from fastapi import Response, Request, UploadFile, Form
 from acestep.api_server import app
@@ -849,29 +851,46 @@ async def _hieltech_vocals_preprocess(audio: UploadFile):
       Eingabe zurueck, bricht die Anfrage NICHT ab (gleiche "graceful
       degradation" wie bei Schritt 3-7 unten).
     """
+    # NEU (9. Okt 2026, Fehler "Verbindung zum Server fehlgeschlagen"/HTTP 524):
+    # die eigentliche Arbeit laeuft jetzt in einem Hintergrund-Thread statt
+    # direkt im asyncio-Event-Loop - siehe _hieltech_vocals_preprocess_sync.
+    src_bytes = await audio.read()
+    return await asyncio.to_thread(_hieltech_vocals_preprocess_sync, src_bytes, audio.filename)
+
+
+def _hieltech_vocals_preprocess_sync(src_bytes, filename):
+    """Synchroner Teil von /v1/hieltech_vocals_preprocess.
+
+    WARUM ein eigener Thread (9. Okt 2026, Ursache fuer HTTP 524 + die
+    "kompletten Worker-Neustarts" in den RunPod-Logs): die Route war
+    "async def", rief darin aber das BLOCKIERENDE subprocess.run() auf. Damit
+    stand der komplette Server (ein einziger uvicorn-Prozess, ein einziger
+    Event-Loop) fuer die ganze Dauer von Schritt 1 bzw. Schritt 3-7 still -
+    auch /ping hat in dieser Zeit NICHT mehr geantwortet. RunPod's Load-
+    Balancer haelt einen Worker, der /ping nicht beantwortet, fuer
+    ungesund und startet ihn neu (= der beobachtete volle Modell-Reload),
+    und jede gerade an diesen Worker gepinnte Anfrage (Worker-Affinitaet)
+    haengt dann, bis Cloudflare mit 524 aufgibt. Im Thread bleibt der
+    Event-Loop frei: /ping, /query_result und /v1/hieltech_fetch_chunk
+    antworten waehrenddessen ganz normal.
+    """
     work_dir = tempfile.mkdtemp(prefix="hieltech_vocals_pre_")
     try:
-        src_ext = os.path.splitext(audio.filename or "source.wav")[1] or ".wav"
+        src_ext = os.path.splitext(filename or "source.wav")[1] or ".wav"
         src_path = os.path.join(work_dir, f"source{src_ext}")
         with open(src_path, "wb") as f:
-            f.write(await audio.read())
+            f.write(src_bytes)
 
-        # Nebenprodukte instrumental_full/residue + zweite Rueckfallstufe,
-        # falls die UVR-Kette unten fehlschlaegt - best effort, blockiert
-        # nicht (siehe Docstring).
-        clean_ok, clean_log = _hieltech_run_step([
-            os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
-            src_path, work_dir,
-        ])
-        vocals_clean_fallback = os.path.join(work_dir, "vocals_clean.wav")
-        instrumental_full = os.path.join(work_dir, "instrumental_full.wav")
-        residue = os.path.join(work_dir, "residue.wav")
-        if not clean_ok or not os.path.isfile(vocals_clean_fallback):
-            vocals_clean_fallback = None
-        if not clean_ok or not os.path.isfile(instrumental_full):
-            instrumental_full = None
-        if not clean_ok or not os.path.isfile(residue):
-            residue = None
+        # NEU (9. Okt 2026, Geschwindigkeit): stem_clean_step.py (Demucs
+        # htdemucs + DeepFilterNet) lief bisher IMMER ZUERST und komplett,
+        # obwohl sein Ergebnis nur gebraucht wird, wenn die UVR-Kette
+        # scheitert (instrumental_full/residue wertet seit dem 9. Okt kein
+        # PWA-Schritt mehr aus, siehe Antwort unten: beide immer null). Es
+        # laeuft jetzt nur noch als echte Rueckfallstufe NACH einem
+        # UVR-Fehlschlag - gleiche Kette, gleiches Ergebnis, eine komplette
+        # Demucs+DeepFilterNet-Runde weniger Wartezeit.
+        clean_log = ""
+        vocals_clean_fallback = None
 
         uvr_dir = os.path.join(work_dir, "uvr_clean")
         uvr_ok, uvr_log = _hieltech_run_step([
@@ -889,6 +908,14 @@ async def _hieltech_vocals_preprocess(audio: UploadFile):
             final_vocals = vocals_gated if gate_ok and os.path.isfile(vocals_gated) else vocals_uvr_clean
 
         if not final_vocals:
+            # Zweite Rueckfallstufe (nur noch hier, siehe Kommentar oben).
+            clean_ok, clean_log = _hieltech_run_step([
+                os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
+                src_path, work_dir,
+            ])
+            candidate = os.path.join(work_dir, "vocals_clean.wav")
+            if clean_ok and os.path.isfile(candidate):
+                vocals_clean_fallback = candidate
             final_vocals = vocals_clean_fallback
 
         if not final_vocals:
@@ -970,6 +997,17 @@ async def _hieltech_vocals_postprocess(
     (siehe dortigen Docstring) - das funktioniert fuer JEDE Songlaenge,
     unabhaengig von der 30-MB-Grenze.
     """
+    # NEU (9. Okt 2026): Arbeit im Hintergrund-Thread, damit /ping usw.
+    # waehrenddessen antworten - siehe _hieltech_vocals_preprocess_sync.
+    step2_bytes = await audio.read()
+    return await asyncio.to_thread(
+        _hieltech_vocals_postprocess_sync, step2_bytes, audio.filename, voice_model, apply_reverb
+    )
+
+
+def _hieltech_vocals_postprocess_sync(step2_bytes, filename, voice_model, apply_reverb):
+    """Synchroner Teil von /v1/hieltech_vocals_postprocess (Schritt 3-7),
+    laeuft in einem Thread - Begruendung siehe _hieltech_vocals_preprocess_sync."""
     steps_applied = []
     warnings = []
     reverb_wanted = str(apply_reverb).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -986,11 +1024,13 @@ async def _hieltech_vocals_postprocess(
         warnings.append("Ungültiger Stimmmodell-Name verworfen (Sicherheitsprüfung)")
 
     work_dir = tempfile.mkdtemp(prefix="hieltech_vocals_")
+    reverb_ref_future = None
+    reverb_ref_pool = None
     try:
-        src_ext = os.path.splitext(audio.filename or "step2.wav")[1] or ".wav"
+        src_ext = os.path.splitext(filename or "step2.wav")[1] or ".wav"
         step2_path = os.path.join(work_dir, f"step2{src_ext}")
         with open(step2_path, "wb") as f:
-            f.write(await audio.read())
+            f.write(step2_bytes)
 
         # --- Schritt 3: Demucs-Nachtrennung (reseparate_vocal_step.py,
         # htdemucs_ft, --shifts 5 --overlap 0.5, 1:1 wie auf dem Mac
@@ -1009,6 +1049,25 @@ async def _hieltech_vocals_postprocess(
             }
         steps_applied.append("demucs_reseparation")
         current = vocals_reseparated
+
+        # NEU (9. Okt 2026, Geschwindigkeit): die Reverb-Referenzmessung
+        # (stem_clean_step.py auf der Schritt-2-Datei) haengt NUR von
+        # step2_path ab, nicht von Schritt 3-6. Bisher lief sie ganz am Ende
+        # hinterher - jetzt startet sie direkt nach Schritt 3 im Hintergrund
+        # (GPU: Demucs+DeepFilterNet), WAEHREND Schritt 4+5 (ffmpeg/WORLD) auf
+        # der CPU rechnen. Gleiche Messung, gleiche Eingabe, gleiches Ergebnis
+        # - nur ueberlappt statt hintereinander. Bewusst erst NACH Schritt 3
+        # gestartet (nicht parallel dazu), damit die beiden Demucs-Laeufe sich
+        # nicht gleichzeitig um den GPU-Speicher streiten. Eigener Unterordner,
+        # damit keine Datei mit der Hauptkette kollidiert.
+        reverb_ref_dir = os.path.join(work_dir, "reverb_ref")
+        if reverb_wanted:
+            os.makedirs(reverb_ref_dir, exist_ok=True)
+            reverb_ref_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            reverb_ref_future = reverb_ref_pool.submit(
+                _hieltech_run_step,
+                [os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"), step2_path, reverb_ref_dir],
+            )
 
         # --- Schritt 4: ffmpeg-Waermekette (vocal_warmth_step.py) ---
         warm_path = os.path.join(work_dir, "vocals_warm.wav")
@@ -1090,12 +1149,18 @@ async def _hieltech_vocals_postprocess(
         # Schritt 7 uebersprungen statt die ganze Anfrage abzubrechen -
         # dieselbe "graceful degradation" wie am Mac.
         if reverb_wanted:
-            ref_ok, ref_log = _hieltech_run_step([
-                os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
-                step2_path, work_dir,
-            ])
-            vocals_clean_ref = os.path.join(work_dir, "vocals_clean.wav")
-            residue_ref = os.path.join(work_dir, "residue.wav")
+            # Ergebnis der oben (nach Schritt 3) gestarteten Hintergrund-
+            # Messung abholen - wartet nur noch auf den Rest, falls sie
+            # laenger als Schritt 4-6 gedauert hat.
+            if reverb_ref_future is not None:
+                ref_ok, ref_log = reverb_ref_future.result()
+            else:
+                ref_ok, ref_log = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "stem_clean_step.py"),
+                    step2_path, reverb_ref_dir,
+                ])
+            vocals_clean_ref = os.path.join(reverb_ref_dir, "vocals_clean.wav")
+            residue_ref = os.path.join(reverb_ref_dir, "residue.wav")
             if ref_ok and os.path.isfile(vocals_clean_ref) and os.path.isfile(residue_ref):
                 reverb_path = os.path.join(work_dir, "vocals_reverb.wav")
                 ok, log = _hieltech_run_step([
@@ -1143,6 +1208,12 @@ async def _hieltech_vocals_postprocess(
             "warnings": warnings,
         }
     finally:
+        # Laeuft die Hintergrund-Messung noch (z.B. weil Schritt 3 hier
+        # vorzeitig mit Fehler zurueckkehrt - dann wurde sie gar nicht
+        # gestartet - oder ein anderer Fehler auftrat), erst auf sie warten,
+        # bevor work_dir geloescht wird.
+        if reverb_ref_pool is not None:
+            reverb_ref_pool.shutdown(wait=True)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 

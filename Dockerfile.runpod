@@ -47,18 +47,33 @@ RUN uv sync --frozen --no-dev --python python3.11
 # runpod_entrypoint.py, die diese venv gezielt fuer genau diesen einen
 # Schritt per subprocess aufruft.
 #
-# torch/torchaudio kommen hier bewusst aus dem CPU-Index (nicht dem
-# riesigen CUDA-Torch der Hauptumgebung) - rvc_convert_step.py instanziiert
-# RVCInference() ohnehin fest mit device="cpu" (unveraendert von der
-# Mac-Version uebernommen), ein zweiter mehrere GB grosser CUDA-Torch waere
-# hier reine Platz-/Build-Zeit-Verschwendung.
+# NEU (9. Okt 2026, Nutzerwunsch "soll alles moeglicher auf gpu laufen"):
+# torch/torchaudio kommen jetzt aus dem CUDA-12.8-Index (passend zum
+# Basis-Image und zur Hauptumgebung). rvc_convert_step.py waehlt seit dem
+# 9. Okt automatisch "cuda", sobald torch.cuda.is_available() - mit dem
+# bisherigen CPU-Torch war das hier NIE der Fall, RVC lief also trotz
+# bezahlter GPU immer auf der CPU. Schlaegt die CUDA-Installation beim Build
+# fehl, wird automatisch wie bisher CPU-Torch installiert (Build bricht
+# nicht ab, RVC funktioniert dann eben langsamer wie vorher).
+# rvc-python verlangt nur torch>=2.0.0, deshalb wird der vorinstallierte
+# CUDA-Torch beim zweiten pip-Aufruf NICHT wieder ersetzt.
 RUN python3.10 -m venv /opt/acestep_rvc_venv \
     && /opt/acestep_rvc_venv/bin/pip install --no-cache-dir "pip==24.0" \
+    && ( /opt/acestep_rvc_venv/bin/pip install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cu128 \
+            "torch==2.7.1" "torchaudio==2.7.1" \
+         || /opt/acestep_rvc_venv/bin/pip install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch torchaudio ) \
     && /opt/acestep_rvc_venv/bin/pip install --no-cache-dir \
-        --index-url https://download.pytorch.org/whl/cpu \
-        --extra-index-url https://pypi.org/simple \
         "numpy<=1.23.5" "omegaconf==2.0.6" "hydra-core==1.0.7" \
         "fairseq==0.12.2" "rvc-python==0.1.5"
+
+# NEU (9. Okt 2026): alle Modell-Gewichte der Vocals-Kette (Demucs, UVR,
+# DeepFilterNet) schon beim Build ins Image laden statt bei jedem frischen
+# Worker erneut aus dem Internet - siehe prefetch_vocals_models.py. Bricht
+# den Build nie ab (Skript endet immer mit Exit-Code 0, zusaetzlich "|| true").
+RUN /app/.venv/bin/python /app/prefetch_vocals_models.py || true
 
 RUN mkdir -p /app/checkpoints /app/output
 

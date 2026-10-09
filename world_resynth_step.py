@@ -132,12 +132,133 @@ sind normalerweise nicht noetig.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import numpy as np
 
 
-def auto_calibrate_f0_range(mono, sr, f0_method, pw):
+# =============================================================================
+# NEU (9. Okt 2026, Nutzerwunsch "die Bearbeitung dauert ewig"): Verteilung
+# auf alle CPU-Kerne des Workers. WORLD ist ein klassischer DSP-Vocoder ohne
+# GPU-Version - schneller wird er nur, wenn mehrere CPU-Kerne gleichzeitig
+# rechnen. Gemessen (60s Testsignal, 1 Kern): Kalibrierungs-Harvest 15.6s,
+# Haupt-Harvest 6.8s, CheapTrick 1.1s, D4C 7.2s, Synthese 2.5s.
+#
+# Was hier parallel laeuft und was bewusst NICHT:
+#   - Kalibrierungs-Durchlauf (50-1100 Hz): standardmaessig WEITERHIN
+#     seriell. Parallel in Stuecken gerechnet weicht der Suchbereich zwar
+#     nur minimal ab (Test: 136.23 statt 136.28 Hz unten) - aber Harvest ist
+#     so empfindlich, dass dadurch ~1% der Frames der Haupt-Tonhoehenspur
+#     kippen (teils um mehrere Halbtoene). Das waere ein anderer Klang als
+#     der bestaetigte, deshalb nur per --parallel_calibration einschaltbar.
+#   - CheapTrick + D4C: arbeiten Frame fuer Frame, parallel in Stuecken mit
+#     1s Ueberlappung - im Test praktisch identisch (groesste Abweichung im
+#     fertigen Signal ca. -65 dB unter Spitzenpegel, nicht hoerbar).
+#   - Haupt-Harvest (die eigentliche Tonhoehen-Spur) + Synthese: bleiben
+#     EIN durchgehender Lauf wie bisher. Harvest trifft Entscheidungen ueber
+#     den ganzen Tonhoehen-Verlauf - in Stuecken gerechnet waeren ~20% der
+#     Frames anders ausgefallen (gemessen), das wuerde den bestaetigten
+#     Klang veraendern.
+# --workers 1 schaltet alles auf das alte, rein serielle Verhalten zurueck.
+# Jeder Fehler in der Parallel-Variante faellt automatisch auf seriell zurueck.
+# =============================================================================
+
+_FRAME_PERIOD_MS = 5.0  # pyworld-Standard, wird unten ueberall so genutzt
+_CHUNK_S = 20.0
+
+
+def _available_cpu_workers(limit=8):
+    """Anzahl wirklich nutzbarer CPU-Kerne (beachtet Container-Grenzen)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            quota, period = fh.read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, int(int(quota) / int(period))))
+    except Exception:
+        pass
+    return max(1, min(n, limit))
+
+
+def _harvest_chunk_worker(args):
+    seg, sr, f0_floor, f0_ceil = args
+    import pyworld as pw
+    f0, _ = pw.harvest(seg, sr, f0_floor=f0_floor, f0_ceil=f0_ceil, frame_period=_FRAME_PERIOD_MS)
+    return f0
+
+
+def _frames_chunk_worker(args):
+    kind, seg, f0, t, sr, threshold = args
+    import pyworld as pw
+    if kind == "cheaptrick":
+        return pw.cheaptrick(seg, f0, t, sr)
+    return pw.d4c(seg, f0, t, sr, threshold=threshold)
+
+
+def _chunk_plan(n_frames, chunk_s=_CHUNK_S, pad_s=1.0):
+    cf = int(round(chunk_s * 1000.0 / _FRAME_PERIOD_MS))
+    pf = int(round(pad_s * 1000.0 / _FRAME_PERIOD_MS))
+    plan = []
+    for a in range(0, n_frames, cf):
+        b = min(n_frames, a + cf)
+        plan.append((a, b, max(0, a - pf), min(n_frames, b + pf)))
+    return plan
+
+
+def _pool(workers):
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+    ctx = mp.get_context("fork") if sys.platform.startswith("linux") else None
+    return ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+
+
+def parallel_harvest_voiced(mono, sr, f0_floor, f0_ceil, workers):
+    """Harvest in Stuecken (2s Ueberlappung) - NUR fuer die Kalibrierung."""
+    n = len(mono)
+    n_frames = int(n / sr * 1000.0 / _FRAME_PERIOD_MS) + 1
+    plan = _chunk_plan(n_frames, pad_s=2.0)
+    jobs = []
+    for a, b, sa, sb in plan:
+        s0 = int(round(sa * _FRAME_PERIOD_MS / 1000.0 * sr))
+        s1 = min(n, int(round((sb - 1) * _FRAME_PERIOD_MS / 1000.0 * sr)) + 1)
+        jobs.append((mono[s0:s1], sr, f0_floor, f0_ceil))
+    with _pool(workers) as ex:
+        results = list(ex.map(_harvest_chunk_worker, jobs))
+    out = np.zeros(n_frames)
+    for (a, b, sa, sb), f0 in zip(plan, results):
+        take = f0[a - sa:b - sa]
+        out[a:a + len(take)] = take
+    return out
+
+
+def parallel_frame_analysis(kind, mono, f0, t, sr, workers, threshold=0.85):
+    """CheapTrick/D4C in Stuecken (1s Ueberlappung) mit EXAKTEN Zeitpunkten:
+    jedes Stueck bekommt die originalen Frame-Zeiten (relativ zu seinem
+    Startsample), dadurch auch bei 44.1 kHz (5 ms = 220.5 Samples) sauber."""
+    n = len(mono)
+    plan = _chunk_plan(len(f0), pad_s=1.0)
+    jobs = []
+    for a, b, sa, sb in plan:
+        s0 = max(0, int(np.floor(t[sa] * sr)) - 1)
+        s1 = min(n, int(np.ceil(t[sb - 1] * sr)) + 2)
+        seg = np.ascontiguousarray(mono[s0:s1])
+        t_local = np.ascontiguousarray(t[sa:sb] - s0 / sr)
+        jobs.append((kind, seg, np.ascontiguousarray(f0[sa:sb]), t_local, sr, threshold))
+    with _pool(workers) as ex:
+        results = list(ex.map(_frames_chunk_worker, jobs))
+    out = None
+    for (a, b, sa, sb), r in zip(plan, results):
+        if out is None:
+            out = np.zeros((len(f0), r.shape[1]))
+        out[a:b] = r[a - sa:b - sa]
+    return out
+
+
+def auto_calibrate_f0_range(mono, sr, f0_method, pw, workers=1, parallel=False):
     """
     Ermittelt automatisch einen sinnvollen F0-Suchbereich fuer DIESEN Song,
     unabhaengig von Stimmlage/Geschlecht/Genre. Erst ein breiter, schneller
@@ -147,7 +268,17 @@ def auto_calibrate_f0_range(mono, sr, f0_method, pw):
     Das ersetzt das fruehere Hand-Tuning pro Song.
     """
     wide_floor, wide_ceil = 50.0, 1100.0
-    if f0_method == "harvest":
+    f0_wide = None
+    if f0_method == "harvest" and parallel and workers > 1 and len(mono) > 2 * _CHUNK_S * sr:
+        try:
+            f0_wide = parallel_harvest_voiced(mono, sr, wide_floor, wide_ceil, workers)
+            print(f"  (Kalibrierung parallel auf {workers} CPU-Kernen)", flush=True)
+        except Exception as e:  # noqa: BLE001 - Rückfall auf seriell
+            print(f"  Parallel-Kalibrierung fehlgeschlagen ({e}), rechne seriell...", flush=True)
+            f0_wide = None
+    if f0_wide is not None:
+        pass
+    elif f0_method == "harvest":
         f0_wide, _ = pw.harvest(mono, sr, f0_floor=wide_floor, f0_ceil=wide_ceil)
     else:
         f0_wide, _ = pw.dio(mono, sr, f0_floor=wide_floor, f0_ceil=wide_ceil)
@@ -376,7 +507,14 @@ def main() -> int:
                          "Gleiten/Sirenen-Rutschen klingen). Niedriger = laengeres, weicheres "
                          "Gleiten bei grossen Spruengen; hoeher = kuerzeres Gleiten, aber groesserer "
                          "Rest-Sprung pro Analyse-Frame.")
+    p.add_argument("--workers", type=int, default=0,
+                    help="Anzahl CPU-Kerne für CheapTrick/D4C (Standard 0 = automatisch, "
+                         "max. 8). 1 = altes, rein serielles Verhalten.")
+    p.add_argument("--parallel_calibration", action="store_true",
+                    help="Kalibrierungs-Durchlauf ebenfalls parallel (schneller, aber minimal anderer "
+                         "Suchbereich -> ca. 1%% der Tonhöhen-Frames fallen anders aus). Standard AUS.")
     args = p.parse_args()
+    workers = args.workers if args.workers > 0 else _available_cpu_workers()
 
     try:
         import soundfile as sf
@@ -399,7 +537,9 @@ def main() -> int:
     if f0_floor is None or f0_ceil is None:
         print("Kalibriere Tonhoehen-Suchbereich automatisch auf diese Stimme/diesen Song "
               "(Erstdurchlauf 50-1100 Hz)...", flush=True)
-        auto_floor, auto_ceil, ok = auto_calibrate_f0_range(mono, sr, args.f0_method, pw)
+        auto_floor, auto_ceil, ok = auto_calibrate_f0_range(
+            mono, sr, args.f0_method, pw, workers=workers, parallel=args.parallel_calibration,
+        )
         if f0_floor is None:
             f0_floor = auto_floor
         if f0_ceil is None:
@@ -457,8 +597,18 @@ def main() -> int:
 
     print(f"Extrahiere Spektralhuelle (CheapTrick) und Aperiodizitaet (D4C, threshold={args.d4c_threshold})...",
           flush=True)
-    sp = pw.cheaptrick(mono, f0, t, sr)
-    ap = pw.d4c(mono, f0, t, sr, threshold=args.d4c_threshold)
+    sp = ap = None
+    if workers > 1 and len(mono) > 2 * _CHUNK_S * sr:
+        try:
+            sp = parallel_frame_analysis("cheaptrick", mono, f0, t, sr, workers)
+            ap = parallel_frame_analysis("d4c", mono, f0, t, sr, workers, threshold=args.d4c_threshold)
+            print(f"  (CheapTrick/D4C parallel auf {workers} CPU-Kernen)", flush=True)
+        except Exception as e:  # noqa: BLE001 - Rückfall auf seriell
+            print(f"  Parallel-Analyse fehlgeschlagen ({e}), rechne seriell...", flush=True)
+            sp = ap = None
+    if sp is None or ap is None:
+        sp = pw.cheaptrick(mono, f0, t, sr)
+        ap = pw.d4c(mono, f0, t, sr, threshold=args.d4c_threshold)
 
     print("Synthese: baue EINE kohaerente Stimme aus F0 + Huelle + Aperiodizitaet neu auf...", flush=True)
     y = pw.synthesize(f0, sp, ap, sr)
