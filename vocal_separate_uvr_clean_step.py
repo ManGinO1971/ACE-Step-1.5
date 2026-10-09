@@ -58,6 +58,24 @@ DEMUCS_MODEL = "htdemucs_ft"
 UVR_DEREVERB_MODEL = "UVR-DeEcho-DeReverb.pth"
 UVR_DEECHO_MODEL = "UVR-De-Echo-Aggressive.pth"
 
+# NEU (10. Okt 2026, A/B-Test auf Nutzerwunsch "bessere Reinigung, damit
+# flow_edit_morph gut arbeiten kann"): MelBand-RoFormer von Kimberley Jensen
+# - laut audio-separators eigener Modellliste das Vocals-Modell mit dem
+# hoechsten Wert (SDR 12.6) und bekannt fuer deutlich weniger Artefakte als
+# Demucs. Ersetzt NUR den ersten Trennschritt (htdemucs_ft); Hall/Echo-
+# Entfernung (UVR) + Gate bleiben exakt gleich - es wird also genau EINE
+# Sache verglichen. Laeuft ueber torch -> auf RunPod automatisch auf "cuda".
+# Umschalten OHNE Code-Aenderung ueber die RunPod-Umgebungsvariable
+#   HIELTECH_VOCALS_SEPARATOR = roformer      (A/B-Test)
+#   HIELTECH_VOCALS_SEPARATOR = htdemucs_ft   (oder gar nicht gesetzt = bisher)
+# Schlaegt RoFormer fehl, faellt das Skript automatisch auf htdemucs_ft zurueck.
+ROFORMER_VOCALS_MODEL = "vocals_mel_band_roformer.ckpt"
+
+
+def _separator_choice():
+    value = (os.environ.get("HIELTECH_VOCALS_SEPARATOR") or "htdemucs_ft").strip().lower()
+    return "roformer" if value in {"roformer", "melband", "mel_band_roformer"} else "htdemucs_ft"
+
 
 def _pick_torch_device():
     """Erkennt automatisch die schnellste verfuegbare Hardware: CUDA (RunPod/
@@ -155,11 +173,26 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     model_file_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uvr_models")
 
-    print(f"Trenne Gesang ({DEMUCS_MODEL}, two-stems=vocals)...")
+    separator_choice = _separator_choice()
     with tempfile.TemporaryDirectory() as work_dir:
-        vocals, sr = separate_vocals_htdemucs_ft(input_path, work_dir)
         vocals_isolated_path = os.path.join(work_dir, "vocals_isolated.wav")
-        sf.write(vocals_isolated_path, vocals, sr)
+        roformer_ok = False
+        if separator_choice == "roformer":
+            print(f"Trenne Gesang (A/B-Test: {ROFORMER_VOCALS_MODEL}, MelBand-RoFormer)...")
+            try:
+                roformer_out = run_uvr_stage(
+                    input_path, os.path.join(work_dir, "roformer"),
+                    ROFORMER_VOCALS_MODEL, "vocals", model_file_dir,
+                )
+                rv, rsr = sf.read(roformer_out)
+                sf.write(vocals_isolated_path, rv, rsr)
+                roformer_ok = True
+            except Exception as e:  # noqa: BLE001 - Rückfall auf htdemucs_ft
+                print(f"RoFormer fehlgeschlagen ({e}) – Rückfall auf {DEMUCS_MODEL}.", file=sys.stderr)
+        if not roformer_ok:
+            print(f"Trenne Gesang ({DEMUCS_MODEL}, two-stems=vocals)...")
+            vocals, sr = separate_vocals_htdemucs_ft(input_path, work_dir)
+            sf.write(vocals_isolated_path, vocals, sr)
 
         print("Entferne Hall (UVR-DeEcho-DeReverb, Ziel-Stem 'no reverb')...")
         dereverb_path = run_uvr_stage(

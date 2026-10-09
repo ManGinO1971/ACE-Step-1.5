@@ -43,7 +43,11 @@ def _uvr():
     from audio_separator.separator import Separator
     model_dir = os.path.join(HERE, "uvr_models")
     os.makedirs(model_dir, exist_ok=True)
-    for model in ("UVR-DeEcho-DeReverb.pth", "UVR-De-Echo-Aggressive.pth"):
+    # vocals_mel_band_roformer.ckpt: NEU (10. Okt 2026) fuer den RoFormer-
+    # A/B-Test (HIELTECH_VOCALS_SEPARATOR=roformer, siehe
+    # vocal_separate_uvr_clean_step.py) - sonst muesste jeder frische Worker
+    # das grosse Modell beim ersten Test-Lauf erst herunterladen.
+    for model in ("UVR-DeEcho-DeReverb.pth", "UVR-De-Echo-Aggressive.pth", "vocals_mel_band_roformer.ckpt"):
         sep = Separator(model_file_dir=model_dir, output_dir=model_dir, log_level=logging.WARNING)
         sep.load_model(model_filename=model)
 
@@ -55,6 +59,6 @@ def _deepfilternet():
 
 if __name__ == "__main__":
     _try("Demucs htdemucs_ft + htdemucs", _demucs)
-    _try("UVR DeEcho/DeReverb-Modelle", _uvr)
+    _try("UVR DeEcho/DeReverb-Modelle + MelBand-RoFormer", _uvr)
     _try("DeepFilterNet3", _deepfilternet)
     sys.exit(0)
