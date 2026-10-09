@@ -52,6 +52,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from fastapi import Response, Request, UploadFile, Form
 from acestep.api_server import app
@@ -674,14 +675,70 @@ def _hieltech_run_step(args, timeout=1800, python_path=None):
     """
     interpreter = python_path if python_path and os.path.isfile(python_path) else sys.executable
     cmd = [interpreter] + args
+    # NEU (9. Okt 2026, Nutzerfrage "nehmen die 4 CPU-Schritte soviel Zeit"):
+    # bisher gab es GAR KEINE Zeitmessung pro Teilschritt - jede bisherige
+    # Einschaetzung dazu war geraten, nicht gemessen. Jeder Aufruf landet
+    # jetzt mit Name+Dauer im RunPod-eigenen Worker-Log (print auf stderr,
+    # dort landen auch die Teilskript-Ausgaben selbst), damit der naechste
+    # echte Testlauf eine ECHTE Zeitaufschluesselung liefert statt einer
+    # Schaetzung.
+    step_name = os.path.basename(args[0]) if args else "?"
+    started_at = time.perf_counter()
     try:
         result = subprocess.run(
             cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout
         )
         ok = result.returncode == 0
+        duration_s = time.perf_counter() - started_at
+        print(f"[HIELTECH-Zeitmessung] {step_name}: {duration_s:.1f}s (ok={ok})", file=sys.stderr, flush=True)
         return ok, (result.stdout or "") + (result.stderr or "")
     except Exception as e:  # noqa: BLE001 - bewusst breit, siehe Docstring
+        duration_s = time.perf_counter() - started_at
+        print(f"[HIELTECH-Zeitmessung] {step_name}: {duration_s:.1f}s (ok=False, Ausnahme={e})", file=sys.stderr, flush=True)
         return False, str(e)
+
+
+def _hieltech_wav_to_flac_b64(wav_path):
+    """Wandelt eine WAV-Datei VERLUSTFREI in FLAC um und gibt
+    (base64_string, "flac") zurueck - bei jedem Fehlschlag faellt die
+    Funktion transparent auf die ungewandelte Original-WAV zurueck
+    (base64_string, "wav").
+
+    Grund (9. Okt 2026, Nutzerwunsch "wav mit 30mb konvertieren vor die
+    bearbeitung, um das problem zu beseitigen, oder die qualitaet wird
+    schlecht... nur fuer vocal erzeugen"): RunPod's Load-Balancer verwirft
+    Anfragen/Antworten ueber 30 MB STILL, bevor sie diesen FastAPI-Server
+    ueberhaupt erreichen (siehe runpod-handler.js - dort landet das nur als
+    HTTP 502/524, ohne jede eigene Fehlermeldung von uns). FLAC ist - anders
+    als MP3 - bit-exakt verlustfrei rekonstruierbar (typischerweise 40-60%
+    kleiner als WAV, bei isoliertem Gesang oft noch mehr), erfuellt also
+    genau die vom Nutzer geforderte Bedingung "qualitaet wird nicht
+    schlechter". Nutzt ffmpeg per subprocess (im Docker-Image bereits per
+    apt installiert, siehe Dockerfile.runpod) statt einer zusaetzlichen
+    Python-Bibliothek. Bewusst NUR an den beiden Netzwerk-Antwort-Stellen der
+    Vocals-Kette eingesetzt (_hieltech_vocals_preprocess/_postprocess) - die
+    Song-/Instrumental-Erzeugung (generate_song/generate_instrumental,
+    downloadAudioBuffer) ist davon unberuehrt, die lieferen ohnehin schon
+    komprimiertes mp3/flac direkt vom Modell, kein WAV ueber diese Routen.
+    """
+    flac_path = os.path.splitext(wav_path)[0] + "_hieltech.flac"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path, "-compression_level", "8", flac_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0 and os.path.isfile(flac_path):
+            with open(flac_path, "rb") as f:
+                return base64.b64encode(f.read()).decode("ascii"), "flac"
+        print(
+            "[HIELTECH] FLAC-Konvertierung fehlgeschlagen, sende WAV unverändert: " + (result.stderr or "")[-300:],
+            file=sys.stderr, flush=True,
+        )
+    except Exception as e:  # noqa: BLE001 - siehe Docstring, nie die Anfrage abbrechen
+        print(f"[HIELTECH] FLAC-Konvertierung fehlgeschlagen ({e}), sende WAV unverändert.", file=sys.stderr, flush=True)
+
+    with open(wav_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii"), "wav"
 
 
 @app.post("/v1/hieltech_vocals_preprocess")
@@ -708,12 +765,15 @@ async def _hieltech_vocals_preprocess(audio: UploadFile):
     flow_edit_morph gelaufen).
 
     Antwort (JSON) bei Erfolg: {"ok": true, "vocals_clean_base64": "...",
-      "instrumental_full_base64": "..."|null, "residue_base64": "..."|null,
-      "audio_ext": "wav"}. vocals_clean_base64 ist die UVR-gegatete Spur,
-      bei deren Fehlschlag ersatzweise die DeepFilterNet-Spur aus stem_
-      clean_step.py. instrumental_full/residue sind best-effort (None bei
-      Fehlschlag), da aktuell kein nachgeschalteter Schritt sie zwingend
-      braucht - sie blockieren die Antwort daher nicht.
+      "instrumental_full_base64": null, "residue_base64": null,
+      "audio_ext": "flac"|"wav"}. vocals_clean_base64 ist die UVR-gegatete
+      Spur, bei deren Fehlschlag ersatzweise die DeepFilterNet-Spur aus
+      stem_clean_step.py - als FLAC (verlustfrei, siehe
+      _hieltech_wav_to_flac_b64) kodiert, um unter RunPod's 30-MB-
+      Antwortgrenze zu bleiben; audio_ext nennt das tatsaechliche Format.
+      instrumental_full_base64/residue_base64 sind NEU (9. Okt 2026) immer
+      null: runpod-handler.js liest sie ohnehin nie aus (nur
+      vocals_clean_base64/audio_ext), reiner Ballast fuer die 30-MB-Grenze.
     Bei Fehlschlag BEIDER Ketten (UVR und DeepFilterNet):
       {"ok": false, "error": "...", "log": "..."} - der Aufrufer
       (runpod-handler.js) faellt dann auf das rohe Original als Schritt-2-
@@ -726,10 +786,6 @@ async def _hieltech_vocals_preprocess(audio: UploadFile):
         src_path = os.path.join(work_dir, f"source{src_ext}")
         with open(src_path, "wb") as f:
             f.write(await audio.read())
-
-        def _hieltech_b64_file(path):
-            with open(path, "rb") as f:
-                return base64.b64encode(f.read()).decode("ascii")
 
         # Nebenprodukte instrumental_full/residue + zweite Rueckfallstufe,
         # falls die UVR-Kette unten fehlschlaegt - best effort, blockiert
@@ -774,12 +830,21 @@ async def _hieltech_vocals_preprocess(audio: UploadFile):
                 "log": (uvr_log[-1000:] + "\n---\n" + clean_log[-1000:]),
             }
 
+        vocals_clean_b64, vocals_clean_ext = _hieltech_wav_to_flac_b64(final_vocals)
+
         return {
             "ok": True,
-            "vocals_clean_base64": _hieltech_b64_file(final_vocals),
-            "instrumental_full_base64": _hieltech_b64_file(instrumental_full) if instrumental_full else None,
-            "residue_base64": _hieltech_b64_file(residue) if residue else None,
-            "audio_ext": "wav",
+            "vocals_clean_base64": vocals_clean_b64,
+            # NEU (9. Okt 2026, Nutzerwunsch "wav mit 30mb konvertieren..."):
+            # bisher wurden instrumental_full/residue IMMER mitgeschickt,
+            # obwohl runpod-handler.js (preprocessVocalsOnRunPod) sie nie
+            # ausliest - reiner Ballast, der die Antwort unnoetig Richtung
+            # der 30-MB-Grenze draengt. Die Dateien existieren bei Erfolg
+            # weiterhin lokal in work_dir (bis zum finally-Cleanup unten),
+            # falls spaeter doch mal ein Verbraucher dafuer gebraucht wird.
+            "instrumental_full_base64": None,
+            "residue_base64": None,
+            "audio_ext": vocals_clean_ext,
         }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -804,8 +869,14 @@ async def _hieltech_vocals_postprocess(
       apply_reverb  - "true"/"false" (als String, multipart kennt kein echtes
                       Bool) - gemessener Studio-Reverb (Schritt 7), siehe unten.
 
-    Antwort (JSON): {"ok": true, "audio_base64": "...", "audio_ext": "wav",
-                      "steps_applied": [...], "warnings": [...]}
+    Antwort (JSON): {"ok": true, "audio_base64": "...",
+                      "audio_ext": "flac"|"wav", "steps_applied": [...],
+                      "warnings": [...]}. audio_base64 ist NEU (9. Okt 2026,
+    Nutzerwunsch "wav mit 30mb konvertieren... qualitaet soll nicht
+    schlechter werden") als FLAC (verlustfrei, siehe
+    _hieltech_wav_to_flac_b64) statt rohem WAV kodiert, um unter RunPod's
+    30-MB-Antwortgrenze zu bleiben - audio_ext nennt das tatsaechliche
+    Format und wird von runpod-handler.js bereits dynamisch ausgelesen.
     """
     steps_applied = []
     warnings = []
@@ -953,13 +1024,11 @@ async def _hieltech_vocals_postprocess(
                     "fehlgeschlagen: " + ref_log[-300:]
                 )
 
-        with open(current, "rb") as f:
-            final_bytes = f.read()
-        final_ext = os.path.splitext(current)[1].lstrip(".") or "wav"
+        final_audio_b64, final_ext = _hieltech_wav_to_flac_b64(current)
 
         return {
             "ok": True,
-            "audio_base64": base64.b64encode(final_bytes).decode("ascii"),
+            "audio_base64": final_audio_b64,
             "audio_ext": final_ext,
             "steps_applied": steps_applied,
             "warnings": warnings,
