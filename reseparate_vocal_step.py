@@ -36,6 +36,27 @@ DEMUCS_SHIFTS = "5"
 DEMUCS_OVERLAP = "0.5"
 
 
+def _pick_torch_device():
+    """Erkennt automatisch die schnellste verfuegbare Hardware: CUDA (RunPod/
+    Linux-GPU), sonst MPS (Apple-GPU auf dem Mac), sonst None (Demucs waehlt
+    dann selbst/faellt auf CPU zurueck). NEU (9. Okt 2026, Nutzerwunsch
+    "soll alles moeglicher auf gpu laufen"): vorher stand hier fest "mps"
+    (nur fuer den Mac gedacht) - auf RunPod (Linux, kein Apple-Metal) ist
+    "mps" dort NIE verfuegbar, dieser besonders teure Schritt (shifts=5,
+    also 5x Inferenz) ist bisher auf JEDEM RunPod-Lauf auf CPU gelandet,
+    obwohl eine GPU bereitstand und bezahlt wurde."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return None
+
+
 def _run_demucs(input_path, work_dir, device):
     cmd = [
         sys.executable, "-m", "demucs",
@@ -55,12 +76,12 @@ def separate_vocals_only(input_path, work_dir):
     """Nutzt Demucs (htdemucs_ft, shifts=5, overlap=0.5), liefert nur den
     Gesang zurueck (--two-stems vocals spart Zeit, da nur vocals.wav +
     no_vocals.wav statt aller vier Stems berechnet werden muessen)."""
-    result = _run_demucs(input_path, work_dir, device="mps")
+    result = _run_demucs(input_path, work_dir, device=_pick_torch_device())
     if result.returncode != 0 and "Separated tracks" not in result.stderr:
-        # Rueckfall auf CPU, falls das mps-Backend in dieser Umgebung nicht
+        # Rueckfall auf CPU, falls weder CUDA noch MPS in dieser Umgebung
         # verfuegbar ist/fehlschlaegt - rein fuer Robustheit, kein erwarteter
         # Klangunterschied (siehe Modul-Docstring).
-        print("mps-Trennung fehlgeschlagen, versuche CPU-Rückfall...", file=sys.stderr)
+        print("GPU-Trennung fehlgeschlagen, versuche CPU-Rückfall...", file=sys.stderr)
         result = _run_demucs(input_path, work_dir, device="cpu")
         if result.returncode != 0 and "Separated tracks" not in result.stderr:
             raise RuntimeError(f"Demucs-Nachtrennung fehlgeschlagen: {result.stderr[-500:]}")

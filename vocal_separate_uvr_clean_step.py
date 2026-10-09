@@ -59,6 +59,27 @@ UVR_DEREVERB_MODEL = "UVR-DeEcho-DeReverb.pth"
 UVR_DEECHO_MODEL = "UVR-De-Echo-Aggressive.pth"
 
 
+def _pick_torch_device():
+    """Erkennt automatisch die schnellste verfuegbare Hardware: CUDA (RunPod/
+    Linux-GPU), sonst MPS (Apple-GPU auf dem Mac), sonst None (Demucs waehlt
+    dann selbst/faellt auf CPU zurueck). NEU (9. Okt 2026, Nutzerwunsch
+    "soll alles moeglicher auf gpu laufen"): vorher stand hier fest "mps"
+    (nur fuer den Mac gedacht) - auf RunPod (Linux, kein Apple-Metal) ist
+    "mps" dort NIE verfuegbar, Demucs ist also bisher auf JEDEM RunPod-Lauf
+    erst gescheitert und dann auf CPU zurueckgefallen, obwohl eine GPU
+    bereitstand und bezahlt wurde."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return None
+
+
 def _run_demucs(input_path, work_dir, device):
     import subprocess
 
@@ -72,9 +93,9 @@ def _run_demucs(input_path, work_dir, device):
 def separate_vocals_htdemucs_ft(input_path, work_dir):
     """Demucs htdemucs_ft, --two-stems=vocals, OHNE --shifts/--overlap (siehe
     Modul-Docstring) - liefert den isolierten Gesang STEREO zurueck."""
-    result = _run_demucs(input_path, work_dir, device="mps")
+    result = _run_demucs(input_path, work_dir, device=_pick_torch_device())
     if result.returncode != 0 and "Separated tracks" not in result.stderr:
-        print("mps-Trennung fehlgeschlagen, versuche CPU-Rückfall...", file=sys.stderr)
+        print("GPU-Trennung fehlgeschlagen, versuche CPU-Rückfall...", file=sys.stderr)
         result = _run_demucs(input_path, work_dir, device="cpu")
         if result.returncode != 0 and "Separated tracks" not in result.stderr:
             raise RuntimeError(f"Demucs-Trennung fehlgeschlagen: {result.stderr[-500:]}")

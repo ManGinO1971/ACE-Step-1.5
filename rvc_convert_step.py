@@ -41,7 +41,18 @@ def main():
 
     from rvc_python.infer import RVCInference
 
-    rvc = RVCInference(device="cpu")
+    # NEU (9. Okt 2026, Nutzerwunsch "soll alles moeglicher auf gpu laufen"):
+    # vorher stand hier fest device="cpu" (unveraendert von der Mac-Version
+    # uebernommen, wo es ohnehin keine CUDA-GPU gibt) - auf RunPod lief RVC
+    # dadurch bisher IMMER auf der CPU, obwohl eine GPU bereitstand und
+    # bezahlt wurde. Siehe Dockerfile.runpod fuer den dazugehoerigen Wechsel
+    # der RVC-venv von CPU- auf CUDA-Torch.
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+    rvc = RVCInference(device=device)
     rvc.load_model(model_path)
     rvc.f0_up_key = pitch_shift
     if index_path:
