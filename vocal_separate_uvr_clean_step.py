@@ -93,6 +93,23 @@ def _run_demucs(input_path, work_dir, device):
 def separate_vocals_htdemucs_ft(input_path, work_dir):
     """Demucs htdemucs_ft, --two-stems=vocals, OHNE --shifts/--overlap (siehe
     Modul-Docstring) - liefert den isolierten Gesang STEREO zurueck."""
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    vocals_path = os.path.join(work_dir, DEMUCS_MODEL, base_name, "vocals.wav")
+
+    # NEU (10. Okt 2026, Geschwindigkeit): nur das Vocals-Spezialmodell von
+    # htdemucs_ft rechnen statt aller 4 - ergebnisgleich (die anderen 3
+    # gehen fuer "vocals" mit Gewicht 0 ein), ca. 4x schneller. Siehe
+    # demucs_vocals_fast.py. shifts=1/overlap=0.25 = Kommandozeilen-
+    # Standard, also exakt die bisherigen Werte dieses Schritts.
+    try:
+        from demucs_vocals_fast import separate_vocals
+        if separate_vocals(input_path, vocals_path, model_name=DEMUCS_MODEL,
+                           shifts=1, overlap=0.25, device=_pick_torch_device()):
+            vocals, sr = sf.read(vocals_path)
+            return vocals.astype(np.float64), sr
+    except Exception as e:  # noqa: BLE001 - Rueckfall auf Kommandozeile unten
+        print(f"Demucs-Schnellweg nicht möglich ({e}), nutze Kommandozeile...", file=sys.stderr)
+
     result = _run_demucs(input_path, work_dir, device=_pick_torch_device())
     if result.returncode != 0 and "Separated tracks" not in result.stderr:
         print("GPU-Trennung fehlgeschlagen, versuche CPU-Rückfall...", file=sys.stderr)
@@ -100,8 +117,6 @@ def separate_vocals_htdemucs_ft(input_path, work_dir):
         if result.returncode != 0 and "Separated tracks" not in result.stderr:
             raise RuntimeError(f"Demucs-Trennung fehlgeschlagen: {result.stderr[-500:]}")
 
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    vocals_path = os.path.join(work_dir, DEMUCS_MODEL, base_name, "vocals.wav")
     vocals, sr = sf.read(vocals_path)
     return vocals.astype(np.float64), sr
 

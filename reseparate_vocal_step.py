@@ -76,6 +76,26 @@ def separate_vocals_only(input_path, work_dir):
     """Nutzt Demucs (htdemucs_ft, shifts=5, overlap=0.5), liefert nur den
     Gesang zurueck (--two-stems vocals spart Zeit, da nur vocals.wav +
     no_vocals.wav statt aller vier Stems berechnet werden muessen)."""
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    vocals_path = os.path.join(work_dir, DEMUCS_MODEL, base_name, "vocals.wav")
+
+    # NEU (10. Okt 2026, Geschwindigkeit): "--two-stems vocals" spart in
+    # Demucs selbst KEINE Rechenzeit - bei htdemucs_ft laufen trotzdem alle 4
+    # Spezialmodelle x 5 shifts = 20 Durchlaeufe, obwohl nur das Vocals-Modell
+    # in die Gesangsspur eingeht (Gewicht 0 fuer die anderen 3). Der
+    # Schnellweg rechnet nur dieses eine Modell (5 statt 20 Durchlaeufe) mit
+    # denselben bestaetigten Werten shifts=5/overlap=0.5 - ergebnisgleich,
+    # siehe demucs_vocals_fast.py. Bei Problemen: Kommandozeile wie bisher.
+    try:
+        from demucs_vocals_fast import separate_vocals
+        if separate_vocals(input_path, vocals_path, model_name=DEMUCS_MODEL,
+                           shifts=int(DEMUCS_SHIFTS), overlap=float(DEMUCS_OVERLAP),
+                           device=_pick_torch_device()):
+            vocals, sr = sf.read(vocals_path)
+            return vocals.astype(np.float64), sr
+    except Exception as e:  # noqa: BLE001 - Rueckfall auf Kommandozeile unten
+        print(f"Demucs-Schnellweg nicht möglich ({e}), nutze Kommandozeile...", file=sys.stderr)
+
     result = _run_demucs(input_path, work_dir, device=_pick_torch_device())
     if result.returncode != 0 and "Separated tracks" not in result.stderr:
         # Rueckfall auf CPU, falls weder CUDA noch MPS in dieser Umgebung
@@ -85,10 +105,6 @@ def separate_vocals_only(input_path, work_dir):
         result = _run_demucs(input_path, work_dir, device="cpu")
         if result.returncode != 0 and "Separated tracks" not in result.stderr:
             raise RuntimeError(f"Demucs-Nachtrennung fehlgeschlagen: {result.stderr[-500:]}")
-
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    stem_dir = os.path.join(work_dir, DEMUCS_MODEL, base_name)
-    vocals_path = os.path.join(stem_dir, "vocals.wav")
 
     vocals, sr = sf.read(vocals_path)
     return vocals.astype(np.float64), sr
