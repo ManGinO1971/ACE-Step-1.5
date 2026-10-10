@@ -12,6 +12,18 @@ model_name muss einer .pth-Datei in rvc_models/voices/ entsprechen
 import sys
 import os
 
+# NEU (10. Okt 2026, Fehler "RVC übersprungen: 'tuple' object has no
+# attribute 'dtype'"): ab torch 2.6 laedt torch.load standardmaessig im
+# "weights_only"-Modus. fairseq (laedt hubert_base.pt fuer RVC) ruft torch.load
+# OHNE diesen Parameter auf, und hubert_base.pt enthaelt neben den Gewichten
+# auch Einstellungs-Objekte -> "Weights only load failed". rvc-python faengt
+# das intern ab und gibt statt Audio einen Fehlertext zurueck, was erst beim
+# Speichern als 'tuple' ... 'dtype' auffiel. Dieser Schalter stellt fuer
+# DIESEN Prozess das alte Ladeverhalten wieder her. Muss VOR dem ersten
+# "import torch" gesetzt werden. Geladen werden nur die bekannten RVC-
+# Basismodelle und die eigenen .pth-Modelle der jeweiligen Lizenz.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 
 def main():
     if len(sys.argv) < 4:
@@ -61,6 +73,18 @@ def main():
     if index_path:
         rvc.index_path = index_path
 
+    # NEU (10. Okt 2026): rvc-python gibt bei einem internen Fehler statt Audio
+    # ein Tupel (Fehlertext, ...) zurueck - dann den ECHTEN Fehler melden statt
+    # des irrefuehrenden Folgefehlers beim Speichern.
+    _orig_vc_single = rvc.vc.vc_single
+
+    def _checked_vc_single(*args, **kwargs):
+        result = _orig_vc_single(*args, **kwargs)
+        if isinstance(result, tuple):
+            raise RuntimeError("RVC-Umwandlung fehlgeschlagen:\n" + str(result[0])[-1500:])
+        return result
+
+    rvc.vc.vc_single = _checked_vc_single
     rvc.infer_file(input_path, output_path)
     print(f"OK: {output_path}")
 
