@@ -38,13 +38,11 @@ def denoise_deepfilter(audio: np.ndarray, sr: int):
     identische Technik wie stem_clean_step.py (clean_vocals_deepfilter_stereo),
     aber ohne Restspur-Berechnung - hier wird nur das bereinigte Ergebnis
     gebraucht."""
-    from df.enhance import enhance, init_df
-    from df.io import load_audio, save_audio
-    import soundfile as sf
+    # NEU (10. Okt 2026): ueber df_compat statt df.io - df.io bricht mit
+    # torchaudio 2.10 (RunPod) schon beim Import ab, Entrauschen nach RVC
+    # war dort dadurch immer ausgefallen. Siehe df_compat.py.
     import librosa
-
-    model, df_state, _ = init_df()
-    df_sr = df_state.sr()
+    from df_compat import enhance_array
 
     if audio.ndim == 1:
         channels = [audio]
@@ -53,17 +51,7 @@ def denoise_deepfilter(audio: np.ndarray, sr: int):
 
     cleaned_channels = []
     for ch in channels:
-        tmp_in = tempfile.mktemp(suffix=".wav")
-        tmp_out = tempfile.mktemp(suffix=".wav")
-        sf.write(tmp_in, ch, sr)
-
-        in_audio, _meta = load_audio(tmp_in, sr=df_sr)
-        enhanced = enhance(model, df_state, in_audio)
-        save_audio(tmp_out, enhanced, df_sr)
-
-        cleaned_at_dfsr, _ = sf.read(tmp_out)
-        os.unlink(tmp_in)
-        os.unlink(tmp_out)
+        cleaned_at_dfsr, df_sr = enhance_array(ch, sr)
 
         if df_sr != sr:
             cleaned = librosa.resample(cleaned_at_dfsr, orig_sr=df_sr, target_sr=sr)
@@ -91,6 +79,8 @@ def main() -> int:
         print("FEHLER: 'soundfile' fehlt in dieser Umgebung (acestep_stems aktivieren).", flush=True)
         return 1
     try:
+        import df_compat
+        df_compat.install_torchaudio_shim()
         import df  # noqa: F401
     except ImportError:
         print("FEHLER: 'DeepFilterNet' (df) fehlt in dieser Umgebung "

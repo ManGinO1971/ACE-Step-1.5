@@ -75,6 +75,11 @@ RUN python3.10 -m venv /opt/acestep_rvc_venv \
 # den Build nie ab (Skript endet immer mit Exit-Code 0, zusaetzlich "|| true").
 RUN /app/.venv/bin/python /app/prefetch_vocals_models.py || true
 
+# NEU (10. Okt 2026): RVC-Basismodelle (hubert_base.pt, rmvpe.pt) laedt
+# rvc-python sonst bei JEDEM frischen Worker beim ersten Stimmwechsel erst
+# aus dem Internet nach (mehrere hundert MB). Hier einmal beim Build.
+RUN /opt/acestep_rvc_venv/bin/python -c "import os, rvc_python; from rvc_python.download_model import download_rvc_models; download_rvc_models(os.path.dirname(rvc_python.__file__))" || true
+
 RUN mkdir -p /app/checkpoints /app/output
 
 ENV TOKENIZERS_PARALLELISM=false

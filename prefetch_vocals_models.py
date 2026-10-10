@@ -53,8 +53,11 @@ def _uvr():
 
 
 def _deepfilternet():
-    from df.enhance import init_df
-    init_df()
+    # NEU (10. Okt 2026): ohne diese Bruecke bricht DeepFilterNet mit
+    # torchaudio 2.10 schon beim Import ab (siehe df_compat.py).
+    sys.path.insert(0, HERE)
+    import df_compat
+    df_compat.get_df_model()
 
 
 if __name__ == "__main__":

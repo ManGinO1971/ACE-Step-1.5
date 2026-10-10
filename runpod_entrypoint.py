@@ -1293,7 +1293,30 @@ async def _hieltech_fetch_chunk(token: str, offset: int = 0, length: int = 18_00
 # eigene Modelle einfach "custom/<name>" als model_name uebergeben (siehe
 # server.js) - os.path.join haengt das als normalen Unterordner an, kein
 # Code dort musste dafuer angepasst werden.
-_HIELTECH_CUSTOM_VOICES_DIR = os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_models", "voices", "custom")
+#
+# NEU (10. Okt 2026, Fehler "Stimmmodell laedt nicht"): bisher lag dieser
+# Ordner unter _HIELTECH_PROJECT_ROOT (= /app im Docker-Container) - also auf
+# der FLUECHTIGEN Platte des jeweiligen Workers, NICHT auf dem Netzwerk-
+# Volume. Ein hochgeladenes Modell war damit nach jedem Worker-Neustart weg
+# und fuer alle anderen Worker nie sichtbar. Jetzt liegt alles auf dem
+# RunPod-Netzwerk-Volume (/runpod-volume, dasselbe Volume wie die ACE-Step-
+# Checkpoints), sofern vorhanden - sonst (Mac/lokal) wie bisher im Projekt.
+# rvc_convert_step.py bekommt denselben Ordner ueber die Umgebungsvariable
+# HIELTECH_RVC_VOICES_DIR (wird an alle Teilskripte vererbt).
+def _hieltech_rvc_voices_root():
+    volume = "/runpod-volume"
+    if os.path.isdir(volume) and os.access(volume, os.W_OK):
+        return os.path.join(volume, "hieltech_rvc", "voices")
+    return os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_models", "voices")
+
+
+_HIELTECH_RVC_VOICES_DIR = _hieltech_rvc_voices_root()
+os.environ.setdefault("HIELTECH_RVC_VOICES_DIR", _HIELTECH_RVC_VOICES_DIR)
+_HIELTECH_CUSTOM_VOICES_DIR = os.path.join(_HIELTECH_RVC_VOICES_DIR, "custom")
+# NEU (10. Okt 2026): RunPod's Load-Balancer verwirft jede Anfrage ueber
+# 30 MB - ein typisches .pth (z.B. 55 MB) kam deshalb NIE an. Groessere
+# Modelle kommen jetzt in Stuecken (siehe _hieltech_vocals_upload_model_chunk).
+_HIELTECH_MAX_MODEL_BYTES = 300 * 1024 * 1024
 # Streng: nur das Muster, das server.js selbst erzeugt (u<license_id>_<16 Hex-
 # Zeichen>.pth) - alles andere wird abgelehnt, BEVOR ein Dateiname den
 # Dateisystem-Aufruf erreicht (Verteidigung in der Tiefe - server.js prueft
@@ -1318,11 +1341,74 @@ async def _hieltech_vocals_upload_model(
     os.makedirs(_HIELTECH_CUSTOM_VOICES_DIR, exist_ok=True)
     target_path = os.path.join(_HIELTECH_CUSTOM_VOICES_DIR, storage_filename)
     try:
-        with open(target_path, "wb") as f:
-            f.write(await model.read())
+        model_bytes = await model.read()
+
+        def _write():
+            with open(target_path, "wb") as f:
+                f.write(model_bytes)
+
+        await asyncio.to_thread(_write)
     except Exception as e:  # noqa: BLE001 - soll nie den ganzen Server crashen
         return {"ok": False, "error": "write_failed", "message": str(e)}
     return {"ok": True}
+
+
+@app.post("/v1/hieltech_vocals_upload_model_chunk")
+async def _hieltech_vocals_upload_model_chunk(
+    chunk: UploadFile,
+    storage_filename: str = Form(...),
+    offset: int = Form(...),
+    total_size: int = Form(...),
+):
+    """NEU (10. Okt 2026): Upload eines .pth in Stuecken (je < 30 MB, z.B.
+    20 MB), weil RunPod's Load-Balancer groessere Anfragen still verwirft.
+
+    Die Stuecke werden direkt auf das Netzwerk-Volume geschrieben (siehe
+    _HIELTECH_CUSTOM_VOICES_DIR) - deshalb ist KEINE Worker-Affinitaet
+    noetig: jedes Stueck darf auf einem anderen Worker landen, alle schreiben
+    in dieselbe Datei. Erst wenn alle Bytes da sind (offset + Stueckgroesse
+    == total_size), wird die Teildatei in einem Schritt zum fertigen Modell
+    umbenannt - ein halb hochgeladenes Modell ist also nie auswaehlbar.
+
+    Antwort: {"ok": true, "received": <bytes bisher>, "complete": bool}
+    """
+    storage_filename = (storage_filename or "").strip()
+    if not _HIELTECH_STORAGE_FILENAME_RE.match(storage_filename):
+        return {"ok": False, "error": "invalid_filename", "message": "Ungültiger Dateiname"}
+    if total_size <= 0 or total_size > _HIELTECH_MAX_MODEL_BYTES or offset < 0 or offset >= total_size:
+        return {"ok": False, "error": "invalid_range", "message": "Ungültige Größe/Position"}
+    data = await chunk.read()
+    if not data or offset + len(data) > total_size:
+        return {"ok": False, "error": "invalid_chunk", "message": "Ungültiges Teilstück"}
+
+    def _write():
+        os.makedirs(_HIELTECH_CUSTOM_VOICES_DIR, exist_ok=True)
+        target_path = os.path.join(_HIELTECH_CUSTOM_VOICES_DIR, storage_filename)
+        part_path = target_path + ".part"
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if offset == 0 else 0)
+        fd = os.open(part_path, flags, 0o644)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        received = os.path.getsize(part_path)
+        complete = offset + len(data) == total_size
+        if complete:
+            if received != total_size:
+                return {"ok": False, "error": "size_mismatch",
+                        "message": f"Datei unvollständig ({received} von {total_size} Bytes)"}
+            os.replace(part_path, target_path)
+        return {"ok": True, "received": received, "complete": complete}
+
+    try:
+        return await asyncio.to_thread(_write)
+    except Exception as e:  # noqa: BLE001 - soll nie den ganzen Server crashen
+        return {"ok": False, "error": "write_failed", "message": str(e)}
 
 
 @app.post("/v1/hieltech_vocals_delete_model")

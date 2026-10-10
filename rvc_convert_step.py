@@ -24,7 +24,10 @@ def main():
     pitch_shift = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    models_dir = os.path.join(base_dir, "rvc_models", "voices")
+    # NEU (10. Okt 2026): auf RunPod liegen die Stimmmodelle auf dem
+    # Netzwerk-Volume (runpod_entrypoint.py setzt HIELTECH_RVC_VOICES_DIR),
+    # am Mac ohne diese Variable wie bisher im Projektordner.
+    models_dir = os.environ.get("HIELTECH_RVC_VOICES_DIR") or os.path.join(base_dir, "rvc_models", "voices")
     model_path = os.path.join(models_dir, f"{model_name}.pth")
 
     if not os.path.exists(model_path):

@@ -60,12 +60,13 @@ def clean_vocals_deepfilter_stereo(vocals_stereo, sr):
     """Bereinigt Gesang pro Kanal einzeln, damit Ergebnis + Restspur
     Stereo bleiben. Gibt (vocals_clean_stereo, residue_stereo) zurueck,
     beide bei Original-Samplerate."""
-    from df.enhance import enhance, init_df
-    from df.io import load_audio, save_audio
+    # NEU (10. Okt 2026): ueber df_compat statt df.io - df.io bricht mit
+    # torchaudio 2.10 (RunPod) schon beim Import ab. Genau deshalb ist
+    # dieses Skript auf RunPod bisher IMMER gescheitert ("ok=False" in den
+    # Logs) und der Studio-Reverb-Schalter (Schritt 7) hatte keine Wirkung.
+    # Gleiche DeepFilterNet-Bereinigung, siehe df_compat.py.
     import librosa
-
-    model, df_state, _ = init_df()
-    df_sr = df_state.sr()
+    from df_compat import enhance_array
 
     if vocals_stereo.ndim == 1:
         channels = [vocals_stereo]
@@ -76,17 +77,7 @@ def clean_vocals_deepfilter_stereo(vocals_stereo, sr):
     residue_channels = []
 
     for ch in channels:
-        tmp_in = tempfile.mktemp(suffix=".wav")
-        tmp_out = tempfile.mktemp(suffix=".wav")
-        sf.write(tmp_in, ch, sr)
-
-        audio, meta = load_audio(tmp_in, sr=df_sr)
-        enhanced = enhance(model, df_state, audio)
-        save_audio(tmp_out, enhanced, df_sr)
-
-        cleaned_at_dfsr, _ = sf.read(tmp_out)
-        os.unlink(tmp_in)
-        os.unlink(tmp_out)
+        cleaned_at_dfsr, df_sr = enhance_array(ch, sr)
 
         ch_at_dfsr = librosa.resample(ch, orig_sr=sr, target_sr=df_sr) if sr != df_sr else ch
         min_len = min(len(ch_at_dfsr), len(cleaned_at_dfsr))
