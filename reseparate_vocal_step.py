@@ -32,7 +32,12 @@ import numpy as np
 import soundfile as sf
 
 DEMUCS_MODEL = "htdemucs_ft"
-DEMUCS_SHIFTS = "5"
+# NEU (10. Okt 2026): per RunPod-Umgebungsvariable HIELTECH_RESEP_SHIFTS
+# testweise aenderbar (z.B. 2 = schneller, minimal anderer Klang). Ohne
+# Variable bleibt es beim bestaetigten Sweet Spot 5.
+DEMUCS_SHIFTS = str(os.environ.get("HIELTECH_RESEP_SHIFTS") or "5").strip()
+if not DEMUCS_SHIFTS.isdigit() or not (1 <= int(DEMUCS_SHIFTS) <= 10):
+    DEMUCS_SHIFTS = "5"
 DEMUCS_OVERLAP = "0.5"
 
 

@@ -145,12 +145,20 @@ def run_uvr_stage(input_path, output_dir, model_filename, target_stem, model_fil
     from audio_separator.separator import Separator
 
     os.makedirs(output_dir, exist_ok=True)
+    # NEU (10. Okt 2026, Geschwindigkeit, ergebnisgleich): die VR-Modelle
+    # rechnen das Lied in voneinander unabhaengigen Fenstern und setzen sie
+    # danach in derselben Reihenfolge wieder zusammen (audio-separator,
+    # vr_separator.inference_vr). batch_size=4 gibt der GPU 4 Fenster auf
+    # einmal statt einzeln - gleiches Ergebnis, weniger Wartezeit. Alle
+    # anderen Werte = audio-separators eigene Standardwerte (unveraendert).
     separator = Separator(
         output_dir=output_dir,
         output_format="WAV",
         output_single_stem=target_stem,
         model_file_dir=model_file_dir,
         log_level=logging.WARNING,
+        vr_params={"batch_size": 4, "window_size": 512, "aggression": 5, "enable_tta": False,
+                   "enable_post_process": False, "post_process_threshold": 0.2, "high_end_process": False},
     )
     separator.load_model(model_filename=model_filename)
     output_files = separator.separate(input_path)

@@ -1091,11 +1091,17 @@ def _hieltech_vocals_postprocess_sync(step2_bytes, filename, voice_model, apply_
         # --- Schritt 5: WORLD-Resynthese (world_resynth_step.py,
         # f0_method=harvest/d4c_threshold=0.7/mix=1.0, bestaetigte Werte) ---
         world_path = os.path.join(work_dir, "vocals_world.wav")
-        ok, log = _hieltech_run_step([
+        world_args = [
             os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
             "--input", current, "--output", world_path,
             "--f0_method", "harvest", "--d4c_threshold", "0.7", "--mix", "1.0",
-        ])
+        ]
+        # NEU (10. Okt 2026): optional per RunPod-Umgebungsvariable
+        # HIELTECH_WORLD_PARALLEL_CALIBRATION=1 (schneller, ca. 1% der
+        # Tonhoehen-Frames anders - nur nach Hoertest). Standard: AUS.
+        if (os.environ.get("HIELTECH_WORLD_PARALLEL_CALIBRATION") or "").strip().lower() in {"1", "true", "yes", "on"}:
+            world_args.append("--parallel_calibration")
+        ok, log = _hieltech_run_step(world_args)
         if ok and os.path.isfile(world_path):
             steps_applied.append("world_resynthesis")
             current = world_path
