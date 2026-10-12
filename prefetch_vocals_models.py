@@ -37,6 +37,9 @@ def _demucs():
     from demucs.pretrained import get_model
     get_model("htdemucs_ft")
     get_model("htdemucs")
+    # NEU (13. Okt 2026): 6-Spuren-Modell fuer die Instrumental-Mix-Balance
+    # (instrumental_balance_step.py: drums/bass/guitar/piano/other/vocals)
+    get_model("htdemucs_6s")
 
 
 def _uvr():
@@ -61,7 +64,7 @@ def _deepfilternet():
 
 
 if __name__ == "__main__":
-    _try("Demucs htdemucs_ft + htdemucs", _demucs)
+    _try("Demucs htdemucs_ft + htdemucs + htdemucs_6s", _demucs)
     _try("UVR DeEcho/DeReverb-Modelle + MelBand-RoFormer", _uvr)
     _try("DeepFilterNet3", _deepfilternet)
     sys.exit(0)

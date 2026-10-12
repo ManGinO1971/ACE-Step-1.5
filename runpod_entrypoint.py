@@ -46,6 +46,7 @@ kann.
 """
 import base64
 import glob
+import json
 import os
 import re
 import shutil
@@ -1227,6 +1228,69 @@ def _hieltech_vocals_postprocess_sync(step2_bytes, filename, voice_model, apply_
         # bevor work_dir geloescht wird.
         if reverb_ref_pool is not None:
             reverb_ref_pool.shutdown(wait=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_instrumental_balance")
+async def _hieltech_instrumental_balance(
+    audio: UploadFile,
+    genre_hint: str = Form(default=""),
+):
+    """NEU (13. Okt 2026, Nutzerwunsch "Instrumente erzeugen: professionelle
+    Lautstaerke- und Mix-Anpassung"): zerlegt das fertige Instrumental per
+    Demucs htdemucs_6s in Spuren, gleicht Begleitinstrumente genre-abhaengig
+    an das Fundament aus Bass+Schlagzeug an und setzt alles verlustfrei
+    wieder zusammen - siehe instrumental_balance_step.py.
+
+    Antwort wie /v1/hieltech_vocals_postprocess: {"ok": true, "result_token",
+    "size_bytes", "audio_ext", "report": {...}} - die Bytes holt
+    runpod-handler.js per /v1/hieltech_fetch_chunk (Worker-Affinitaet) ab.
+    """
+    src_bytes = await audio.read()
+    return await asyncio.to_thread(_hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint)
+
+
+def _hieltech_instrumental_balance_sync(src_bytes, filename, genre_hint):
+    work_dir = tempfile.mkdtemp(prefix="hieltech_balance_")
+    try:
+        ext = os.path.splitext(filename or "")[1].lower() or ".mp3"
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        src_path = os.path.join(work_dir, "instrumental" + ext)
+        with open(src_path, "wb") as f:
+            f.write(src_bytes)
+        out_wav = os.path.join(work_dir, "balanced.wav")
+        ok, output = _hieltech_run_step(
+            [os.path.join(_HIELTECH_PROJECT_ROOT, "instrumental_balance_step.py"), src_path, out_wav, (genre_hint or "")[:500]],
+            timeout=900,
+        )
+        report = None
+        for line in reversed(output.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and '"ok"' in line:
+                try:
+                    report = json.loads(line)
+                except ValueError:
+                    report = None
+                break
+        if not ok or not os.path.isfile(out_wav):
+            return {"ok": False, "error": "instrumental_balance_failed", "message": output[-600:]}
+        if report:
+            print(f"[HIELTECH-Info] Instrumental-Balance: {json.dumps(report, ensure_ascii=False)[:600]}", file=sys.stderr, flush=True)
+        try:
+            converted_path, final_ext = _hieltech_wav_to_flac_file(out_wav)
+            handoff_path, result_token = _hieltech_handoff_store(converted_path, final_ext)
+            size_bytes = os.path.getsize(handoff_path)
+        except OSError as e:
+            return {"ok": False, "error": "instrumental_balance_handoff_failed", "message": str(e)}
+        return {
+            "ok": True,
+            "result_token": result_token,
+            "size_bytes": size_bytes,
+            "audio_ext": final_ext,
+            "report": report or {},
+        }
+    finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
