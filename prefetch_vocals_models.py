@@ -50,9 +50,15 @@ def _uvr():
     # A/B-Test (HIELTECH_VOCALS_SEPARATOR=roformer, siehe
     # vocal_separate_uvr_clean_step.py) - sonst muesste jeder frische Worker
     # das grosse Modell beim ersten Test-Lauf erst herunterladen.
-    for model in ("UVR-DeEcho-DeReverb.pth", "UVR-De-Echo-Aggressive.pth", "vocals_mel_band_roformer.ckpt"):
-        sep = Separator(model_file_dir=model_dir, output_dir=model_dir, log_level=logging.WARNING)
-        sep.load_model(model_filename=model)
+    # NEU (13. Okt 2026): Karaoke-Modelle fuer "Background Vocals erzeugen"
+    # (backing_separate_step.py - Lead/Background-Trennung).
+    for model in ("UVR-DeEcho-DeReverb.pth", "UVR-De-Echo-Aggressive.pth", "vocals_mel_band_roformer.ckpt",
+                  "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt", "6_HP-Karaoke-UVR.pth"):
+        try:
+            sep = Separator(model_file_dir=model_dir, output_dir=model_dir, log_level=logging.WARNING)
+            sep.load_model(model_filename=model)
+        except Exception as e:  # noqa: BLE001 - ein fehlendes Modell darf die anderen nicht verhindern
+            print(f"[Vorab-Download] Modell übersprungen: {model} ({e})", flush=True)
 
 
 def _deepfilternet():
@@ -65,6 +71,6 @@ def _deepfilternet():
 
 if __name__ == "__main__":
     _try("Demucs htdemucs_ft + htdemucs + htdemucs_6s", _demucs)
-    _try("UVR DeEcho/DeReverb-Modelle + MelBand-RoFormer", _uvr)
+    _try("UVR DeEcho/DeReverb + MelBand-RoFormer + Karaoke-Modelle", _uvr)
     _try("DeepFilterNet3", _deepfilternet)
     sys.exit(0)

@@ -59,7 +59,7 @@ import uuid
 import asyncio
 import concurrent.futures
 
-from fastapi import Response, Request, UploadFile, Form
+from fastapi import Response, Request, UploadFile, Form, File
 from acestep.api_server import app
 
 
@@ -1228,6 +1228,246 @@ def _hieltech_vocals_postprocess_sync(step2_bytes, filename, voice_model, apply_
         # bevor work_dir geloescht wird.
         if reverb_ref_pool is not None:
             reverb_ref_pool.shutdown(wait=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ============================================================================
+# "Background Vocals erzeugen" (NEU, 13. Okt 2026, Nutzerwunsch): eigene
+# Kette fuer die Background-Stimmen, nach demselben Prinzip wie "Vocals
+# erzeugen" - die bestehende Lead-Kette oben bleibt komplett unveraendert.
+#   1. /v1/hieltech_backing_preprocess: Gesang trennen -> Lead/Background
+#      trennen (Karaoke-Modell) -> Background reinigen -> Gate. Meldet
+#      has_backing=false, wenn im Song gar kein Background-Gesang ist.
+#   2. (optional, runpod-handler.js) flow_edit_morph per /release_task mit
+#      dem Background-Text aus den (Klammern) im Songtext.
+#   3. /v1/hieltech_backing_postprocess: gemeinsame Nachbearbeitung EINMAL
+#      (Demucs-Nachtrennung nur nach Neu-Erzeugung, Waermekette, WORLD), dann
+#      bis zu 3 Stimmen getrennt: je eigenes RVC-Modell + Tonlage
+#      (maennlich/weiblich, nur ganze Oktaven - die Harmonien bleiben in der
+#      Tonart) + Denoise + Gate. Ohne Modell: System-Stimme.
+# ============================================================================
+
+
+def _hieltech_is_handoff_path(path):
+    try:
+        real = os.path.realpath(path or "")
+        return real.startswith(os.path.realpath(_HIELTECH_HANDOFF_DIR) + os.sep) and os.path.isfile(real)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hieltech_last_json_line(output):
+    for line in reversed((output or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and '"ok"' in line:
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+@app.post("/v1/hieltech_backing_preprocess")
+async def _hieltech_backing_preprocess(audio: UploadFile):
+    """Antwort: {"ok": true, "has_backing": bool, "handoff_path": "...",
+    "direct_path": "...", "audio_ext": "...", "report": {...}}.
+    handoff_path ist fuer /release_task (src_audio_path), direct_path fuer
+    /v1/hieltech_backing_postprocess (src_handoff_path) - zwei Kopien, damit
+    ein Rueckfall ohne Neu-Erzeugung immer noch eine Datei vorfindet. Beide
+    nur per Worker-Affinitaet erreichbar."""
+    src_bytes = await audio.read()
+    return await asyncio.to_thread(_hieltech_backing_preprocess_sync, src_bytes, audio.filename)
+
+
+def _hieltech_backing_preprocess_sync(src_bytes, filename):
+    work_dir = tempfile.mkdtemp(prefix="hieltech_backing_pre_")
+    try:
+        src_ext = os.path.splitext(filename or "source.mp3")[1].lower() or ".mp3"
+        if not re.match(r"^\.[a-z0-9]{1,5}$", src_ext):
+            src_ext = ".mp3"
+        src_path = os.path.join(work_dir, "source" + src_ext)
+        with open(src_path, "wb") as f:
+            f.write(src_bytes)
+        out_dir = os.path.join(work_dir, "out")
+        ok, log = _hieltech_run_step(
+            [os.path.join(_HIELTECH_PROJECT_ROOT, "backing_separate_step.py"), src_path, out_dir], timeout=2400
+        )
+        report = _hieltech_last_json_line(log)
+        if not ok or not report:
+            return {"ok": False, "error": "backing_preprocess_failed", "message": "Lead/Background-Trennung fehlgeschlagen.", "log": log[-1500:]}
+        print(f"[HIELTECH-Info] Background-Trennung: {json.dumps(report, ensure_ascii=False)}", file=sys.stderr, flush=True)
+        if not report.get("has_backing"):
+            return {"ok": True, "has_backing": False, "report": report}
+        backing_clean = os.path.join(out_dir, "backing_clean.wav")
+        if not os.path.isfile(backing_clean):
+            return {"ok": False, "error": "backing_preprocess_failed", "message": "Background-Spur fehlt nach der Trennung.", "log": log[-1500:]}
+        gated = os.path.join(out_dir, "backing_gated.wav")
+        gate_ok, _gate_log = _hieltech_run_step([
+            os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", backing_clean, "--output", gated,
+        ], timeout=300)
+        final = gated if gate_ok and os.path.isfile(gated) else backing_clean
+        try:
+            converted, ext = _hieltech_wav_to_flac_file(final)
+            handoff_path, _t1 = _hieltech_handoff_store(converted, ext)
+            direct_path, _t2 = _hieltech_handoff_store(converted, ext)
+        except OSError as e:
+            return {"ok": False, "error": "backing_preprocess_handoff_failed", "message": str(e)}
+        return {"ok": True, "has_backing": True, "handoff_path": handoff_path, "direct_path": direct_path, "audio_ext": ext, "report": report}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _hieltech_median_f0(path):
+    """Mittlere Tonhoehe (Hz) der gesungenen Stellen, oder None."""
+    try:
+        import librosa
+        import numpy as np
+
+        y, sr = librosa.load(path, sr=16000, mono=True)
+        if y.size < sr:
+            return None
+        f0 = librosa.yin(y, fmin=70, fmax=900, sr=sr, frame_length=1024)
+        rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=256)[0]
+        n = min(len(f0), len(rms))
+        f0, rms = f0[:n], rms[:n]
+        voiced = f0[rms > (np.max(rms) * 0.1)]
+        if voiced.size < 20:
+            return None
+        return float(np.median(voiced))
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH] Tonhöhen-Messung nicht möglich: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+def _hieltech_octave_shift(median_f0, gender):
+    """Nur ganze Oktaven, damit Harmonien in der Tonart bleiben."""
+    if not median_f0:
+        return 0
+    if gender == "female" and median_f0 < 170:
+        return 12
+    if gender == "male" and median_f0 > 200:
+        return -12
+    return 0
+
+
+@app.post("/v1/hieltech_backing_postprocess")
+async def _hieltech_backing_postprocess(
+    audio: UploadFile | None = File(default=None),
+    src_handoff_path: str = Form(default=""),
+    regenerated: str = Form(default="false"),
+    voices: str = Form(default="[]"),
+):
+    """voices: JSON-Liste bis 3 Eintraege {"slot": 1-3, "model": "custom/..."
+    oder "" (System-Stimme), "gender": "male"|"female"}.
+    Antwort: {"ok": true, "voices": [{"slot", "result_token", "size_bytes",
+    "audio_ext", "rvc_applied", "pitch_shift"}], "warnings": [...]}"""
+    src_bytes = await audio.read() if audio is not None else None
+    filename = audio.filename if audio is not None else ""
+    return await asyncio.to_thread(
+        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices
+    )
+
+
+def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json):
+    warnings = []
+    try:
+        voices = json.loads(voices_json or "[]")
+    except ValueError:
+        voices = []
+    voices = [v for v in voices if isinstance(v, dict)][:3] or [{"slot": 1, "model": "", "gender": "female"}]
+    work_dir = tempfile.mkdtemp(prefix="hieltech_backing_post_")
+    try:
+        if src_bytes:
+            ext = os.path.splitext(filename or "")[1].lower() or ".flac"
+            if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+                ext = ".flac"
+            src_path = os.path.join(work_dir, "backing_src" + ext)
+            with open(src_path, "wb") as f:
+                f.write(src_bytes)
+        elif _hieltech_is_handoff_path(src_handoff_path):
+            src_path = os.path.realpath(src_handoff_path)
+        else:
+            return {"ok": False, "error": "backing_source_missing", "message": "Keine Background-Quelle (weder Datei noch gültiger Handoff-Pfad)."}
+
+        current = src_path
+        if str(regenerated).strip().lower() in {"1", "true", "yes"}:
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "reseparate_vocal_step.py"), current, work_dir])
+            resep = os.path.join(work_dir, "vocals_reseparated.wav")
+            if ok and os.path.isfile(resep):
+                current = resep
+            else:
+                warnings.append("Background: Demucs-Nachtrennung übersprungen: " + log[-300:])
+
+        warm = os.path.join(work_dir, "backing_warm.wav")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "vocal_warmth_step.py"), current, warm])
+        if ok and os.path.isfile(warm):
+            current = warm
+        else:
+            warnings.append("Background: Wärmekette übersprungen: " + log[-300:])
+
+        world = os.path.join(work_dir, "backing_world.wav")
+        world_args = [
+            os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
+            "--input", current, "--output", world,
+            "--f0_method", "harvest", "--d4c_threshold", "0.7", "--mix", "1.0",
+        ]
+        if (os.environ.get("HIELTECH_WORLD_PARALLEL_CALIBRATION") or "").strip().lower() in {"1", "true", "yes", "on"}:
+            world_args.append("--parallel_calibration")
+        ok, log = _hieltech_run_step(world_args)
+        if ok and os.path.isfile(world):
+            current = world
+        else:
+            warnings.append("Background: WORLD-Resynthese übersprungen: " + log[-300:])
+
+        median_f0 = _hieltech_median_f0(current)
+        print(f"[HIELTECH-Info] Background: mittlere Tonhöhe {median_f0 and round(median_f0)} Hz", file=sys.stderr, flush=True)
+
+        results = []
+        for i, v in enumerate(voices):
+            slot = int(v.get("slot") or (i + 1))
+            model = str(v.get("model") or "").strip()
+            gender = "male" if str(v.get("gender") or "").lower() == "male" else "female"
+            if ".." in model or model.startswith("/"):
+                model = ""
+                warnings.append(f"Stimme {slot}: ungültiger Modellname verworfen")
+            voice_path = current
+            rvc_applied = False
+            shift = _hieltech_octave_shift(median_f0, gender)
+            if model:
+                rvc_out = os.path.join(work_dir, f"backing_{slot}_rvc.wav")
+                ok, log = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), current, rvc_out, model, str(shift),
+                ], python_path=_HIELTECH_RVC_VENV_PYTHON)
+                if ok and os.path.isfile(rvc_out):
+                    rvc_applied = True
+                    voice_path = rvc_out
+                    den = os.path.join(work_dir, f"backing_{slot}_den.wav")
+                    ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "denoise_step.py"), "--input", voice_path, "--output", den])
+                    if ok and os.path.isfile(den):
+                        voice_path = den
+                    gated = os.path.join(work_dir, f"backing_{slot}_gate.wav")
+                    ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", voice_path, "--output", gated])
+                    if ok and os.path.isfile(gated):
+                        voice_path = gated
+                else:
+                    warnings.append(f"Stimme {slot}: Stimmwechsel ('{model}') übersprungen, System-Stimme verwendet: " + log[-300:])
+            try:
+                converted, ext = _hieltech_wav_to_flac_file(voice_path) if voice_path.endswith(".wav") else (voice_path, os.path.splitext(voice_path)[1].lstrip(".") or "flac")
+                _hp, token = _hieltech_handoff_store(converted, ext)
+                results.append({
+                    "slot": slot,
+                    "result_token": token,
+                    "size_bytes": os.path.getsize(_hp),
+                    "audio_ext": ext,
+                    "rvc_applied": rvc_applied,
+                    "pitch_shift": shift if rvc_applied else 0,
+                })
+            except OSError as e:
+                warnings.append(f"Stimme {slot}: Ergebnis-Übergabe fehlgeschlagen: {e}")
+        if not results:
+            return {"ok": False, "error": "backing_postprocess_failed", "message": "Keine Background-Stimme konnte erzeugt werden.", "warnings": warnings}
+        return {"ok": True, "voices": results, "warnings": warnings, "median_f0": median_f0}
+    finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
