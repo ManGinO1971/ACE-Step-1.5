@@ -1340,12 +1340,17 @@ def _hieltech_median_f0(path):
 
 
 def _hieltech_octave_shift(median_f0, gender):
-    """Nur ganze Oktaven, damit Harmonien in der Tonart bleiben."""
-    if not median_f0:
-        return 0
-    if gender == "female" and median_f0 < 170:
-        return 12
-    if gender == "male" and median_f0 > 200:
+    """Nur ganze Oktaven, damit Melodie und Harmonien in der Tonart bleiben.
+    NEU (13. Okt 2026, Nutzer-Hoertest "die female sollen +12, auf jeden
+    Fall hoeher, aber genau die vocal range treffen"): weiblich IMMER eine
+    Oktave hoeher, ausser der Background liegt schon klar in Frauenlage
+    (mittlere Tonhoehe ab HIELTECH_BACKING_FEMALE_KEEP_HZ, Standard 250 Hz).
+    Maennlich bleibt, ausser der Background liegt sehr hoch."""
+    female_keep = float(os.environ.get("HIELTECH_BACKING_FEMALE_KEEP_HZ", "250"))
+    male_down = float(os.environ.get("HIELTECH_BACKING_MALE_DOWN_HZ", "330"))
+    if gender == "female":
+        return 0 if (median_f0 and median_f0 >= female_keep) else 12
+    if median_f0 and median_f0 > male_down:
         return -12
     return 0
 
@@ -1435,20 +1440,35 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
             shift = _hieltech_octave_shift(median_f0, gender)
             if model:
                 rvc_out = os.path.join(work_dir, f"backing_{slot}_rvc.wav")
+                # NEU (13. Okt 2026): genaueres Tonhoehen-Verfahren RMVPE fuer
+                # Background (weniger falsche Toene); Rueckfall auf Standard.
+                f0m = (os.environ.get("HIELTECH_BACKING_F0_METHOD") or "rmvpe").strip()
                 ok, log = _hieltech_run_step([
-                    os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), current, rvc_out, model, str(shift),
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), current, rvc_out, model, str(shift), f0m,
                 ], python_path=_HIELTECH_RVC_VENV_PYTHON)
+                if not (ok and os.path.isfile(rvc_out)) and f0m != "harvest":
+                    warnings.append(f"Stimme {slot}: {f0m} nicht nutzbar, Rückfall auf harvest")
+                    ok, log = _hieltech_run_step([
+                        os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), current, rvc_out, model, str(shift),
+                    ], python_path=_HIELTECH_RVC_VENV_PYTHON)
                 if ok and os.path.isfile(rvc_out):
                     rvc_applied = True
                     voice_path = rvc_out
-                    den = os.path.join(work_dir, f"backing_{slot}_den.wav")
-                    ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "denoise_step.py"), "--input", voice_path, "--output", den])
-                    if ok and os.path.isfile(den):
-                        voice_path = den
-                    gated = os.path.join(work_dir, f"backing_{slot}_gate.wav")
-                    ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", voice_path, "--output", gated])
-                    if ok and os.path.isfile(gated):
-                        voice_path = gated
+                    print(f"[HIELTECH-Info] Background Stimme {slot}: {gender}, Transposition {shift:+d}", file=sys.stderr, flush=True)
+                    # NEU (13. Okt 2026, Nutzer-Hoertest "nicht alle 3 Spuren
+                    # haben gleich viel gesungen"): das Noise-Gate (und die
+                    # Rauschentfernung) PRO Stimme schnitten leise Stellen je
+                    # Stimme verschieden weg. Die Spur ist vor dem Stimmwechsel
+                    # bereits gereinigt+gegatet - deshalb standardmaessig aus.
+                    if (os.environ.get("HIELTECH_BACKING_VOICE_CLEANUP") or "0").strip().lower() in {"1", "true", "yes", "on"}:
+                        den = os.path.join(work_dir, f"backing_{slot}_den.wav")
+                        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "denoise_step.py"), "--input", voice_path, "--output", den])
+                        if ok and os.path.isfile(den):
+                            voice_path = den
+                        gated = os.path.join(work_dir, f"backing_{slot}_gate.wav")
+                        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", voice_path, "--output", gated])
+                        if ok and os.path.isfile(gated):
+                            voice_path = gated
                 else:
                     warnings.append(f"Stimme {slot}: Stimmwechsel ('{model}') übersprungen, System-Stimme verwendet: " + log[-300:])
             try:

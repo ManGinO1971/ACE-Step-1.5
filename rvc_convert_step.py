@@ -27,13 +27,17 @@ os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
 def main():
     if len(sys.argv) < 4:
-        print("Nutzung: python rvc_convert_step.py <input.wav> <output.wav> <model_name> [pitch_shift]")
+        print("Nutzung: python rvc_convert_step.py <input.wav> <output.wav> <model_name> [pitch_shift] [f0_method]")
         sys.exit(1)
 
     input_path = sys.argv[1]
     output_path = sys.argv[2]
     model_name = sys.argv[3]
     pitch_shift = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    # NEU (13. Okt 2026, Background Vocals): optionales Tonhoehen-Verfahren
+    # (z.B. "rmvpe" - genauer als der Standard "harvest"). Ohne Angabe bleibt
+    # alles wie bisher (Lead-Vocals unveraendert).
+    f0_method = sys.argv[5].strip() if len(sys.argv) > 5 and sys.argv[5].strip() else None
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     # NEU (10. Okt 2026): auf RunPod liegen die Stimmmodelle auf dem
@@ -69,7 +73,15 @@ def main():
         device = "cpu"
     rvc = RVCInference(device=device)
     rvc.load_model(model_path)
-    rvc.f0_up_key = pitch_shift
+    # FIX (13. Okt 2026): vorher stand hier "rvc.f0_up_key = pitch_shift" -
+    # rvc-python liest aber das Attribut "f0up_key" (ohne Unterstrich), die
+    # Transposition wurde dadurch IMMER stillschweigend ignoriert. set_params()
+    # ist der offizielle Weg und meldet unbekannte Namen.
+    params = {"f0up_key": pitch_shift}
+    if f0_method:
+        params["f0method"] = f0_method
+    rvc.set_params(**params)
+    print(f"RVC: Transposition {pitch_shift:+d} Halbtöne, Tonhöhen-Verfahren {rvc.f0method}")
     if index_path:
         rvc.index_path = index_path
 
