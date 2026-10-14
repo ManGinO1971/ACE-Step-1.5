@@ -1345,12 +1345,16 @@ def _hieltech_octave_shift(median_f0, gender):
     Fall hoeher, aber genau die vocal range treffen"): weiblich IMMER eine
     Oktave hoeher, ausser der Background liegt schon klar in Frauenlage
     (mittlere Tonhoehe ab HIELTECH_BACKING_FEMALE_KEEP_HZ, Standard 250 Hz).
-    Maennlich bleibt, ausser der Background liegt sehr hoch."""
+    Maennlich: NEU (14. Okt 2026, Hoertest "Man-Stimme ist zu tief, soll
+    hoeher") standardmaessig KEINE Transposition mehr - die Maennerstimme
+    singt in der Lage des Backgrounds. Optional per
+    HIELTECH_BACKING_MALE_DOWN_HZ (z.B. 330) wieder eine Oktave tiefer, wenn
+    der Background sehr hoch liegt."""
     female_keep = float(os.environ.get("HIELTECH_BACKING_FEMALE_KEEP_HZ", "250"))
-    male_down = float(os.environ.get("HIELTECH_BACKING_MALE_DOWN_HZ", "330"))
+    male_down = float(os.environ.get("HIELTECH_BACKING_MALE_DOWN_HZ", "0") or 0)
     if gender == "female":
         return 0 if (median_f0 and median_f0 >= female_keep) else 12
-    if median_f0 and median_f0 > male_down:
+    if male_down > 0 and median_f0 and median_f0 > male_down:
         return -12
     return 0
 
