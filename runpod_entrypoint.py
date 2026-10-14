@@ -1554,6 +1554,106 @@ def _hieltech_instrumental_balance_sync(src_bytes, filename, genre_hint):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+# ============================================================================
+# NEU (14. Okt 2026): Hintergrund-Auftraege fuer lange Schritte.
+# RunPod's Load-Balancer bricht JEDE einzelne Anfrage nach 5,5 Minuten ab
+# (docs.runpod.io/serverless/load-balancing/overview, "Processing timeout")
+# -> HTTP 524, die Arbeit war verloren und wurde per Wiederholung sogar
+# doppelt gestartet. Jetzt: eine kurze Start-Anfrage legt den Auftrag an und
+# antwortet sofort mit job_id; runpod-handler.js fragt per
+# /v1/hieltech_job_status (Worker-Affinitaet!) nach, bis er fertig ist. Das
+# Ergebnis ist exakt dasselbe JSON wie bei den bisherigen Routen, die
+# weiterhin unveraendert bestehen bleiben (Rueckfall fuer aeltere Aufrufer).
+# ============================================================================
+_HIELTECH_JOBS = {}
+_HIELTECH_JOBS_LOCK = threading.Lock()
+_HIELTECH_JOB_KEEP_S = 2 * 3600
+
+
+def _hieltech_jobs_cleanup():
+    now = time.time()
+    with _HIELTECH_JOBS_LOCK:
+        for jid in [j for j, v in _HIELTECH_JOBS.items() if now - v.get("started", now) > _HIELTECH_JOB_KEEP_S]:
+            _HIELTECH_JOBS.pop(jid, None)
+
+
+def _hieltech_job_start(label, fn, *args):
+    _hieltech_jobs_cleanup()
+    job_id = uuid.uuid4().hex
+    with _HIELTECH_JOBS_LOCK:
+        _HIELTECH_JOBS[job_id] = {"status": "running", "label": label, "started": time.time()}
+
+    def _run():
+        try:
+            result = fn(*args)
+        except Exception as e:  # noqa: BLE001 - Fehler als Ergebnis melden, nie den Server stoeren
+            result = {"ok": False, "error": "job_exception", "message": f"{type(e).__name__}: {e}"}
+        with _HIELTECH_JOBS_LOCK:
+            job = _HIELTECH_JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "done"
+                job["result"] = result
+                job["finished"] = time.time()
+        print(f"[HIELTECH-Zeitmessung] Auftrag {label}: {time.time() - _HIELTECH_JOBS.get(job_id, {}).get('started', time.time()):.1f}s", file=sys.stderr, flush=True)
+
+    threading.Thread(target=_run, name=f"hieltech-{label}", daemon=True).start()
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/v1/hieltech_job_status")
+async def _hieltech_job_status(job_id: str = ""):
+    if not _HIELTECH_TOKEN_RE.match(job_id or ""):
+        return Response(status_code=400, content=b"ungueltige job_id")
+    with _HIELTECH_JOBS_LOCK:
+        job = dict(_HIELTECH_JOBS.get(job_id) or {})
+    if not job:
+        return Response(status_code=404, content=b"Auftrag unbekannt - falscher Worker oder abgelaufen")
+    elapsed = round(time.time() - job.get("started", time.time()), 1)
+    if job.get("status") != "done":
+        return {"ok": True, "status": "running", "label": job.get("label"), "elapsed": elapsed}
+    return {"ok": True, "status": "done", "label": job.get("label"), "elapsed": elapsed, "result": job.get("result")}
+
+
+@app.post("/v1/hieltech_vocals_preprocess_start")
+async def _hieltech_vocals_preprocess_start(audio: UploadFile):
+    src_bytes = await audio.read()
+    return _hieltech_job_start("vocals_preprocess", _hieltech_vocals_preprocess_sync, src_bytes, audio.filename)
+
+
+@app.post("/v1/hieltech_vocals_postprocess_start")
+async def _hieltech_vocals_postprocess_start(
+    audio: UploadFile,
+    voice_model: str = Form(default=""),
+    apply_reverb: str = Form(default="false"),
+):
+    step2_bytes = await audio.read()
+    return _hieltech_job_start("vocals_postprocess", _hieltech_vocals_postprocess_sync, step2_bytes, audio.filename, voice_model, apply_reverb)
+
+
+@app.post("/v1/hieltech_backing_preprocess_start")
+async def _hieltech_backing_preprocess_start(audio: UploadFile):
+    src_bytes = await audio.read()
+    return _hieltech_job_start("backing_preprocess", _hieltech_backing_preprocess_sync, src_bytes, audio.filename)
+
+
+@app.post("/v1/hieltech_backing_postprocess_start")
+async def _hieltech_backing_postprocess_start(
+    audio: UploadFile | None = File(default=None),
+    src_handoff_path: str = Form(default=""),
+    regenerated: str = Form(default="false"),
+    voices: str = Form(default="[]"),
+):
+    src_bytes = await audio.read() if audio is not None else None
+    filename = audio.filename if audio is not None else ""
+    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices)
+
+
+@app.post("/v1/hieltech_instrumental_balance_start")
+async def _hieltech_instrumental_balance_start(audio: UploadFile, genre_hint: str = Form(default="")):
+    src_bytes = await audio.read()
+    return _hieltech_job_start("instrumental_balance", _hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint)
+
+
 @app.get("/v1/hieltech_fetch_chunk")
 async def _hieltech_fetch_chunk(token: str, offset: int = 0, length: int = 18_000_000, done: str = "false"):
     """Liest einen Byte-Bereich aus einer per _hieltech_handoff_store
