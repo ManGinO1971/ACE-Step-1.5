@@ -59,6 +59,102 @@ import uuid
 import asyncio
 import concurrent.futures
 
+
+# =============================================================================
+# HIELTECH (14. Okt 2026): Modell-Pruefung beim Start, BEVOR ACE-Step laedt.
+# /app/checkpoints ist das RunPod-Netzwerk-Volume (siehe Dockerfile CMD). Lief
+# das Volume beim Herunterladen voll ("Disk quota exceeded"), bleibt ein
+# halber Modellordner liegen - ACE-Step prueft nur, ob der ORDNER existiert,
+# und laedt ihn nie neu. Hier: jede .safetensors-Datei der zu pruefenden
+# Modelle gegen ihren eigenen Header pruefen (erwartete Groesse = 8 + Header +
+# Datenende); unvollstaendig -> Ordner loeschen, ACE-Step laedt dann neu.
+# Zusaetzlich die Belegung je Modellordner ins Log, damit man sieht, wie gross
+# das Volume sein muss.
+# =============================================================================
+def _hieltech_safetensors_complete(path):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                return False
+            header_len = int.from_bytes(raw, "little")
+            if header_len <= 0 or header_len > 100 * 1024 * 1024:
+                return False
+            header = json.loads(f.read(header_len).decode("utf-8"))
+        data_end = 0
+        for key, meta in header.items():
+            if key == "__metadata__" or not isinstance(meta, dict):
+                continue
+            offsets = meta.get("data_offsets") or [0, 0]
+            data_end = max(data_end, int(offsets[1]))
+        return size == 8 + header_len + data_end
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hieltech_dir_size_gb(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total / (1024 ** 3)
+
+
+def _hieltech_check_models_at_startup():
+    ckpt = os.environ.get("HIELTECH_CHECKPOINTS_DIR", "/app/checkpoints")
+    if not os.path.isdir(ckpt):
+        return
+    try:
+        sizes = []
+        for name in sorted(os.listdir(ckpt)):
+            full = os.path.join(ckpt, name)
+            if os.path.isdir(full):
+                sizes.append(f"{name}={_hieltech_dir_size_gb(full):.1f} GB")
+        usage = shutil.disk_usage(ckpt)
+        print(f"[HIELTECH-Info] Volume-Belegung: {', '.join(sizes) or '(leer)'}; "
+              f"laut System {usage.used / 1024 ** 3:.1f} GB belegt, {usage.free / 1024 ** 3:.1f} GB frei", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH-Info] Volume-Belegung nicht messbar: {e}", file=sys.stderr, flush=True)
+
+    names = [n.strip() for n in os.environ.get("HIELTECH_VERIFY_MODELS", "acestep-v15-base").split(",") if n.strip()]
+    for name in names:
+        if "/" in name or ".." in name:
+            continue
+        model_dir = os.path.join(ckpt, name)
+        if not os.path.isdir(model_dir):
+            continue
+        files = glob.glob(os.path.join(model_dir, "**", "*.safetensors"), recursive=True)
+        broken = [os.path.basename(f) for f in files if not _hieltech_safetensors_complete(f)]
+        if files and not broken:
+            print(f"[HIELTECH-Info] Modell {name}: vollständig ({len(files)} Gewichtsdatei(en))", file=sys.stderr, flush=True)
+            continue
+        reason = f"unvollständige Datei(en): {', '.join(broken)}" if broken else "keine Gewichtsdatei gefunden"
+        # Mehrere Worker teilen sich das Volume: laeuft gerade bei einem
+        # anderen Worker der Download, NICHT dazwischenfunken (Dateien in den
+        # letzten 15 Minuten veraendert -> stehen lassen).
+        newest = 0.0
+        for root, _dirs, fnames in os.walk(model_dir):
+            for fn in fnames:
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(root, fn)))
+                except OSError:
+                    pass
+        if newest and time.time() - newest < 900:
+            print(f"[HIELTECH] Modell {name}: {reason} - wird gerade noch geschrieben (anderer Worker?), bleibt stehen", file=sys.stderr, flush=True)
+            continue
+        print(f"[HIELTECH] Modell {name}: {reason} - Ordner wird gelöscht und neu heruntergeladen", file=sys.stderr, flush=True)
+        shutil.rmtree(model_dir, ignore_errors=True)
+
+
+try:
+    _hieltech_check_models_at_startup()
+except Exception as _e:  # noqa: BLE001
+    print(f"[HIELTECH] Modell-Prüfung übersprungen: {_e}", file=sys.stderr, flush=True)
+
 from fastapi import Response, Request, UploadFile, Form, File
 from acestep.api_server import app
 
