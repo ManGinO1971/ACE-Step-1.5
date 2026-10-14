@@ -1461,6 +1461,8 @@ async def _hieltech_backing_postprocess(
     src_handoff_path: str = Form(default=""),
     regenerated: str = Form(default="false"),
     voices: str = Form(default="[]"),
+    world_mix: str = Form(default="1.0"),
+    reseparate: str = Form(default="1"),
 ):
     """voices: JSON-Liste bis 3 Eintraege {"slot": 1-3, "model": "custom/..."
     oder "" (System-Stimme), "gender": "male"|"female"}.
@@ -1469,11 +1471,11 @@ async def _hieltech_backing_postprocess(
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
     return await asyncio.to_thread(
-        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices
+        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate
     )
 
 
-def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json):
+def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json, world_mix="1.0", reseparate="1"):
     warnings = []
     try:
         voices = json.loads(voices_json or "[]")
@@ -1494,8 +1496,19 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
         else:
             return {"ok": False, "error": "backing_source_missing", "message": "Keine Background-Quelle (weder Datei noch gültiger Handoff-Pfad)."}
 
+        # NEU (14. Okt 2026, Hoertest "Roboter-Klang auf allen 3 Spuren"):
+        # WORLD (nur EINE Tonhoehe gleichzeitig -> mehrstimmige Harmonien
+        # klingen roboterhaft) und die Demucs-Nachtrennung sind jetzt pro
+        # Anfrage abschaltbar (VPS-.env BACKING_WORLD_MIX / BACKING_RESEP).
+        try:
+            world_mix_f = max(0.0, min(1.0, float(world_mix)))
+        except (TypeError, ValueError):
+            world_mix_f = 1.0
+        resep_on = str(reseparate).strip().lower() not in {"0", "false", "no", "off"}
+        print(f"[HIELTECH-Info] Background-Nachbearbeitung: Nachtrennung {'an' if resep_on else 'aus'}, WORLD-Anteil {world_mix_f:.2f}", file=sys.stderr, flush=True)
+
         current = src_path
-        if str(regenerated).strip().lower() in {"1", "true", "yes"}:
+        if resep_on and str(regenerated).strip().lower() in {"1", "true", "yes"}:
             ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "reseparate_vocal_step.py"), current, work_dir])
             resep = os.path.join(work_dir, "vocals_reseparated.wav")
             if ok and os.path.isfile(resep):
@@ -1510,19 +1523,20 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
         else:
             warnings.append("Background: Wärmekette übersprungen: " + log[-300:])
 
-        world = os.path.join(work_dir, "backing_world.wav")
-        world_args = [
-            os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
-            "--input", current, "--output", world,
-            "--f0_method", "harvest", "--d4c_threshold", "0.7", "--mix", "1.0",
-        ]
-        if (os.environ.get("HIELTECH_WORLD_PARALLEL_CALIBRATION") or "").strip().lower() in {"1", "true", "yes", "on"}:
-            world_args.append("--parallel_calibration")
-        ok, log = _hieltech_run_step(world_args)
-        if ok and os.path.isfile(world):
-            current = world
-        else:
-            warnings.append("Background: WORLD-Resynthese übersprungen: " + log[-300:])
+        if world_mix_f > 0:
+            world = os.path.join(work_dir, "backing_world.wav")
+            world_args = [
+                os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
+                "--input", current, "--output", world,
+                "--f0_method", "harvest", "--d4c_threshold", "0.7", "--mix", f"{world_mix_f:.2f}",
+            ]
+            if (os.environ.get("HIELTECH_WORLD_PARALLEL_CALIBRATION") or "").strip().lower() in {"1", "true", "yes", "on"}:
+                world_args.append("--parallel_calibration")
+            ok, log = _hieltech_run_step(world_args)
+            if ok and os.path.isfile(world):
+                current = world
+            else:
+                warnings.append("Background: WORLD-Resynthese übersprungen: " + log[-300:])
 
         median_f0 = _hieltech_median_f0(current)
         print(f"[HIELTECH-Info] Background: mittlere Tonhöhe {median_f0 and round(median_f0)} Hz", file=sys.stderr, flush=True)
@@ -1742,10 +1756,12 @@ async def _hieltech_backing_postprocess_start(
     src_handoff_path: str = Form(default=""),
     regenerated: str = Form(default="false"),
     voices: str = Form(default="[]"),
+    world_mix: str = Form(default="1.0"),
+    reseparate: str = Form(default="1"),
 ):
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
-    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices)
+    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate)
 
 
 @app.post("/v1/hieltech_instrumental_balance_start")
