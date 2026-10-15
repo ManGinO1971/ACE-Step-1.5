@@ -1408,7 +1408,17 @@ def _hieltech_backing_preprocess_sync(src_bytes, filename):
             direct_path, _t2 = _hieltech_handoff_store(converted, ext)
         except OSError as e:
             return {"ok": False, "error": "backing_preprocess_handoff_failed", "message": str(e)}
-        return {"ok": True, "has_backing": True, "handoff_path": handoff_path, "direct_path": direct_path, "audio_ext": ext, "report": report}
+        # NEU (15. Okt 2026): Song ohne Lead-Gesang als Vorlage fuer Lego
+        # (nur per Worker-Affinitaet erreichbar, wie handoff_path).
+        context_path = None
+        ctx_wav = os.path.join(out_dir, "context_no_lead.wav")
+        if os.path.isfile(ctx_wav):
+            try:
+                ctx_conv, ctx_ext = _hieltech_wav_to_flac_file(ctx_wav)
+                context_path, _t3 = _hieltech_handoff_store(ctx_conv, ctx_ext)
+            except OSError as e:
+                print(f"[HIELTECH] Song ohne Lead nicht übergebbar: {e}", file=sys.stderr, flush=True)
+        return {"ok": True, "has_backing": True, "handoff_path": handoff_path, "direct_path": direct_path, "context_path": context_path, "audio_ext": ext, "report": report}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1455,6 +1465,42 @@ def _hieltech_octave_shift(median_f0, gender):
     return 0
 
 
+def _hieltech_apply_backing_mask(voice_path, mask_path, out_path):
+    """NEU (15. Okt 2026, Hoertest "Lead-Gesang ist mit drin, soll nur die
+    (Klammer)-Stellen treffen"): die neue Stimme ist nur dort hoerbar, wo im
+    Original Background gesungen wird (Huellkurve der gereinigten Original-
+    Background-Spur, mit Haltezeit und weichen Uebergaengen)."""
+    try:
+        import librosa
+        import numpy as np
+        import soundfile as sf
+
+        y, sr = sf.read(voice_path, always_2d=True)
+        m, _ = librosa.load(mask_path, sr=sr, mono=True)
+        hop = 512
+        rms = librosa.feature.rms(y=m, frame_length=2048, hop_length=hop)[0]
+        if rms.size == 0 or float(np.max(rms)) <= 0:
+            return False
+        thr_db = float(os.environ.get("HIELTECH_BACKING_MASK_DB", "-32"))
+        hold_s = float(os.environ.get("HIELTECH_BACKING_MASK_HOLD_S", "0.25"))
+        fade_s = float(os.environ.get("HIELTECH_BACKING_MASK_FADE_S", "0.06"))
+        active = rms > float(np.max(rms)) * (10 ** (thr_db / 20.0))
+        hold = max(1, int(hold_s * sr / hop))
+        kernel = np.ones(2 * hold + 1)
+        active = np.convolve(active.astype(float), kernel, mode="same") > 0
+        fade = max(1, int(fade_s * sr / hop))
+        env = np.convolve(active.astype(float), np.ones(fade) / fade, mode="same")
+        env = np.clip(env, 0.0, 1.0)
+        t_frames = np.arange(env.size) * hop
+        gain = np.interp(np.arange(y.shape[0]), t_frames, env, right=0.0)
+        sf.write(out_path, y * gain[:, None], sr)
+        print(f"[HIELTECH-Info] Zeitmaske: Stimme an {100.0 * float(np.mean(active)):.0f} % der Songdauer hörbar", file=sys.stderr, flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH] Zeitmaske nicht möglich: {e}", file=sys.stderr, flush=True)
+        return False
+
+
 @app.post("/v1/hieltech_backing_postprocess")
 async def _hieltech_backing_postprocess(
     audio: UploadFile | None = File(default=None),
@@ -1463,6 +1509,7 @@ async def _hieltech_backing_postprocess(
     voices: str = Form(default="[]"),
     world_mix: str = Form(default="1.0"),
     reseparate: str = Form(default="1"),
+    mask_path: str = Form(default=""),
 ):
     """voices: JSON-Liste bis 3 Eintraege {"slot": 1-3, "model": "custom/..."
     oder "" (System-Stimme), "gender": "male"|"female"}.
@@ -1471,11 +1518,11 @@ async def _hieltech_backing_postprocess(
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
     return await asyncio.to_thread(
-        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate
+        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path
     )
 
 
-def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json, world_mix="1.0", reseparate="1"):
+def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json, world_mix="1.0", reseparate="1", mask_path=""):
     warnings = []
     try:
         voices = json.loads(voices_json or "[]")
@@ -1585,6 +1632,12 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
                             voice_path = gated
                 else:
                     warnings.append(f"Stimme {slot}: Stimmwechsel ('{model}') übersprungen, System-Stimme verwendet: " + log[-300:])
+            if mask_path and _hieltech_is_handoff_path(mask_path):
+                masked = os.path.join(work_dir, f"backing_{slot}_masked.wav")
+                if _hieltech_apply_backing_mask(voice_path, os.path.realpath(mask_path), masked):
+                    voice_path = masked
+                else:
+                    warnings.append(f"Stimme {slot}: Zeitmaske übersprungen")
             try:
                 converted, ext = _hieltech_wav_to_flac_file(voice_path) if voice_path.endswith(".wav") else (voice_path, os.path.splitext(voice_path)[1].lstrip(".") or "flac")
                 _hp, token = _hieltech_handoff_store(converted, ext)
@@ -1758,10 +1811,11 @@ async def _hieltech_backing_postprocess_start(
     voices: str = Form(default="[]"),
     world_mix: str = Form(default="1.0"),
     reseparate: str = Form(default="1"),
+    mask_path: str = Form(default=""),
 ):
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
-    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate)
+    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path)
 
 
 @app.post("/v1/hieltech_instrumental_balance_start")

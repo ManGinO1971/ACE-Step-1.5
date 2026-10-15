@@ -19,7 +19,10 @@ Gesangsspur). Deshalb:
      Background-Spur im Verhaeltnis zur gesamten Gesangsspur).
 
 Aufruf: python backing_separate_step.py <song> <output_dir>
-Erzeugt in <output_dir>: backing_clean.wav (nur wenn vorhanden)
+Erzeugt in <output_dir>: backing_clean.wav (nur wenn vorhanden) und
+context_no_lead.wav (Song OHNE Lead-Gesang = Instrumente + Original-
+Background; NEU 15. Okt 2026, Vorlage fuer den Lego-Modus, damit das Modell
+den Lead nicht mitsingt)
 Letzte stdout-Zeile: JSON {"ok": true, "has_backing": bool, ...}
 """
 import json
@@ -81,11 +84,36 @@ def run_karaoke(vocals_path, out_dir, model_file_dir):
             if not lead or not others:
                 raise RuntimeError(f"{model}: Ausgaben nicht eindeutig zuordenbar: {[os.path.basename(o) for o in outs]}")
             print(f"Lead/Background-Trennung mit {model}", file=sys.stderr, flush=True)
-            return others[0], model
+            return others[0], model, lead[0]
         except Exception as e:  # noqa: BLE001 - naechstes Modell versuchen
             last_err = e
             print(f"Karaoke-Modell {model} nicht nutzbar ({e}) – versuche nächstes.", file=sys.stderr, flush=True)
     raise RuntimeError(f"Kein Karaoke-Trennmodell nutzbar: {last_err}")
+
+
+def _load_stereo(path, sr):
+    import librosa
+
+    y, _ = librosa.load(path, sr=sr, mono=False)
+    y = np.atleast_2d(y)
+    if y.shape[0] == 1:
+        y = np.vstack([y, y])
+    return y[:2]
+
+
+def write_context_without_lead(song, lead_path, sr, out_path):
+    """Song minus Lead-Stimme (beide auf dieselbe Abtastrate gebracht)."""
+    mix = _load_stereo(song, sr)
+    lead = _load_stereo(lead_path, sr)
+    n = min(mix.shape[1], lead.shape[1])
+    ctx = mix[:, :n] - lead[:, :n]
+    if mix.shape[1] > n:
+        ctx = np.concatenate([ctx, mix[:, n:]], axis=1)
+    peak = float(np.max(np.abs(ctx))) if ctx.size else 0.0
+    if peak > 0.99:
+        ctx = ctx * (0.99 / peak)
+    sf.write(out_path, ctx.T, sr)
+    print("Song ohne Lead-Gesang erzeugt (Vorlage für Lego)", file=sys.stderr, flush=True)
 
 
 def main():
@@ -102,7 +130,11 @@ def main():
         vocals_path = os.path.join(work, "vocals_all.wav")
         sf.write(vocals_path, vocals, sr)
 
-        backing_raw, model_used = run_karaoke(vocals_path, work, model_file_dir)
+        backing_raw, model_used, lead_path = run_karaoke(vocals_path, work, model_file_dir)
+        try:
+            write_context_without_lead(song, lead_path, sr, os.path.join(out_dir, "context_no_lead.wav"))
+        except Exception as e:  # noqa: BLE001 - nur fuer Lego noetig, nie fatal
+            print(f"Song ohne Lead nicht erzeugbar ({e})", file=sys.stderr, flush=True)
         braw, bsr = sf.read(backing_raw)
         l_vocals = lufs(np.atleast_2d(vocals.T) if vocals.ndim > 1 else vocals[None, :], sr)
         l_back = lufs(np.atleast_2d(braw.T) if braw.ndim > 1 else braw[None, :], bsr)
