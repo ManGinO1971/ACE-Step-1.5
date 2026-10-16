@@ -473,6 +473,11 @@ def main() -> int:
     p.add_argument("--d4c_threshold", type=float, default=0.85,
                     help="D4C-Schwelle fuer den Rausch-/Atemanteil (Standard 0.85). Hoeher = "
                          "natuerlichere, luftigere Hoehen/S-Laute; niedriger = tonigere, klarere Hoehen.")
+    p.add_argument("--f0_file", default=None,
+                   help="Tonhoehe aus Datei (numpy .npy, Hz pro Frame) statt eigener Suche (Melodie-Lock).")
+    p.add_argument("--f0_hop_ms", type=float, default=10.0, help="Frame-Abstand der --f0_file in ms.")
+    p.add_argument("--f0_fill_gaps_ms", type=float, default=150.0,
+                   help="Stimmlose Luecken bis zu dieser Laenge mit der Melodie fuellen (leise Stellen).")
     p.add_argument("--f0_method", choices=["dio", "harvest"], default="dio",
                     help="Tonhoehen-Tracker: 'dio' (Standard, schnell) oder 'harvest' (deutlich "
                          "langsamer, aber robuster bei lauten/geschrienen/unruhigen Passagen, wo "
@@ -534,7 +539,15 @@ def main() -> int:
           f"(Eingang war {audio.shape[1]}-kanalig, fuer die Analyse zu Mono zusammengefasst)", flush=True)
 
     f0_floor, f0_ceil = args.f0_floor, args.f0_ceil
-    if f0_floor is None or f0_ceil is None:
+    f0_ext = None
+    if args.f0_file:
+        # NEU (16. Okt 2026, "Melodie-Lock"): Tonhoehe kommt von aussen (RMVPE,
+        # findet die Hauptmelodie auch in mehrstimmigem Gesang) statt aus
+        # Harvest/Dio, die bei Harmonien zwischen den Stimmen springen.
+        f0_ext = np.load(args.f0_file).astype(np.float64)
+        f0_floor = f0_floor or 50.0
+        f0_ceil = f0_ceil or 1100.0
+    if f0_ext is None and (f0_floor is None or f0_ceil is None):
         print("Kalibriere Tonhoehen-Suchbereich automatisch auf diese Stimme/diesen Song "
               "(Erstdurchlauf 50-1100 Hz)...", flush=True)
         auto_floor, auto_ceil, ok = auto_calibrate_f0_range(
@@ -551,7 +564,30 @@ def main() -> int:
             print(f"  Kalibrierung unsicher (zu wenig stimmhaftes Material) - "
                   f"Rueckfall auf breiten Standardbereich {f0_floor:.0f}-{f0_ceil:.0f} Hz", flush=True)
 
-    if args.f0_method == "harvest":
+    if f0_ext is not None:
+        t = np.arange(int(len(mono) / sr * 1000.0 / _FRAME_PERIOD_MS) + 1) * (_FRAME_PERIOD_MS / 1000.0)
+        src_t = np.arange(f0_ext.size) * (args.f0_hop_ms / 1000.0)
+        voiced_src = f0_ext > 0
+        # kurze stimmlose Luecken (leise Stellen) zwischen zwei stimmhaften
+        # Abschnitten mit der Melodie fuellen
+        gap_frames = int(args.f0_fill_gaps_ms / args.f0_hop_ms)
+        filled = f0_ext.copy()
+        if gap_frames > 0 and voiced_src.any():
+            idx = np.flatnonzero(voiced_src)
+            for a, b in zip(idx[:-1], idx[1:]):
+                if 1 < b - a <= gap_frames + 1:
+                    la, lb = np.log(f0_ext[a]), np.log(f0_ext[b])
+                    for k in range(a + 1, b):
+                        filled[k] = np.exp(la + (lb - la) * (k - a) / (b - a))
+        n_filled = int(np.sum((filled > 0) & ~voiced_src))
+        vmask = filled > 0
+        logf = np.where(vmask, np.log(np.maximum(filled, 1e-6)), 0.0)
+        f0 = np.exp(np.interp(t, src_t, logf))
+        near = np.interp(t, src_t, vmask.astype(float)) > 0.5
+        f0 = np.where(near, f0, 0.0)
+        print(f"Tonhoehe (F0) aus Melodie-Datei uebernommen ({f0_ext.size} Frames a {args.f0_hop_ms:.0f} ms, "
+              f"{n_filled} Frames in leisen Luecken ergaenzt)", flush=True)
+    elif args.f0_method == "harvest":
         print(f"Extrahiere Tonhoehe (F0) ueber Harvest (robuster, langsamer), "
               f"Suchbereich {f0_floor:.0f}-{f0_ceil:.0f} Hz...", flush=True)
         f0, t = pw.harvest(mono, sr, f0_floor=f0_floor, f0_ceil=f0_ceil)

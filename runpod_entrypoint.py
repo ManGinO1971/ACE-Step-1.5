@@ -1552,6 +1552,7 @@ async def _hieltech_backing_postprocess(
     world_mix: str = Form(default="1.0"),
     reseparate: str = Form(default="1"),
     mask_path: str = Form(default=""),
+    melody_lock: str = Form(default="0"),
 ):
     """voices: JSON-Liste bis 3 Eintraege {"slot": 1-3, "model": "custom/..."
     oder "" (System-Stimme), "gender": "male"|"female"}.
@@ -1560,11 +1561,11 @@ async def _hieltech_backing_postprocess(
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
     return await asyncio.to_thread(
-        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path
+        _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path, melody_lock
     )
 
 
-def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json, world_mix="1.0", reseparate="1", mask_path=""):
+def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, regenerated, voices_json, world_mix="1.0", reseparate="1", mask_path="", melody_lock="0"):
     warnings = []
     try:
         voices = json.loads(voices_json or "[]")
@@ -1594,7 +1595,7 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
         except (TypeError, ValueError):
             world_mix_f = 1.0
         resep_on = str(reseparate).strip().lower() not in {"0", "false", "no", "off"}
-        print(f"[HIELTECH-Info] Background-Nachbearbeitung: Nachtrennung {'an' if resep_on else 'aus'}, WORLD-Anteil {world_mix_f:.2f}", file=sys.stderr, flush=True)
+        print(f"[HIELTECH-Info] Background-Nachbearbeitung: Nachtrennung {'an' if resep_on else 'aus'}, WORLD-Anteil {world_mix_f:.2f}, Melodie-Lock {melody_lock}", file=sys.stderr, flush=True)
 
         current = src_path
         if resep_on and str(regenerated).strip().lower() in {"1", "true", "yes"}:
@@ -1612,7 +1613,39 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
         else:
             warnings.append("Background: Wärmekette übersprungen: " + log[-300:])
 
-        if world_mix_f > 0:
+        # NEU (16. Okt 2026, Nutzerwunsch "De-Harmonizer: die richtige Melodie
+        # holen - auch an leisen Stellen -, einstimmig neu singen, dann
+        # Vocoder"): RMVPE holt EINE Hauptmelodie aus der mehrstimmigen Spur,
+        # WORLD baut damit eine einstimmige Stimme neu auf. Ersetzt dann den
+        # normalen WORLD-Schritt (der seine Tonhoehe selbst suchte und bei
+        # Harmonien zwischen den Stimmen sprang -> Roboter-Klang).
+        locked = False
+        if str(melody_lock).strip().lower() in {"1", "true", "yes", "on"}:
+            f0_file = os.path.join(work_dir, "backing_melody_f0.npy")
+            ok, log = _hieltech_run_step(
+                [os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_step.py"), current, f0_file],
+                python_path=_HIELTECH_RVC_VENV_PYTHON,
+            )
+            for line in (log or "").splitlines():
+                if line.startswith("Melodie-Linie"):
+                    print(f"[HIELTECH-Info] {line.strip()}", file=sys.stderr, flush=True)
+            if ok and os.path.isfile(f0_file):
+                mono_out = os.path.join(work_dir, "backing_melody_lock.wav")
+                ok2, log2 = _hieltech_run_step([
+                    os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
+                    "--input", current, "--output", mono_out, "--f0_file", f0_file,
+                    "--d4c_threshold", os.environ.get("HIELTECH_MELODY_D4C", "0.85"), "--mix", "1.0",
+                ])
+                if ok2 and os.path.isfile(mono_out):
+                    current = mono_out
+                    locked = True
+                    print("[HIELTECH-Info] Melodie-Lock: einstimmige Background-Stimme neu aufgebaut", file=sys.stderr, flush=True)
+                else:
+                    warnings.append("Background: Melodie-Lock (Neusynthese) übersprungen: " + (log2 or "")[-300:])
+            else:
+                warnings.append("Background: Melodie-Lock (RMVPE) übersprungen: " + (log or "")[-300:])
+
+        if world_mix_f > 0 and not locked:
             world = os.path.join(work_dir, "backing_world.wav")
             world_args = [
                 os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
@@ -1854,10 +1887,11 @@ async def _hieltech_backing_postprocess_start(
     world_mix: str = Form(default="1.0"),
     reseparate: str = Form(default="1"),
     mask_path: str = Form(default=""),
+    melody_lock: str = Form(default="0"),
 ):
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
-    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path)
+    return _hieltech_job_start("backing_postprocess", _hieltech_backing_postprocess_sync, src_bytes, filename, src_handoff_path, regenerated, voices, world_mix, reseparate, mask_path, melody_lock)
 
 
 @app.post("/v1/hieltech_instrumental_balance_start")
