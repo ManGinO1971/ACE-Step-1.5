@@ -476,6 +476,8 @@ def main() -> int:
     p.add_argument("--f0_file", default=None,
                    help="Tonhoehe aus Datei (numpy .npy, Hz pro Frame) statt eigener Suche (Melodie-Lock).")
     p.add_argument("--f0_hop_ms", type=float, default=10.0, help="Frame-Abstand der --f0_file in ms.")
+    p.add_argument("--f0_median_ms", type=float, default=0.0,
+                   help="Ton-Stabilisierung fuer --f0_file: gleitender Median in ms (0 = aus).")
     p.add_argument("--f0_fill_gaps_ms", type=float, default=150.0,
                    help="Stimmlose Luecken bis zu dieser Laenge mit der Melodie fuellen (leise Stellen).")
     p.add_argument("--f0_method", choices=["dio", "harvest"], default="dio",
@@ -587,6 +589,20 @@ def main() -> int:
         f0 = np.where(near, f0, 0.0)
         print(f"Tonhoehe (F0) aus Melodie-Datei uebernommen ({f0_ext.size} Frames a {args.f0_hop_ms:.0f} ms, "
               f"{n_filled} Frames in leisen Luecken ergaenzt)", flush=True)
+        # NEU (16. Okt 2026, Hoertest "Toene brechen, wellig - sollen stabil
+        # werden"): gleitender Median ueber jeden stimmhaften Abschnitt
+        # (im Halbton-Bereich) - glaettet kurze Wackler/Brueche, ohne den
+        # Melodieverlauf zwischen den Noten zu verwischen.
+        if args.f0_median_ms > 0:
+            from scipy.ndimage import median_filter
+
+            win = max(3, int(round(args.f0_median_ms / _FRAME_PERIOD_MS)) | 1)
+            voiced = f0 > 0
+            edges = np.flatnonzero(np.diff(np.concatenate([[0], voiced.astype(int), [0]])))
+            for a, b in zip(edges[0::2], edges[1::2]):
+                if b - a >= 3:
+                    f0[a:b] = np.exp(median_filter(np.log(f0[a:b]), size=min(win, (b - a) | 1), mode="nearest"))
+            print(f"  Ton-Stabilisierung: gleitender Median ueber {win * _FRAME_PERIOD_MS:.0f} ms je Abschnitt", flush=True)
     elif args.f0_method == "harvest":
         print(f"Extrahiere Tonhoehe (F0) ueber Harvest (robuster, langsamer), "
               f"Suchbereich {f0_floor:.0f}-{f0_ceil:.0f} Hz...", flush=True)
