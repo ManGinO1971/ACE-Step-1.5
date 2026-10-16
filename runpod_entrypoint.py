@@ -1523,9 +1523,9 @@ def _hieltech_apply_backing_mask(voice_path, mask_path, out_path):
         rms = librosa.feature.rms(y=m, frame_length=2048, hop_length=hop)[0]
         if rms.size == 0 or float(np.max(rms)) <= 0:
             return False
-        thr_db = float(os.environ.get("HIELTECH_BACKING_MASK_DB", "-45"))
-        hold_s = float(os.environ.get("HIELTECH_BACKING_MASK_HOLD_S", "0.5"))
-        fade_s = float(os.environ.get("HIELTECH_BACKING_MASK_FADE_S", "0.12"))
+        thr_db = float(os.environ.get("HIELTECH_BACKING_MASK_DB", "-32"))
+        hold_s = float(os.environ.get("HIELTECH_BACKING_MASK_HOLD_S", "0.25"))
+        fade_s = float(os.environ.get("HIELTECH_BACKING_MASK_FADE_S", "0.06"))
         active = rms > float(np.max(rms)) * (10 ** (thr_db / 20.0))
         hold = max(1, int(hold_s * sr / hop))
         kernel = np.ones(2 * hold + 1)
@@ -1635,11 +1635,6 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
                     os.path.join(_HIELTECH_PROJECT_ROOT, "world_resynth_step.py"),
                     "--input", current, "--output", mono_out, "--f0_file", f0_file,
                     "--d4c_threshold", os.environ.get("HIELTECH_MELODY_D4C", "0.85"), "--mix", "1.0",
-                    # NEU (16. Okt 2026, Hoertest "Toene brechen"): strengere
-                    # Sprungbegrenzung + Glaettung je Ton, mehr Lueckenfuellung
-                    "--f0_max_semitones_per_sec", os.environ.get("HIELTECH_MELODY_SLEW", "200"),
-                    "--f0_median_ms", os.environ.get("HIELTECH_MELODY_MEDIAN_MS", "70"),
-                    "--f0_fill_gaps_ms", os.environ.get("HIELTECH_MELODY_FILL_MS", "250"),
                 ])
                 if ok2 and os.path.isfile(mono_out):
                     current = mono_out
