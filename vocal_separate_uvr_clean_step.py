@@ -157,7 +157,7 @@ def run_uvr_stage(input_path, output_dir, model_filename, target_stem, model_fil
         output_single_stem=target_stem,
         model_file_dir=model_file_dir,
         log_level=logging.WARNING,
-        vr_params={"batch_size": 4, "window_size": 512, "aggression": 5, "enable_tta": False,
+        vr_params={"batch_size": int(os.environ.get("HIELTECH_UVR_BATCH", "4")), "window_size": 512, "aggression": 5, "enable_tta": False,
                    "enable_post_process": False, "post_process_threshold": 0.2, "high_end_process": False},
     )
     separator.load_model(model_filename=model_filename)

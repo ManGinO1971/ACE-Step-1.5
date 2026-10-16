@@ -820,6 +820,28 @@ def _hieltech_handoff_store(source_path, ext):
     return handoff_path, token
 
 
+def _hieltech_free_gpu_cache():
+    """Gibt ungenutzten PyTorch-GPU-Zwischenspeicher DIESES Prozesses (ACE-
+    Step-Server) frei. Geladene Modelle bleiben unberuehrt; laufende
+    Erzeugungen in anderen Threads sind davon nicht betroffen."""
+    try:
+        if "torch" not in sys.modules:
+            return
+        import gc
+
+        import torch
+
+        if torch.cuda.is_available():
+            gc.collect()
+            before = torch.cuda.memory_reserved()
+            torch.cuda.empty_cache()
+            freed = (before - torch.cuda.memory_reserved()) / 1024 ** 3
+            if freed > 0.05:
+                print(f"[HIELTECH-Info] GPU-Zwischenspeicher freigegeben: {freed:.1f} GB", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH] GPU-Zwischenspeicher nicht freigebbar: {e}", file=sys.stderr, flush=True)
+
+
 def _hieltech_run_step(args, timeout=1800, python_path=None):
     """Fuehrt ein Schritt-Skript per subprocess aus. Nutzt standardmaessig
     denselben Python-Interpreter wie dieser Server (kein Conda-
@@ -835,6 +857,17 @@ def _hieltech_run_step(args, timeout=1800, python_path=None):
     """
     interpreter = python_path if python_path and os.path.isfile(python_path) else sys.executable
     cmd = [interpreter] + args
+    # NEU (16. Okt 2026, gemessen: "CUDA out of memory ... Process 137 has
+    # 17.80 GiB memory in use" - der ACE-Step-Server haelt seit dem Base-
+    # Modell fast die ganze GPU, ueberwiegend als ungenutzten PyTorch-
+    # Zwischenspeicher): vor jedem Schritt diesen Zwischenspeicher freigeben
+    # (die Modelle bleiben geladen) und den Schritt mit sparsamerer
+    # Speicher-Einstellung starten. Scheitert er trotzdem an Speichermangel:
+    # einmal erneut freigeben und mit kleineren GPU-Paketen wiederholen.
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _hieltech_free_gpu_cache()
     # NEU (9. Okt 2026, Nutzerfrage "nehmen die 4 CPU-Schritte soviel Zeit"):
     # bisher gab es GAR KEINE Zeitmessung pro Teilschritt - jede bisherige
     # Einschaetzung dazu war geraten, nicht gemessen. Jeder Aufruf landet
@@ -846,9 +879,18 @@ def _hieltech_run_step(args, timeout=1800, python_path=None):
     started_at = time.perf_counter()
     try:
         result = subprocess.run(
-            cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout
+            cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout, env=env
         )
         ok = result.returncode == 0
+        if not ok and "out of memory" in ((result.stdout or "") + (result.stderr or "")).lower():
+            print(f"[HIELTECH] {step_name}: GPU-Speicher voll - gebe Zwischenspeicher frei und wiederhole sparsamer", file=sys.stderr, flush=True)
+            _hieltech_free_gpu_cache()
+            env_retry = dict(env)
+            env_retry["HIELTECH_UVR_BATCH"] = "1"
+            result = subprocess.run(
+                cmd, cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=timeout, env=env_retry
+            )
+            ok = result.returncode == 0
         duration_s = time.perf_counter() - started_at
         print(f"[HIELTECH-Zeitmessung] {step_name}: {duration_s:.1f}s (ok={ok})", file=sys.stderr, flush=True)
         # NEU (10. Okt 2026): wichtige Hinweise der Teilskripte (welches
