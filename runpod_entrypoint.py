@@ -1737,6 +1737,7 @@ def _hieltech_backing_postprocess_sync(src_bytes, filename, src_handoff_path, re
 async def _hieltech_instrumental_balance(
     audio: UploadFile,
     genre_hint: str = Form(default=""),
+    drop_vocals: str = Form(default="0"),
 ):
     """NEU (13. Okt 2026, Nutzerwunsch "Instrumente erzeugen: professionelle
     Lautstaerke- und Mix-Anpassung"): zerlegt das fertige Instrumental per
@@ -1749,10 +1750,10 @@ async def _hieltech_instrumental_balance(
     runpod-handler.js per /v1/hieltech_fetch_chunk (Worker-Affinitaet) ab.
     """
     src_bytes = await audio.read()
-    return await asyncio.to_thread(_hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint)
+    return await asyncio.to_thread(_hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint, drop_vocals)
 
 
-def _hieltech_instrumental_balance_sync(src_bytes, filename, genre_hint):
+def _hieltech_instrumental_balance_sync(src_bytes, filename, genre_hint, drop_vocals="0"):
     work_dir = tempfile.mkdtemp(prefix="hieltech_balance_")
     try:
         ext = os.path.splitext(filename or "")[1].lower() or ".mp3"
@@ -1763,7 +1764,8 @@ def _hieltech_instrumental_balance_sync(src_bytes, filename, genre_hint):
             f.write(src_bytes)
         out_wav = os.path.join(work_dir, "balanced.wav")
         ok, output = _hieltech_run_step(
-            [os.path.join(_HIELTECH_PROJECT_ROOT, "instrumental_balance_step.py"), src_path, out_wav, (genre_hint or "")[:500]],
+            [os.path.join(_HIELTECH_PROJECT_ROOT, "instrumental_balance_step.py"), src_path, out_wav, (genre_hint or "")[:500]]
+            + (["drop_vocals"] if str(drop_vocals).strip().lower() in ("1", "true", "yes") else []),
             timeout=900,
         )
         report = None
@@ -1895,9 +1897,9 @@ async def _hieltech_backing_postprocess_start(
 
 
 @app.post("/v1/hieltech_instrumental_balance_start")
-async def _hieltech_instrumental_balance_start(audio: UploadFile, genre_hint: str = Form(default="")):
+async def _hieltech_instrumental_balance_start(audio: UploadFile, genre_hint: str = Form(default=""), drop_vocals: str = Form(default="0")):
     src_bytes = await audio.read()
-    return _hieltech_job_start("instrumental_balance", _hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint)
+    return _hieltech_job_start("instrumental_balance", _hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint, drop_vocals)
 
 
 @app.get("/v1/hieltech_fetch_chunk")

@@ -225,15 +225,22 @@ def separate(wav_path):
     return sep.samplerate, mix, stems
 
 
-def balance(mix, stems, fs, genre):
+def balance(mix, stems, fs, genre, drop_vocals=False):
     n = min([mix.shape[1]] + [s.shape[1] for s in stems.values()])
     mix = mix[:, :n]
     stems = {k: v[:, :n] for k, v in stems.items()}
     levels = {k: lufs(v, fs) for k, v in stems.items()}
     gains, notes = plan_gains(levels, genre)
+    # NEU (17. Okt 2026, Karaoke-Test): Gesangs-Reste (das "Summen" der
+    # Lead-Melodie, das flow_edit_morph manchmal stehen laesst) komplett
+    # herausnehmen - nur wenn ausdruecklich angefordert.
+    if drop_vocals and "vocals" in stems:
+        notes.append("Gesangs-Reste (Summen) entfernt")
     residual = mix - sum(stems.values())
     out = residual.copy()
     for k, v in stems.items():
+        if drop_vocals and k == "vocals":
+            continue
         out += v * (10 ** (gains.get(k, 0.0) / 20))
     peak = float(np.max(np.abs(out))) if out.size else 0.0
     safety_db = 0.0
@@ -249,6 +256,7 @@ def main():
         sys.exit(2)
     src, dst = sys.argv[1], sys.argv[2]
     genre_text = sys.argv[3] if len(sys.argv) > 3 else ""
+    drop_vocals = len(sys.argv) > 4 and sys.argv[4] == "drop_vocals"
     genre = detect_genre(genre_text)
     import soundfile as sf
 
@@ -256,7 +264,7 @@ def main():
         wav = os.path.join(td, "in.wav")
         _decode_to_wav(src, wav)
         fs, mix, stems = separate(wav)
-        out, levels, gains, notes, safety_db = balance(mix, stems, fs, genre)
+        out, levels, gains, notes, safety_db = balance(mix, stems, fs, genre, drop_vocals)
         sf.write(dst, out.T.astype(np.float32), fs, subtype="PCM_24")
 
     report = {
@@ -266,6 +274,7 @@ def main():
         "gains_db": {k: round(v, 1) for k, v in gains.items() if abs(v) >= 0.05},
         "notes": notes,
         "safety_db": round(safety_db, 1),
+        "drop_vocals": bool(drop_vocals),
     }
     print(json.dumps(report, ensure_ascii=False), flush=True)
 
