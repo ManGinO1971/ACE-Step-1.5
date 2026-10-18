@@ -21,9 +21,11 @@ Aufruf: python lyrics_transcribe_step.py <song> <ausgabe.json>
 Umgebung: HIELTECH_ASR_MODEL (Standard openai/whisper-large-v3),
           HIELTECH_ASR_LANGUAGE (Standard leer = automatisch)
 """
+import gc
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -35,6 +37,12 @@ sys.path.insert(0, HERE)
 
 ASR_MODEL = os.environ.get("HIELTECH_ASR_MODEL") or "openai/whisper-large-v3"
 ASR_LANGUAGE = (os.environ.get("HIELTECH_ASR_LANGUAGE") or "").strip() or None
+# 18. Okt 2026: erster Live-Test lief in "GPU-Speicher voll" - Whisper lief im
+# selben Prozess wie die Trennmodelle (deren Speicher war noch belegt) und
+# mit batch_size 8. Jetzt: Whisper in einem EIGENEN Prozess (Trennung ist
+# dann komplett freigegeben) und kleinere Stapel; bei Speichermangel
+# automatisch nochmal mit Stapel 1.
+ASR_BATCH = int(os.environ.get("HIELTECH_ASR_BATCH") or "2")
 
 
 def _cache_dir():
@@ -90,7 +98,7 @@ def _asr():
             device=0 if cuda else -1,
             model_kwargs={"cache_dir": _cache_dir()} if _cache_dir() else {},
             chunk_length_s=30,
-            batch_size=8,
+            batch_size=max(1, ASR_BATCH),
         )
     return _ASR
 
@@ -115,7 +123,40 @@ def transcribe(path):
     return words
 
 
+def _free_gpu():
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def transcribe_in_subprocess(path, label):
+    """Whisper in einem frischen Prozess - bei Speichermangel nochmal mit Stapel 1."""
+    out = path + ".asr.json"
+    for batch in (str(max(1, ASR_BATCH)), "1"):
+        env = dict(os.environ, HIELTECH_ASR_BATCH=batch)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--asr", path, out],
+                           capture_output=True, text=True, env=env, cwd=HERE)
+        if r.returncode == 0 and os.path.isfile(out):
+            with open(out, "r", encoding="utf-8") as f:
+                return json.load(f)
+        tail = ((r.stdout or "") + (r.stderr or ""))[-1200:]
+        print(f"Whisper ({label}, Stapel {batch}) fehlgeschlagen: {tail}", file=sys.stderr, flush=True)
+        if "out of memory" not in tail.lower() or batch == "1":
+            break
+    raise RuntimeError(f"Whisper ({label}) fehlgeschlagen")
+
+
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--asr":
+        words = transcribe(sys.argv[2])
+        with open(sys.argv[3], "w", encoding="utf-8") as f:
+            json.dump(words, f, ensure_ascii=False)
+        return
     if len(sys.argv) < 3:
         print("Nutzung: python lyrics_transcribe_step.py <song> <ausgabe.json>")
         sys.exit(1)
@@ -152,12 +193,18 @@ def main():
         has_backing = math.isfinite(l_back) and l_back > float(os.environ.get("HIELTECH_BACKING_ABSENT_LUFS", "-45"))
         report["has_backing"] = bool(has_backing)
 
+        backing_dry = dereverb(backing_raw, "backing_dry") if has_backing else None
+        _free_gpu()
         print(f"Text korrigieren: Whisper ({ASR_MODEL}) hört den Lead...", file=sys.stderr, flush=True)
-        report["lead"] = transcribe(lead)
+        report["lead"] = transcribe_in_subprocess(lead, "Lead")
         report["backing"] = []
-        if has_backing:
+        if backing_dry:
             print("Text korrigieren: Whisper hört den Background...", file=sys.stderr, flush=True)
-            report["backing"] = transcribe(dereverb(backing_raw, "backing_dry"))
+            try:
+                report["backing"] = transcribe_in_subprocess(backing_dry, "Background")
+            except Exception as e:  # noqa: BLE001 - Lead reicht notfalls
+                print(f"Background nicht mitgehört: {e}", file=sys.stderr, flush=True)
+                report["has_backing"] = False
         report["duration"] = round(len(vocals) / float(sr), 2) if vocals.ndim == 1 else round(vocals.shape[0] / float(sr), 2)
 
     with open(out_json, "w", encoding="utf-8") as f:
