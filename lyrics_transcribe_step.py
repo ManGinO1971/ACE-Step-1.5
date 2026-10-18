@@ -18,7 +18,7 @@ Das Abgleichen mit dem Original-Songtext macht der VPS (runpod-handler.js),
 damit es ohne neuen RunPod-Build verbessert werden kann.
 
 Aufruf: python lyrics_transcribe_step.py <song> <ausgabe.json>
-Umgebung: HIELTECH_ASR_MODEL (Standard openai/whisper-large-v3),
+Umgebung: HIELTECH_ASR_MODEL (Standard openai/whisper-large-v3-turbo),
           HIELTECH_ASR_LANGUAGE (Standard leer = automatisch)
 """
 import gc
@@ -35,7 +35,14 @@ import soundfile as sf
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-ASR_MODEL = os.environ.get("HIELTECH_ASR_MODEL") or "openai/whisper-large-v3"
+# 18. Okt 2026 (zweiter Live-Test, wieder Speicher voll): der ACE-Step-Server
+# selbst belegt auf der 24-GB-Karte ca. 17 GB (Turbo + Base + LM). Fuer
+# Whisper bleiben nur ca. 4-5 GB -> Standard jetzt large-v3-turbo (halb so
+# gross, fast gleich genau). Die Trennung laeuft zudem in einem EIGENEN
+# Prozess, der vor Whisper komplett beendet ist; und als letzter Ausweg
+# hoert Whisper auf der CPU mit (langsamer, aber sicher).
+ASR_MODEL = os.environ.get("HIELTECH_ASR_MODEL") or "openai/whisper-large-v3-turbo"
+ASR_DEVICE = (os.environ.get("HIELTECH_ASR_DEVICE") or "").strip().lower()
 ASR_LANGUAGE = (os.environ.get("HIELTECH_ASR_LANGUAGE") or "").strip() or None
 # 18. Okt 2026: erster Live-Test lief in "GPU-Speicher voll" - Whisper lief im
 # selben Prozess wie die Trennmodelle (deren Speicher war noch belegt) und
@@ -90,7 +97,7 @@ def _asr():
         import torch
         from transformers import pipeline
 
-        cuda = torch.cuda.is_available()
+        cuda = torch.cuda.is_available() and ASR_DEVICE != "cpu"
         _ASR = pipeline(
             "automatic-speech-recognition",
             model=ASR_MODEL,
@@ -137,16 +144,21 @@ def _free_gpu():
 def transcribe_in_subprocess(path, label):
     """Whisper in einem frischen Prozess - bei Speichermangel nochmal mit Stapel 1."""
     out = path + ".asr.json"
-    for batch in (str(max(1, ASR_BATCH)), "1"):
-        env = dict(os.environ, HIELTECH_ASR_BATCH=batch)
+    tries = [(str(max(1, ASR_BATCH)), ""), ("1", ""), ("4", "cpu")]
+    for batch, device in tries:
+        env = dict(os.environ, HIELTECH_ASR_BATCH=batch, HIELTECH_ASR_DEVICE=device,
+                   PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+        if device == "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            print(f"Whisper ({label}): GPU zu voll - höre auf der CPU mit (langsamer)", file=sys.stderr, flush=True)
         r = subprocess.run([sys.executable, os.path.abspath(__file__), "--asr", path, out],
                            capture_output=True, text=True, env=env, cwd=HERE)
         if r.returncode == 0 and os.path.isfile(out):
             with open(out, "r", encoding="utf-8") as f:
                 return json.load(f)
         tail = ((r.stdout or "") + (r.stderr or ""))[-1200:]
-        print(f"Whisper ({label}, Stapel {batch}) fehlgeschlagen: {tail}", file=sys.stderr, flush=True)
-        if "out of memory" not in tail.lower() or batch == "1":
+        print(f"Whisper ({label}, Stapel {batch}{', CPU' if device else ''}) fehlgeschlagen: {tail}", file=sys.stderr, flush=True)
+        if "out of memory" not in tail.lower():
             break
     raise RuntimeError(f"Whisper ({label}) fehlgeschlagen")
 
@@ -157,10 +169,43 @@ def main():
         with open(sys.argv[3], "w", encoding="utf-8") as f:
             json.dump(words, f, ensure_ascii=False)
         return
+    if len(sys.argv) >= 4 and sys.argv[1] == "--separate":
+        separate(sys.argv[2], sys.argv[3])
+        return
     if len(sys.argv) < 3:
         print("Nutzung: python lyrics_transcribe_step.py <song> <ausgabe.json>")
         sys.exit(1)
     song, out_json = sys.argv[1], sys.argv[2]
+    report = {"ok": True, "asr_model": ASR_MODEL}
+    with tempfile.TemporaryDirectory() as work:
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--separate", song, work],
+                           capture_output=True, text=True, cwd=HERE,
+                           env=dict(os.environ, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"))
+        sys.stderr.write((r.stderr or "")[-3000:])
+        sep_json = os.path.join(work, "sep.json")
+        if r.returncode != 0 or not os.path.isfile(sep_json):
+            print(f"Trennung fehlgeschlagen: {((r.stdout or '') + (r.stderr or ''))[-1500:]}", file=sys.stderr, flush=True)
+            sys.exit(2)
+        with open(sep_json, "r", encoding="utf-8") as f:
+            sep = json.load(f)
+        report.update({k: sep[k] for k in ("karaoke_model", "backing_lufs", "has_backing", "duration") if k in sep})
+        print(f"Text korrigieren: Whisper ({ASR_MODEL}) hört den Lead...", file=sys.stderr, flush=True)
+        report["lead"] = transcribe_in_subprocess(sep["lead"], "Lead")
+        report["backing"] = []
+        if sep.get("backing"):
+            print("Text korrigieren: Whisper hört den Background...", file=sys.stderr, flush=True)
+            try:
+                report["backing"] = transcribe_in_subprocess(sep["backing"], "Background")
+            except Exception as e:  # noqa: BLE001 - Lead reicht notfalls
+                print(f"Background nicht mitgehört: {e}", file=sys.stderr, flush=True)
+                report["has_backing"] = False
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False)
+    print(json.dumps({"ok": True, "lead_words": len(report["lead"]), "backing_words": len(report["backing"])}), flush=True)
+
+
+def separate(song, work):
+    """Eigener Prozess: Gesang trennen, Lead/Background trocken als WAV in work."""
     from backing_separate_step import (
         UVR_DEREVERB_MODEL,
         run_karaoke,
@@ -170,8 +215,8 @@ def main():
     from instrumental_balance_step import lufs
 
     model_file_dir = os.path.join(HERE, "uvr_models")
-    report = {"ok": True, "asr_model": ASR_MODEL}
-    with tempfile.TemporaryDirectory() as work:
+    report = {}
+    if True:
         print("Text korrigieren: trenne Gesang (htdemucs_ft)...", file=sys.stderr, flush=True)
         vocals, sr = separate_vocals_htdemucs_ft(song, work)
         vocals_path = os.path.join(work, "vocals_all.wav")
@@ -194,22 +239,11 @@ def main():
         report["has_backing"] = bool(has_backing)
 
         backing_dry = dereverb(backing_raw, "backing_dry") if has_backing else None
-        _free_gpu()
-        print(f"Text korrigieren: Whisper ({ASR_MODEL}) hört den Lead...", file=sys.stderr, flush=True)
-        report["lead"] = transcribe_in_subprocess(lead, "Lead")
-        report["backing"] = []
-        if backing_dry:
-            print("Text korrigieren: Whisper hört den Background...", file=sys.stderr, flush=True)
-            try:
-                report["backing"] = transcribe_in_subprocess(backing_dry, "Background")
-            except Exception as e:  # noqa: BLE001 - Lead reicht notfalls
-                print(f"Background nicht mitgehört: {e}", file=sys.stderr, flush=True)
-                report["has_backing"] = False
+        report["lead"] = lead
+        report["backing"] = backing_dry
         report["duration"] = round(len(vocals) / float(sr), 2) if vocals.ndim == 1 else round(vocals.shape[0] / float(sr), 2)
-
-    with open(out_json, "w", encoding="utf-8") as f:
+    with open(os.path.join(work, "sep.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False)
-    print(json.dumps({"ok": True, "lead_words": len(report["lead"]), "backing_words": len(report["backing"])}), flush=True)
 
 
 if __name__ == "__main__":
