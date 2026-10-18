@@ -1902,6 +1902,49 @@ async def _hieltech_instrumental_balance_start(audio: UploadFile, genre_hint: st
     return _hieltech_job_start("instrumental_balance", _hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint, drop_vocals)
 
 
+def _hieltech_lyrics_align_sync(src_bytes, filename, lines_json):
+    """NEU (18. Okt 2026, "Text korrigieren"): prueft, welche Zeilen des
+    eigenen Songtexts wo im Song gesungen werden (Abgleich, kein freies
+    Raten) - siehe lyrics_align_step.py."""
+    work_dir = tempfile.mkdtemp(prefix="hieltech_lyrics_align_")
+    try:
+        ext = os.path.splitext(filename or "")[1].lower() or ".mp3"
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        src_path = os.path.join(work_dir, "song" + ext)
+        with open(src_path, "wb") as f:
+            f.write(src_bytes)
+        try:
+            lines = json.loads(lines_json or "[]")
+            assert isinstance(lines, list) and all(isinstance(l, list) for l in lines)
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "error": "invalid_lines", "message": "Zeilen fehlen oder sind ungültig."}
+        lines_path = os.path.join(work_dir, "lines.json")
+        with open(lines_path, "w", encoding="utf-8") as f:
+            json.dump(lines, f, ensure_ascii=False)
+        out_json = os.path.join(work_dir, "align.json")
+        ok, log = _hieltech_run_step(
+            [os.path.join(_HIELTECH_PROJECT_ROOT, "lyrics_align_step.py"), src_path, lines_path, out_json], timeout=900
+        )
+        for line in (log or "").splitlines():
+            if line.startswith("Text-Abgleich:"):
+                print(f"[HIELTECH-Info] {line.strip()[:300]}", file=sys.stderr, flush=True)
+        if not ok or not os.path.isfile(out_json):
+            return {"ok": False, "error": "lyrics_align_failed", "message": "Text-Abgleich fehlgeschlagen.", "log": log[-1500:]}
+        with open(out_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["ok"] = True
+        return data
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_lyrics_align_start")
+async def _hieltech_lyrics_align_start(audio: UploadFile, lines: str = Form(default="[]")):
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lyrics_align", _hieltech_lyrics_align_sync, src_bytes, audio.filename, lines)
+
+
 @app.get("/v1/hieltech_fetch_chunk")
 async def _hieltech_fetch_chunk(token: str, offset: int = 0, length: int = 18_000_000, done: str = "false"):
     """Liest einen Byte-Bereich aus einer per _hieltech_handoff_store
