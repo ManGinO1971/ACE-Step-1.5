@@ -1902,39 +1902,6 @@ async def _hieltech_instrumental_balance_start(audio: UploadFile, genre_hint: st
     return _hieltech_job_start("instrumental_balance", _hieltech_instrumental_balance_sync, src_bytes, audio.filename, genre_hint, drop_vocals)
 
 
-def _hieltech_lyrics_transcribe_sync(src_bytes, filename):
-    """NEU (18. Okt 2026, "Text korrigieren"): trennt Lead/Background und
-    schreibt beide mit Whisper mit (Woerter + Zeitstempel + Lautstaerke),
-    siehe lyrics_transcribe_step.py. Das Abgleichen mit dem Songtext macht
-    runpod-handler.js auf dem VPS."""
-    work_dir = tempfile.mkdtemp(prefix="hieltech_lyrics_asr_")
-    try:
-        ext = os.path.splitext(filename or "")[1].lower() or ".mp3"
-        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
-            ext = ".mp3"
-        src_path = os.path.join(work_dir, "song" + ext)
-        with open(src_path, "wb") as f:
-            f.write(src_bytes)
-        out_json = os.path.join(work_dir, "asr.json")
-        ok, log = _hieltech_run_step(
-            [os.path.join(_HIELTECH_PROJECT_ROOT, "lyrics_transcribe_step.py"), src_path, out_json], timeout=2400
-        )
-        if not ok or not os.path.isfile(out_json):
-            return {"ok": False, "error": "lyrics_transcribe_failed", "message": "Mithören (Whisper) fehlgeschlagen.", "log": log[-1500:]}
-        with open(out_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        data["ok"] = True
-        return data
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
-@app.post("/v1/hieltech_lyrics_transcribe_start")
-async def _hieltech_lyrics_transcribe_start(audio: UploadFile):
-    src_bytes = await audio.read()
-    return _hieltech_job_start("lyrics_transcribe", _hieltech_lyrics_transcribe_sync, src_bytes, audio.filename)
-
-
 @app.get("/v1/hieltech_fetch_chunk")
 async def _hieltech_fetch_chunk(token: str, offset: int = 0, length: int = 18_000_000, done: str = "false"):
     """Liest einen Byte-Bereich aus einer per _hieltech_handoff_store
