@@ -99,8 +99,10 @@ def main():
     # Melodie der ORIGINAL-Lead-Spur (4. Argument, .npy). Springt die neue
     # Stimme um ~1-2 Oktaven weg vom Original (z.B. kurz C4 statt C5 mitten im
     # gehaltenen Ton), wird sie auf die Oktave des Originals zurückgesetzt.
-    if len(sys.argv) > 4 and os.path.isfile(sys.argv[4]):
-        ref = np.load(sys.argv[4]).astype(np.float64)
+    extra = sys.argv[4:]
+    ref_path = next((a for a in extra if not a.startswith("--")), None)
+    if ref_path and os.path.isfile(ref_path):
+        ref = np.load(ref_path).astype(np.float64)
         n = min(len(ref), len(f0))
         both = (f0[:n] > 0) & (ref[:n] > 0)
         d = np.zeros(n)
@@ -109,6 +111,29 @@ def main():
         fix = both & (k != 0) & (np.abs(d - 12.0 * k) < _env("NSF_LOCK_TOL_ST", 1.5)) & (np.abs(k) <= 2)
         f0[:n][fix] = f0[:n][fix] / np.power(2.0, k[fix])
         print(f"Melodie-Lock (Original-Lead): {int(fix.sum())} Frames auf die Oktave des Originals gesetzt", file=sys.stderr, flush=True)
+        # NEU (20. Okt 2026, Test "tiefe Töne"): --follow = kurze schiefe Stellen
+        # (1-11 Halbtöne neben dem Original, höchstens NSF_FOLLOW_MAX_MS lang,
+        # typisch beim Tonwechsel) folgen der Original-Melodie (Oktave der neuen Stimme bleibt).
+        if "--follow" in extra:
+            d2 = np.zeros(n)
+            d2[both] = 12.0 * np.log2(f0[:n][both] / ref[:n][both])
+            oc = np.round(d2 / 12.0)
+            rest = d2 - 12.0 * oc
+            off = both & (np.abs(rest) > _env("NSF_FOLLOW_TOL_ST", 0.8))
+            max_run = int(_env("NSF_FOLLOW_MAX_MS", 200) / 10)
+            moved, i = 0, 0
+            while i < n:
+                if off[i]:
+                    j = i
+                    while j < n and off[j]:
+                        j += 1
+                    if j - i <= max_run:
+                        f0[i:j] = ref[i:j] * np.power(2.0, oc[i:j])
+                        moved += j - i
+                    i = j
+                else:
+                    i += 1
+            print(f"Melodie-Folgen (Original-Lead): {moved} Frames an kurzen schiefen Stellen an das Original angepasst", file=sys.stderr, flush=True)
     voiced = f0 > 0
     if voiced.sum() < 2:
         print("FEHLER: zu wenig Melodie erkannt", file=sys.stderr)

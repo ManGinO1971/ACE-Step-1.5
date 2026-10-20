@@ -2307,6 +2307,9 @@ def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path
                 if ok_r and os.path.isfile(ref_f0):
                     voc_args.append(ref_f0)
                     steps.append("melody_lock")
+                    if "melody_follow" in exp:
+                        voc_args.append("--follow")
+                        steps.append("melody_follow")
                 else:
                     warnings.append("Melodie-Lock übersprungen: " + (log_r or "")[-300:])
             ok, log = _hieltech_run_step(voc_args, timeout=900)
