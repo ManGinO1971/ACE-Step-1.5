@@ -51,6 +51,7 @@ def text_score(variant, lines_path, work):
     with open(out, "r", encoding="utf-8") as f:
         inst = json.load(f).get("instances", [])
     score = sum(float(i.get("conf", 0)) * sum(i.get("words", [])) for i in inst)
+    text_score.last_segments = [[float(i["t0"]), float(i["t1"]), float(i.get("conf", 0))] for i in inst if "t0" in i and "t1" in i]
     return round(score, 2), len(inst)
 
 
@@ -104,9 +105,11 @@ def main():
         with open(lines_path, "w", encoding="utf-8") as f:
             json.dump(lines, f, ensure_ascii=False)
         for idx, v in enumerate(variants):
+            text_score.last_segments = []
             ts, n_inst = text_score(v, lines_path, work) if lines else (None, 0)
             gs = gap_seconds(v, lead_ref)
-            scores.append({"variant": idx, "text_score": ts, "lines_found": n_inst, "gap_seconds": gs})
+            scores.append({"variant": idx, "text_score": ts, "lines_found": n_inst, "gap_seconds": gs,
+                           "segments": text_score.last_segments})
             print(f"Variante {idx + 1}: sicher gesungene Wörter {ts}, Zeilen {n_inst}, Lücken {gs} s", file=sys.stderr, flush=True)
 
     # REGEL (geändert 20. Okt 2026 nach Hörtest: Variante mit 0 s Lücken klang

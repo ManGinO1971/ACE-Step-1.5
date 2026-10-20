@@ -95,6 +95,20 @@ def main():
     n_frames = mel.shape[-1]
 
     f0 = repair_f0(np.load(f0_path).astype(np.float64))
+    # NEU (20. Okt 2026, Test "hohe Töne"): optional Oktav-Lock gegen die
+    # Melodie der ORIGINAL-Lead-Spur (4. Argument, .npy). Springt die neue
+    # Stimme um ~1-2 Oktaven weg vom Original (z.B. kurz C4 statt C5 mitten im
+    # gehaltenen Ton), wird sie auf die Oktave des Originals zurückgesetzt.
+    if len(sys.argv) > 4 and os.path.isfile(sys.argv[4]):
+        ref = np.load(sys.argv[4]).astype(np.float64)
+        n = min(len(ref), len(f0))
+        both = (f0[:n] > 0) & (ref[:n] > 0)
+        d = np.zeros(n)
+        d[both] = 12.0 * np.log2(f0[:n][both] / ref[:n][both])
+        k = np.round(d / 12.0)
+        fix = both & (k != 0) & (np.abs(d - 12.0 * k) < _env("NSF_LOCK_TOL_ST", 1.5)) & (np.abs(k) <= 2)
+        f0[:n][fix] = f0[:n][fix] / np.power(2.0, k[fix])
+        print(f"Melodie-Lock (Original-Lead): {int(fix.sum())} Frames auf die Oktave des Originals gesetzt", file=sys.stderr, flush=True)
     voiced = f0 > 0
     if voiced.sum() < 2:
         print("FEHLER: zu wenig Melodie erkannt", file=sys.stderr)

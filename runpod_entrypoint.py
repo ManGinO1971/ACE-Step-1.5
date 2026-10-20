@@ -2213,8 +2213,11 @@ def _hieltech_lead_v2_source_path(path):
     return None
 
 
-def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths="", lead_text=""):
+def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths="", lead_text="", experiment=""):
     warnings, steps = [], []
+    # NEU (20. Okt 2026, Test "hohe Töne"): nur aktiv, wenn ausdrücklich angefordert
+    # (Terminal-Test) - die App schickt das Feld nicht, dort bleibt alles wie bisher.
+    exp = {x.strip() for x in (experiment or "").split(",") if x.strip()}
     pick_info = None
     work_dir = tempfile.mkdtemp(prefix="hieltech_lead_v2_post_")
     try:
@@ -2264,6 +2267,14 @@ def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path
             args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), current, os.path.realpath(lead_ref_path), masked]
             if _hieltech_is_handoff_path(backing_ref_path):
                 args.append(os.path.realpath(backing_ref_path))
+            if "lyrics_mask" in exp and pick_info and isinstance(pick_info.get("scores"), list):
+                segs = next((sc.get("segments") for sc in pick_info["scores"] if sc.get("variant") == pick_info.get("chosen")), None)
+                if segs:
+                    keep_file = os.path.join(work_dir, "lead_lines.json")
+                    with open(keep_file, "w", encoding="utf-8") as f:
+                        json.dump(segs, f)
+                    args.append(keep_file)
+                    steps.append("lyrics_mask")
             ok, log = _hieltech_run_step(args, timeout=600)
             if ok and os.path.isfile(masked):
                 current = masked
@@ -2288,7 +2299,17 @@ def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path
                                      timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
         if ok and os.path.isfile(f0_file):
             voc = os.path.join(work_dir, "vocoder_c.wav")
-            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "nsf_vocoder_step.py"), current, f0_file, voc], timeout=900)
+            voc_args = [os.path.join(_HIELTECH_PROJECT_ROOT, "nsf_vocoder_step.py"), current, f0_file, voc]
+            if "melody_lock" in exp and _hieltech_is_handoff_path(lead_ref_path):
+                ref_f0 = os.path.join(work_dir, "f0_lead_ref.npy")
+                ok_r, log_r = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), os.path.realpath(lead_ref_path), ref_f0],
+                                                 timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+                if ok_r and os.path.isfile(ref_f0):
+                    voc_args.append(ref_f0)
+                    steps.append("melody_lock")
+                else:
+                    warnings.append("Melodie-Lock übersprungen: " + (log_r or "")[-300:])
+            ok, log = _hieltech_run_step(voc_args, timeout=900)
             if ok and os.path.isfile(voc):
                 current = voc
                 steps.append("vocoder_c")
@@ -2333,6 +2354,7 @@ async def _hieltech_lead_v2_post_start(
     voice_model: str = Form(default=""),
     extract_paths: str = Form(default=""),
     lead_text: str = Form(default=""),
+    experiment: str = Form(default=""),
 ):
     """Antwort (über /v1/hieltech_job_status): {"ok", "result_token", "size_bytes",
     "audio_ext", "steps_applied", "warnings", "rvc_applied", "pick"} – abholen über
@@ -2340,7 +2362,7 @@ async def _hieltech_lead_v2_post_start(
     lead_text: mehrere Varianten, die beste wird automatisch gewählt."""
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
-    return _hieltech_job_start("lead_v2_post", _hieltech_lead_v2_post_sync, src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths, lead_text)
+    return _hieltech_job_start("lead_v2_post", _hieltech_lead_v2_post_sync, src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths, lead_text, experiment)
 
 
 

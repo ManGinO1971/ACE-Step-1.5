@@ -29,8 +29,22 @@ env_r = np.roll(env_r, lag)
 db = 20 * np.log10(env_r + 1e-9)
 ref_level = np.percentile(db[db > db.max() - 60], 95)
 open_ = db > ref_level + DB
-if len(sys.argv) > 4:  # wo der Background das Original klar dominiert -> zu
-    bk, bsr = sf.read(sys.argv[4], always_2d=True)
+extra = sys.argv[4:]
+keep_json = next((a for a in extra if a.endswith(".json")), None)
+backing_path = next((a for a in extra if not a.endswith(".json")), None)
+if keep_json:  # NEU (20. Okt 2026, Test): weit weg von jeder Lead-Textzeile (z.B. "(Ooh)"-Intro) -> zu
+    import json
+    segs = [s for s in json.load(open(keep_json)) if s[2] >= E("MASK_KEEP_MIN_CONF", 0.5)]
+    pad = E("MASK_KEEP_PAD_S", 1.0)
+    keep = np.zeros(len(open_), dtype=bool)
+    for t0, t1, _c in segs:
+        keep[max(0, int((t0 - pad) * 100)):int((t1 + pad) * 100) + 1] = True
+    if segs:
+        before = int(open_.sum())
+        open_ &= keep
+        print(f"Text-Maske: {len(segs)} Lead-Zeilen, {(before - int(open_.sum())) / 100:.1f} s außerhalb der Lead-Zeilen stummgeschaltet")
+if backing_path:  # wo der Background das Original klar dominiert -> zu
+    bk, bsr = sf.read(backing_path, always_2d=True)
     bk = librosa.resample(bk.mean(1), orig_sr=bsr, target_sr=sr)
     env_b = np.roll(librosa.feature.rms(y=bk, frame_length=hop * 4, hop_length=hop)[0], lag)
     m = min(len(env_b), len(open_))
