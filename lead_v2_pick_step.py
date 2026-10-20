@@ -11,8 +11,8 @@ Varianten erzeugt und hier die beste gewählt:
      Zeilen: Sicherheit x Anzahl gesungener Wörter -> "sicher gesungene Wörter".
   2. Lücken: Sekunden, in denen im ORIGINAL der Lead singt (Lead-Referenz),
      die Variante aber stumm ist.
-  Gewählt wird die Variante mit dem höchsten Text-Score; liegen zwei Varianten
-  weniger als 2 % auseinander, entscheidet die geringere Lückenzeit.
+  Gewählt wird die Variante mit den wenigsten Lücken (auf 0,5 s gerundet);
+  bei gleichen Lücken die mit mehr sicher gesungenen Wörtern (Hörtest 20.10.).
 
 Aufruf: python lead_v2_pick_step.py <lead_text.txt> <lead_ref.wav|-> <variante1> <variante2> [...]
 Letzte stdout-Zeile: JSON {"ok": true, "chosen": <index>, "scores": [...]}
@@ -109,14 +109,18 @@ def main():
             scores.append({"variant": idx, "text_score": ts, "lines_found": n_inst, "gap_seconds": gs})
             print(f"Variante {idx + 1}: sicher gesungene Wörter {ts}, Zeilen {n_inst}, Lücken {gs} s", file=sys.stderr, flush=True)
 
-    def key(s):
-        return (s["text_score"] if s["text_score"] is not None else -1.0)
+    # REGEL (geändert 20. Okt 2026 nach Hörtest: Variante mit 0 s Lücken klang
+    # besser als die mit mehr erkannten Wörtern, aber 3 s Lücken):
+    #   1. weniger Lücken zuerst (auf 0,5 s gerundet - kleine Unterschiede zählen nicht)
+    #   2. bei gleichen Lücken: mehr sicher gesungene Wörter
+    def text_of(sc):
+        return sc["text_score"] if sc["text_score"] is not None else -1.0
 
-    best = max(scores, key=key)
-    top = key(best)
-    # Text-Abgleich nicht möglich (alle None/0) -> nur nach Lücken entscheiden
-    near = [s for s in scores if key(s) >= top * 0.98] if top > 0 else list(scores)
-    chosen = min(near, key=lambda s: (s["gap_seconds"] if s["gap_seconds"] is not None else 1e9, -key(s)))
+    def gaps_of(sc):
+        g = sc["gap_seconds"]
+        return round(g * 2) / 2 if g is not None else 0.0
+
+    chosen = min(scores, key=lambda sc: (gaps_of(sc), -text_of(sc)))
     print(json.dumps({"ok": True, "chosen": chosen["variant"], "scores": scores}, ensure_ascii=False), flush=True)
     return 0
 
