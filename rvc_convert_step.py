@@ -50,11 +50,20 @@ def main():
         print(f"FEHLER: Modell nicht gefunden: {model_path}")
         sys.exit(1)
 
+    # FIX (20. Okt 2026): Index-Datei suchen - zuerst exakt "<Modellname>.index"
+    # direkt neben dem Modell (eigene Modelle: custom/<name>.index), sonst wie
+    # bisher im Stimmen-Ordner nach einer .index-Datei mit dem Modellnamen.
     index_path = ""
-    for f in os.listdir(models_dir):
-        if model_name in f and f.endswith(".index"):
-            index_path = os.path.join(models_dir, f)
-            break
+    exact_index = os.path.join(os.path.dirname(model_path), os.path.basename(model_name) + ".index")
+    if os.path.isfile(exact_index):
+        index_path = exact_index
+    else:
+        for f in os.listdir(models_dir):
+            if os.path.basename(model_name) in f and f.endswith(".index"):
+                index_path = os.path.join(models_dir, f)
+                break
+    if (os.environ.get("HIELTECH_RVC_USE_INDEX") or "1").strip().lower() in {"0", "false", "no", "off"}:
+        index_path = ""
 
     hubert_path = os.path.join(base_dir, "rvc_models", "hubert_base.pt")
 
@@ -72,12 +81,21 @@ def main():
     except Exception:
         device = "cpu"
     rvc = RVCInference(device=device)
-    rvc.load_model(model_path)
+    # FIX (20. Okt 2026, Hörtest: "fast meine Stimme"): rvc-python benutzt den
+    # Index NUR, wenn er bei load_model() übergeben wird - das spätere
+    # "rvc.index_path = ..." (unten, unverändert) hatte nie eine Wirkung.
+    rvc.load_model(model_path, index_path=index_path)
+    print(f"RVC-Index: {os.path.basename(index_path) if index_path else 'keiner'}")
     # FIX (13. Okt 2026): vorher stand hier "rvc.f0_up_key = pitch_shift" -
     # rvc-python liest aber das Attribut "f0up_key" (ohne Unterstrich), die
     # Transposition wurde dadurch IMMER stillschweigend ignoriert. set_params()
     # ist der offizielle Weg und meldet unbekannte Namen.
     params = {"f0up_key": pitch_shift}
+    # Index-Anteil wie im Hörtest (rvc-python-Standard 0.5), per Umgebung änderbar
+    try:
+        params["index_rate"] = float(os.environ.get("HIELTECH_RVC_INDEX_RATE", "0.5"))
+    except ValueError:
+        params["index_rate"] = 0.5
     if f0_method:
         params["f0method"] = f0_method
     rvc.set_params(**params)

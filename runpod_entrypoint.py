@@ -2037,7 +2037,8 @@ _HIELTECH_MAX_MODEL_BYTES = 300 * 1024 * 1024
 # Dateisystem-Aufruf erreicht (Verteidigung in der Tiefe - server.js prueft
 # zwar bereits Ownership/erzeugt den Namen selbst, aber diese Route soll
 # auch fuer sich allein sicher sein).
-_HIELTECH_STORAGE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}\.pth$")
+# NEU (20. Okt 2026): auch die passende .index-Datei (gleicher Name) ist erlaubt.
+_HIELTECH_STORAGE_FILENAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}\.(pth|index)$")
 
 
 @app.post("/v1/hieltech_vocals_upload_model")
@@ -2212,10 +2213,34 @@ def _hieltech_lead_v2_source_path(path):
     return None
 
 
-def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model):
+def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths="", lead_text=""):
     warnings, steps = [], []
+    pick_info = None
     work_dir = tempfile.mkdtemp(prefix="hieltech_lead_v2_post_")
     try:
+        # NEU (20. Okt): "automatisch die beste von 2" - mehrere Extract-
+        # Varianten, Auswahl per Text-Abgleich + Lückenzeit (lead_v2_pick_step.py)
+        try:
+            cand = [p for p in json.loads(extract_paths or "[]") if isinstance(p, str)][:4]
+        except ValueError:
+            cand = []
+        cand = [c for c in (_hieltech_lead_v2_source_path(p) for p in cand) if c]
+        if not src_bytes and len(cand) >= 2:
+            text_file = os.path.join(work_dir, "lead_text.txt")
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(lead_text or "")
+            ref = os.path.realpath(lead_ref_path) if _hieltech_is_handoff_path(lead_ref_path) else "-"
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_pick_step.py"), text_file, ref] + cand, timeout=1200)
+            pick_info = _hieltech_last_json_line(log)
+            if ok and pick_info and isinstance(pick_info.get("chosen"), int) and 0 <= pick_info["chosen"] < len(cand):
+                extract_path = cand[pick_info["chosen"]]
+                steps.append(f"pick_variant_{pick_info['chosen'] + 1}")
+                print(f"[HIELTECH-Info] Lead v2 Auswahl: Variante {pick_info['chosen'] + 1} {json.dumps(pick_info.get('scores'), ensure_ascii=False)}", file=sys.stderr, flush=True)
+            else:
+                extract_path = cand[0]
+                warnings.append("Variantenauswahl fehlgeschlagen, Variante 1 genommen: " + (log or "")[-300:])
+        elif not src_bytes and len(cand) == 1:
+            extract_path = cand[0]
         if src_bytes:
             ext = os.path.splitext(filename or "")[1].lower() or ".flac"
             if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
@@ -2293,7 +2318,8 @@ def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path
         hp, token = _hieltech_handoff_store(conv, ext)
         print(f"[HIELTECH-Info] Lead v2 Nachbearbeitung: {', '.join(steps)}" + (f" | Warnungen: {len(warnings)}" if warnings else ""), file=sys.stderr, flush=True)
         return {"ok": True, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": ext,
-                "steps_applied": steps, "warnings": warnings, "rvc_applied": rvc_applied}
+                "steps_applied": steps, "warnings": warnings, "rvc_applied": rvc_applied,
+                "pick": pick_info}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -2305,13 +2331,16 @@ async def _hieltech_lead_v2_post_start(
     lead_ref_path: str = Form(default=""),
     backing_ref_path: str = Form(default=""),
     voice_model: str = Form(default=""),
+    extract_paths: str = Form(default=""),
+    lead_text: str = Form(default=""),
 ):
     """Antwort (über /v1/hieltech_job_status): {"ok", "result_token", "size_bytes",
-    "audio_ext", "steps_applied", "warnings", "rvc_applied"} – abholen über
-    /v1/hieltech_fetch_chunk (selber Worker)."""
+    "audio_ext", "steps_applied", "warnings", "rvc_applied", "pick"} – abholen über
+    /v1/hieltech_fetch_chunk (selber Worker). extract_paths (JSON-Liste) +
+    lead_text: mehrere Varianten, die beste wird automatisch gewählt."""
     src_bytes = await audio.read() if audio is not None else None
     filename = audio.filename if audio is not None else ""
-    return _hieltech_job_start("lead_v2_post", _hieltech_lead_v2_post_sync, src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model)
+    return _hieltech_job_start("lead_v2_post", _hieltech_lead_v2_post_sync, src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths, lead_text)
 
 
 
