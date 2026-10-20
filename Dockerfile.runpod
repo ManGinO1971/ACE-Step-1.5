@@ -80,6 +80,17 @@ RUN /app/.venv/bin/python /app/prefetch_vocals_models.py || true
 # aus dem Internet nach (mehrere hundert MB). Hier einmal beim Build.
 RUN /opt/acestep_rvc_venv/bin/python -c "import os, rvc_python; from rvc_python.download_model import download_rvc_models; download_rvc_models(os.path.dirname(rvc_python.__file__))" || true
 
+# NEU (20. Okt 2026, Lead Vocals v2): Gewichte für "Vocoder C"
+# (PC-NSF-HiFiGAN von OpenVPI, siehe nsf_vocoder_step.py). LIZENZ der
+# Gewichte: CC BY-NC-SA 4.0 (nicht kommerziell) – vor dem Verkauf klären.
+# Bricht den Build nie ab (|| true) – ohne Gewichte überspringt die neue Kette
+# den Vocoder nur mit Warnung.
+RUN mkdir -p /opt/hieltech_nsf_vocoder \
+    && curl -fsSL -o /tmp/pc_nsf.zip "https://github.com/openvpi/vocoders/releases/download/pc-nsf-hifigan-44.1k-hop512-128bin-2025.02/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.zip" \
+    && /app/.venv/bin/python -m zipfile -e /tmp/pc_nsf.zip /opt/hieltech_nsf_vocoder \
+    && rm -f /tmp/pc_nsf.zip \
+    && ls /opt/hieltech_nsf_vocoder/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt || true
+
 RUN mkdir -p /app/checkpoints /app/output
 
 ENV TOKENIZERS_PARALLELISM=false

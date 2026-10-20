@@ -2145,6 +2145,176 @@ async def _hieltech_vocals_delete_model(
     return {"ok": True}
 
 
+# ===========================================================================
+# NEU (20. Okt 2026): "Lead Vocals v2" – neue Kette für den Mikrofon-Knopf
+# (per Hörtest gewählt, Root Nah Bow T7/v2). Rein ZUSÄTZLICH – alle bisherigen
+# Routen bleiben unverändert; der VPS wählt per LEAD_VOCALS_MODE (v2/alt).
+#   1. /v1/hieltech_lead_v2_prepare_start: Song -> RoFormer -> Karaoke ->
+#      "Song ohne Background" (Quelle für Extract) + Lead-/Background-Referenz
+#   2. (VPS) /release_task Extract mit dem Base-Modell, auf denselben Worker
+#      gepinnt, Quelle = "Song ohne Background" (src_audio_path)
+#   3. /v1/hieltech_lead_v2_post_start: Zeitmaske -> Gate -> RMVPE ->
+#      Vocoder C -> optional .pth (RVC, f0 rmvpe). KEIN Denoise (Hörtest:
+#      DeepFilterNet schnitt Gesang weg), KEINE Wärmekette, KEIN WORLD.
+# ===========================================================================
+_HIELTECH_VOICE_MODEL_RE = re.compile(r"^(custom/)?[A-Za-z0-9_-]{1,120}$")
+
+
+def _hieltech_lead_v2_prepare_sync(src_bytes, filename):
+    work_dir = tempfile.mkdtemp(prefix="hieltech_lead_v2_pre_")
+    try:
+        src_ext = os.path.splitext(filename or "source.mp3")[1].lower() or ".mp3"
+        if not re.match(r"^\.[a-z0-9]{1,5}$", src_ext):
+            src_ext = ".mp3"
+        src_path = os.path.join(work_dir, "source" + src_ext)
+        with open(src_path, "wb") as f:
+            f.write(src_bytes)
+        out_dir = os.path.join(work_dir, "out")
+        ok, log = _hieltech_run_step(
+            [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_prepare_step.py"), src_path, out_dir], timeout=2400
+        )
+        report = _hieltech_last_json_line(log)
+        if not ok or not report:
+            return {"ok": False, "error": "lead_v2_prepare_failed", "message": "Lead-v2-Vorbereitung (Trennung) fehlgeschlagen.", "log": log[-1500:]}
+        paths = {}
+        for key, name in (("song_path", "song_ohne_background.wav"), ("lead_ref_path", "lead_ref.wav"), ("backing_ref_path", "backing_ref.wav")):
+            p = os.path.join(out_dir, name)
+            if not os.path.isfile(p):
+                return {"ok": False, "error": "lead_v2_prepare_failed", "message": f"{name} fehlt nach der Trennung."}
+            conv, ext = _hieltech_wav_to_flac_file(p)
+            paths[key], _tok = _hieltech_handoff_store(conv, ext)
+        print(f"[HIELTECH-Info] Lead v2 Vorbereitung: {json.dumps(report, ensure_ascii=False)}", file=sys.stderr, flush=True)
+        return {"ok": True, **paths, "report": report}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_lead_v2_prepare_start")
+async def _hieltech_lead_v2_prepare_start(audio: UploadFile):
+    """Antwort (über /v1/hieltech_job_status): {"ok", "song_path", "lead_ref_path",
+    "backing_ref_path", "report"} – alle Pfade nur per Worker-Affinität nutzbar."""
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lead_v2_prepare", _hieltech_lead_v2_prepare_sync, src_bytes, audio.filename)
+
+
+def _hieltech_lead_v2_source_path(path):
+    """Extract-Ergebnis: nur Dateien aus ACE-Steps eigenem Ausgabeordner oder
+    aus dem Handoff-Ordner werden angenommen (kein beliebiger Pfad)."""
+    try:
+        real = os.path.realpath(path or "")
+        allowed = os.path.realpath(getattr(app.state, "temp_audio_dir", "") or "")
+        if allowed and real.startswith(allowed + os.sep) and os.path.isfile(real):
+            return real
+    except Exception:  # noqa: BLE001
+        pass
+    if _hieltech_is_handoff_path(path):
+        return os.path.realpath(path)
+    return None
+
+
+def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model):
+    warnings, steps = [], []
+    work_dir = tempfile.mkdtemp(prefix="hieltech_lead_v2_post_")
+    try:
+        if src_bytes:
+            ext = os.path.splitext(filename or "")[1].lower() or ".flac"
+            if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+                ext = ".flac"
+            current = os.path.join(work_dir, "extract" + ext)
+            with open(current, "wb") as f:
+                f.write(src_bytes)
+        else:
+            current = _hieltech_lead_v2_source_path(extract_path)
+            if not current:
+                return {"ok": False, "error": "lead_v2_source_missing", "message": "Extract-Ergebnis nicht gefunden (falscher Worker?)."}
+        wav = os.path.join(work_dir, "extract.wav")
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", current, wav], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.isfile(wav):
+            return {"ok": False, "error": "lead_v2_decode_failed", "message": (r.stderr or "")[-300:]}
+        current = wav
+
+        # 1. Zeitmaske: Stille, wo im Original nur Background singt
+        if _hieltech_is_handoff_path(lead_ref_path):
+            masked = os.path.join(work_dir, "masked.wav")
+            args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), current, os.path.realpath(lead_ref_path), masked]
+            if _hieltech_is_handoff_path(backing_ref_path):
+                args.append(os.path.realpath(backing_ref_path))
+            ok, log = _hieltech_run_step(args, timeout=600)
+            if ok and os.path.isfile(masked):
+                current = masked
+                steps.append("time_mask")
+            else:
+                warnings.append("Zeitmaske übersprungen: " + log[-300:])
+        else:
+            warnings.append("Zeitmaske übersprungen: Lead-Referenz fehlt")
+
+        # 2. Gate (live-Werte)
+        gated = os.path.join(work_dir, "gated.wav")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", current, "--output", gated], timeout=300)
+        if ok and os.path.isfile(gated):
+            current = gated
+            steps.append("gate")
+        else:
+            warnings.append("Gate übersprungen: " + log[-300:])
+
+        # 3. RMVPE-Melodie + Vocoder C
+        f0_file = os.path.join(work_dir, "f0.npy")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), current, f0_file],
+                                     timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+        if ok and os.path.isfile(f0_file):
+            voc = os.path.join(work_dir, "vocoder_c.wav")
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "nsf_vocoder_step.py"), current, f0_file, voc], timeout=900)
+            if ok and os.path.isfile(voc):
+                current = voc
+                steps.append("vocoder_c")
+            else:
+                warnings.append("Vocoder C übersprungen: " + log[-400:])
+        else:
+            warnings.append("RMVPE-Melodie fehlgeschlagen, Vocoder C übersprungen: " + log[-400:])
+
+        # 4. optional .pth (RVC) – f0 rmvpe wie im Hörtest
+        rvc_applied = False
+        voice_model = (voice_model or "").strip()
+        if voice_model:
+            if not _HIELTECH_VOICE_MODEL_RE.match(voice_model):
+                warnings.append("Stimmmodell-Name ungültig – Stimmwechsel übersprungen")
+            else:
+                rvc_out = os.path.join(work_dir, "rvc.wav")
+                ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), current, rvc_out, voice_model, "0", "rmvpe"],
+                                             python_path=_HIELTECH_RVC_VENV_PYTHON)
+                if ok and os.path.isfile(rvc_out):
+                    current = rvc_out
+                    rvc_applied = True
+                    steps.append("rvc_convert")
+                else:
+                    warnings.append(f"Stimmwechsel ('{voice_model}') übersprungen: " + log[-400:])
+
+        conv, ext = _hieltech_wav_to_flac_file(current)
+        hp, token = _hieltech_handoff_store(conv, ext)
+        print(f"[HIELTECH-Info] Lead v2 Nachbearbeitung: {', '.join(steps)}" + (f" | Warnungen: {len(warnings)}" if warnings else ""), file=sys.stderr, flush=True)
+        return {"ok": True, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": ext,
+                "steps_applied": steps, "warnings": warnings, "rvc_applied": rvc_applied}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_lead_v2_post_start")
+async def _hieltech_lead_v2_post_start(
+    audio: UploadFile | None = File(default=None),
+    extract_path: str = Form(default=""),
+    lead_ref_path: str = Form(default=""),
+    backing_ref_path: str = Form(default=""),
+    voice_model: str = Form(default=""),
+):
+    """Antwort (über /v1/hieltech_job_status): {"ok", "result_token", "size_bytes",
+    "audio_ext", "steps_applied", "warnings", "rvc_applied"} – abholen über
+    /v1/hieltech_fetch_chunk (selber Worker)."""
+    src_bytes = await audio.read() if audio is not None else None
+    filename = audio.filename if audio is not None else ""
+    return _hieltech_job_start("lead_v2_post", _hieltech_lead_v2_post_sync, src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model)
+
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
