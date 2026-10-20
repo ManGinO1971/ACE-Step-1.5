@@ -898,7 +898,7 @@ def _hieltech_run_step(args, timeout=1800, python_path=None):
         # ins RunPod-Worker-Log durchreichen - die Skript-Ausgabe selbst wird
         # sonst nur im Fehlerfall zurueckgegeben und war im Log unsichtbar.
         for line in ((result.stdout or "") + (result.stderr or "")).splitlines():
-            if any(m in line for m in ("[Demucs-Schnellweg]", "Trenne Gesang", "Rückfall", "parallel auf")):
+            if any(m in line for m in ("[Demucs-Schnellweg]", "Trenne Gesang", "Rückfall", "parallel auf", "GPU-Speicher", "Stimmwechsel lief", "Melodie-Lock", "Melodie-Folgen", "Text-Maske")):
                 print(f"[HIELTECH-Info] {step_name}: {line.strip()[:300]}", file=sys.stderr, flush=True)
         return ok, (result.stdout or "") + (result.stderr or "")
     except Exception as e:  # noqa: BLE001 - bewusst breit, siehe Docstring

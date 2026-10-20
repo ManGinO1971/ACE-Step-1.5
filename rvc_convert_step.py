@@ -67,19 +67,56 @@ def main():
 
     hubert_path = os.path.join(base_dir, "rvc_models", "hubert_base.pt")
 
-    from rvc_python.infer import RVCInference
-
     # NEU (9. Okt 2026, Nutzerwunsch "soll alles moeglicher auf gpu laufen"):
     # vorher stand hier fest device="cpu" (unveraendert von der Mac-Version
     # uebernommen, wo es ohnehin keine CUDA-GPU gibt) - auf RunPod lief RVC
     # dadurch bisher IMMER auf der CPU, obwohl eine GPU bereitstand und
     # bezahlt wurde. Siehe Dockerfile.runpod fuer den dazugehoerigen Wechsel
     # der RVC-venv von CPU- auf CUDA-Torch.
+    # NEU (21. Okt 2026, Test "tiefe Töne": "CUDA out of memory" -> Hicham fiel
+    # komplett weg): GPU zuerst; ist ihr Speicher voll, Zwischenspeicher frei
+    # und noch einmal; klappt das nicht, auf dem Prozessor weiter (langsamer,
+    # aber der Stimmwechsel fällt nie mehr weg). HIELTECH_RVC_DEVICE erzwingt ein Gerät.
     try:
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        has_cuda = torch.cuda.is_available()
     except Exception:
-        device = "cpu"
+        torch, has_cuda = None, False
+    forced = os.environ.get("HIELTECH_RVC_DEVICE", "").strip()
+    devices = [forced] if forced else (["cuda", "cuda", "cpu"] if has_cuda else ["cpu"])
+    if has_cuda:
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            print(f"GPU-Speicher: {free_b / 1073741824:.1f} GB frei von {total_b / 1073741824:.1f} GB ({torch.cuda.get_device_name(0)})", flush=True)
+        except Exception:
+            pass
+    last_err = None
+    for attempt, device in enumerate(devices):
+        try:
+            _run_rvc(device, model_path, index_path, pitch_shift, f0_method, input_path, output_path)
+            if attempt:
+                print(f"Stimmwechsel lief im {attempt + 1}. Versuch ({device})", flush=True)
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if "out of memory" not in str(e).lower() or attempt == len(devices) - 1:
+                raise
+            print(f"GPU-Speicher voll beim Stimmwechsel ({device}) - gebe frei und versuche weiter", flush=True)
+            try:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+    if last_err:
+        raise last_err
+    print(f"OK: {output_path}")
+
+
+def _run_rvc(device, model_path, index_path, pitch_shift, f0_method, input_path, output_path):
+    from rvc_python.infer import RVCInference
+
     rvc = RVCInference(device=device)
     # FIX (20. Okt 2026, Hörtest: "fast meine Stimme"): rvc-python benutzt den
     # Index NUR, wenn er bei load_model() übergeben wird - das spätere
@@ -116,7 +153,7 @@ def main():
 
     rvc.vc.vc_single = _checked_vc_single
     rvc.infer_file(input_path, output_path)
-    print(f"OK: {output_path}")
+
 
 
 if __name__ == "__main__":
