@@ -2215,9 +2215,16 @@ def _hieltech_lead_v2_source_path(path):
 
 def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path, backing_ref_path, voice_model, extract_paths="", lead_text="", experiment=""):
     warnings, steps = [], []
-    # NEU (20. Okt 2026, Test "hohe Töne"): nur aktiv, wenn ausdrücklich angefordert
-    # (Terminal-Test) - die App schickt das Feld nicht, dort bleibt alles wie bisher.
-    exp = {x.strip() for x in (experiment or "").split(",") if x.strip()}
+    # Verbesserungen aus den Hörtests 20./21. Okt 2026 (Rock pon rock, Fassung F):
+    #   melody_lock   - Oktav-Sprünge an die Oktave des Original-Leads (Höhen)
+    #   lyrics_mask   - Stellen weit weg von jeder Lead-Textzeile stumm ("(Ooh)"-Intro)
+    #   melody_follow - kurze schiefe Stellen beim Tonwechsel folgen dem Original (Tiefen)
+    # SEIT 21. Okt 2026 STANDARD für jeden Song (vom Inhaber nach Hörtest F freigegeben).
+    # Abschalten: Umgebungsvariable HIELTECH_LEAD_V2_FEATURES="none" (oder eigene Liste);
+    # ein mitgeschicktes Formfeld "experiment" hat Vorrang ("none" = alles aus, wie 20. Okt).
+    feat = (experiment or "").strip() or os.environ.get("HIELTECH_LEAD_V2_FEATURES", "melody_lock,lyrics_mask,melody_follow")
+    exp = set() if feat.strip().lower() == "none" else {x.strip() for x in feat.split(",") if x.strip()}
+    print(f"[HIELTECH-Info] Lead v2 Verbesserungen: {', '.join(sorted(exp)) or 'keine'}", file=sys.stderr, flush=True)
     pick_info = None
     work_dir = tempfile.mkdtemp(prefix="hieltech_lead_v2_post_")
     try:
