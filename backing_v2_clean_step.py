@@ -80,6 +80,7 @@ def main():
         print(__doc__)
         return 1
     lead_p, back_p, song_p, f0l_p, f0b_p, lines_p, out_dir = sys.argv[1:8]
+    win_p = sys.argv[8] if len(sys.argv) > 8 else "-"
     os.makedirs(out_dir, exist_ok=True)
     back, sr = load(back_p)
     lead, _ = load(lead_p, sr)
@@ -143,8 +144,23 @@ def main():
     keep_b = drop_short(keep_b, int(E("BV2_MIN_S", 0.12) / HOP_S))
     solo = drop_short(solo, int(E("BV2_MIN_S", 0.12) / HOP_S))
     hold, att, rel = int(E("BV2_HOLD_S", 0.15) / HOP_S), max(1, int(0.03 / HOP_S)), max(1, int(0.15 / HOP_S))
+    # NEU (21. Okt 2026, Hörtest "nur die (…)- und {…}-Stellen, nicht mehr und nicht weniger"):
+    # Zeitfenster aus Songtext + Text-Abgleich - außerhalb davon kein Background.
+    windows = []
+    if win_p != "-" and os.path.isfile(win_p):
+        windows = [w for w in json.load(open(win_p)) if len(w) >= 2 and w[1] > w[0]]
+    win = np.ones(n, dtype=bool)
+    if windows:
+        win[:] = False
+        for a, b in windows:
+            win[max(0, int(a / HOP_S)):min(n, int(b / HOP_S) + 1)] = True
+        keep_b &= win
+        solo &= win
     gb = smooth_gain(keep_b, hold, att, rel)
     gs = smooth_gain(solo, hold, att, rel)
+    if windows:  # harte Fenstergrenzen weich machen (30 ms), damit nichts klickt
+        wr = smooth_gain(win, 0, max(1, int(0.03 / HOP_S)), max(1, int(0.03 / HOP_S)))
+        gb, gs = gb * wr, gs * wr
     t_audio = np.arange(n_s) / sr
     t_fr = np.arange(n) * HOP_S
     gb_s = np.interp(t_audio, t_fr, gb)
@@ -173,6 +189,8 @@ def main():
         "solo_from_lead_s": round(solo.sum() * HOP_S, 1),
         "together_s": round(together.sum() * HOP_S, 1),
         "lead_lines_used": len(lines),
+        "text_windows": len(windows),
+        "text_windows_s": round(float(win.sum()) * HOP_S, 1) if windows else None,
         "boost_db": round(gain_db, 1),
     }
     print(f"Saubere Background-Vorlage: Linie {report['background_line_s']} s, Solo aus Lead-Spur {report['solo_from_lead_s']} s, "
