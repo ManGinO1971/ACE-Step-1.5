@@ -109,9 +109,15 @@ def main():
         d = np.zeros(n)
         d[both] = 12.0 * np.log2(f0[:n][both] / ref[:n][both])
         k = np.round(d / 12.0)
-        fix = both & (k != 0) & (np.abs(d - 12.0 * k) < _env("NSF_LOCK_TOL_ST", 1.5)) & (np.abs(k) <= 2)
-        f0[:n][fix] = f0[:n][fix] / np.power(2.0, k[fix])
-        print(f"Melodie-Lock (Original-Lead): {int(fix.sum())} Frames auf die Oktave des Originals gesetzt", file=sys.stderr, flush=True)
+        # NEU (21. Okt 2026, Background mit Mann + 2 Frauen): die Stimme darf in IHRER
+        # Oktave bleiben (z.B. Mann eine Oktave unter der Frauen-Vorlage) - korrigiert
+        # werden nur Sprünge weg von ihrer üblichen Oktave. Beim Lead ist das 0 (wie bisher).
+        k_base = float(np.median(k[both])) if both.any() else 0.0
+        k_base = float(np.round(k_base)) if abs(k_base) <= 2 else 0.0
+        kr = k - k_base
+        fix = both & (kr != 0) & (np.abs(d - 12.0 * k) < _env("NSF_LOCK_TOL_ST", 1.5)) & (np.abs(kr) <= 2)
+        f0[:n][fix] = f0[:n][fix] / np.power(2.0, kr[fix])
+        print(f"Melodie-Lock (Original): {int(fix.sum())} Frames auf die Oktave der Stimme gesetzt (Stimmlage {k_base:+.0f} Oktave(n) zur Vorlage)", file=sys.stderr, flush=True)
         # NEU (20. Okt 2026, Test "tiefe Töne"): --follow = kurze schiefe Stellen
         # (1-11 Halbtöne neben dem Original, höchstens NSF_FOLLOW_MAX_MS lang,
         # typisch beim Tonwechsel) folgen der Original-Melodie (Oktave der neuen Stimme bleibt).
