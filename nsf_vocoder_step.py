@@ -141,6 +141,31 @@ def main():
                 else:
                     i += 1
             print(f"Melodie-Folgen (Original-Lead): {moved} Frames an kurzen schiefen Stellen an das Original angepasst", file=sys.stderr, flush=True)
+        # NEU (21. Okt 2026, Background-Test 7: Frau 1 traf die Vorlage nur zu 37 %, Vibrato
+        # 1,4 Halbtöne tief = "wackelt"): --follow-all = die Stimme singt ÜBERALL die Melodie
+        # der Vorlage (in ihrer eigenen Oktave); vom eigenen Vibrato bleibt nur ein Teil
+        # (NSF_VIBRATO_KEEP, Standard 0.35) - das Vibrato der Vorlage selbst bleibt erhalten.
+        if "--follow-all" in extra:
+            keep_v = _env("NSF_VIBRATO_KEEP", 0.35)
+            lf = np.where(f0[:n] > 0, np.log2(np.maximum(f0[:n], 1e-6)), np.nan)
+            seg_ok = both & (f0[:n] > 0)
+            own = np.zeros(n)
+            i = 0
+            while i < n:  # eigene Schwankung je Ton = Abstand zur geglätteten eigenen Linie
+                if seg_ok[i]:
+                    j = i
+                    while j < n and seg_ok[j]:
+                        j += 1
+                    x = lf[i:j]
+                    w = min(15, max(1, (j - i) // 2 * 2 - 1))
+                    tr = np.convolve(np.pad(x, w // 2, mode="edge"), np.ones(w) / w, mode="valid")[: j - i]
+                    own[i:j] = x - tr
+                    i = j
+                else:
+                    i += 1
+            tgt = np.log2(np.maximum(ref[:n], 1e-6)) + k_base + keep_v * own
+            f0[:n][seg_ok] = np.power(2.0, tgt[seg_ok])
+            print(f"Melodie überall (Vorlage): {int(seg_ok.sum())} Frames auf die Melodie der Vorlage gesetzt, eigenes Vibrato x{keep_v:.2f}", file=sys.stderr, flush=True)
     # NEU (21. Okt 2026, Background V2): --shift=N Halbtöne (Stimme ohne .pth, z.B. Frau +12)
     shift_arg = next((a for a in sys.argv[4:] if a.startswith("--shift=")), None)
     if shift_arg:

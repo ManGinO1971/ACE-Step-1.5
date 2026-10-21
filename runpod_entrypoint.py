@@ -2457,6 +2457,8 @@ def _hieltech_backing_v2_post_sync(extract_paths, backing_text, backing_ref_path
                 steps.append("melody_lock")
                 if "melody_follow" in exp:
                     steps.append("melody_follow")
+                if "melody_follow_all" in exp:
+                    steps.append("melody_follow_all")
             else:
                 ref_f0 = None
                 warnings.append("Melodie-Lock übersprungen: " + (log_r or "")[-300:])
@@ -2467,6 +2469,8 @@ def _hieltech_backing_v2_post_sync(extract_paths, backing_text, backing_ref_path
                 a.append(ref_f0)
                 if "melody_follow" in exp:
                     a.append("--follow")
+                if "melody_follow_all" in exp:
+                    a.append("--follow-all")
             if shift:
                 a.append(f"--shift={int(shift)}")
             return _hieltech_run_step(a, timeout=900)
