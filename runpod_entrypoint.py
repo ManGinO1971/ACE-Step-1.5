@@ -2530,6 +2530,47 @@ def _hieltech_bv2_lead_lines(lyrics):
     return out
 
 
+def _hieltech_bv2_backing_windows(lyrics, instances, conf_min=0.3):
+    """NEU (21. Okt 2026): Zeitfenster, in denen laut Songtext Background singt.
+    instances: Text-Abgleich der Lead-Zeilen [{"k","t0","t1","conf"}].
+      {…} in einer Lead-Zeile      -> genau diese Zeile (± 0,15 s)
+      (…) innerhalb einer Lead-Zeile -> diese Zeile bis 1,5 s danach
+      (…) als eigene Zeile          -> nach der vorigen Lead-Zeile bis zur nächsten (max. 4 s)
+      (…) vor der ersten Lead-Zeile  -> Songanfang bis zur ersten Lead-Zeile"""
+    together, inline, after = set(), set(), set()
+    k = -1
+    for raw in (lyrics or "").splitlines():
+        t = raw.strip()
+        if not t or (t.startswith("[") and t.endswith("]")):
+            continue
+        lead = re.sub(r"\s+", " ", re.sub(r"\{([^{}]*)\}", r"\1", re.sub(r"\([^()]*\)", " ", t))).strip()
+        if lead.split() and re.search(r"[A-Za-zÀ-ÿ]", lead):
+            k += 1
+            if "{" in t:
+                together.add(k)
+            if "(" in t:
+                inline.add(k)
+        elif "(" in t or "{" in t:
+            after.add(k)
+    inst = sorted([(int(i["k"]), float(i["t0"]), float(i["t1"])) for i in instances
+                   if float(i.get("conf", 0)) >= conf_min and "t0" in i and "t1" in i], key=lambda x: x[1])
+    if not inst:
+        return []
+    win = []
+    starts = [x[1] for x in inst]
+    for idx, (kk, t0, t1) in enumerate(inst):
+        nxt = starts[idx + 1] if idx + 1 < len(starts) else t1 + 4.0
+        if kk in together:
+            win.append([max(0.0, t0 - 0.15), t1 + 0.15])
+        if kk in inline:
+            win.append([t0, min(t1 + 1.5, nxt + 0.1)])
+        if kk in after:
+            win.append([max(0.0, t1 - 0.2), min(nxt + 0.4, t1 + 4.0)])
+    if -1 in after:
+        win.append([0.0, starts[0] + 0.1])
+    return win
+
+
 def _hieltech_backing_v2_clean_sync(lead_ref_path, backing_ref_path, song_path, lyrics):
     """NEU (21. Okt 2026): saubere Background-Vorlage (backing_v2_clean_step.py) +
     Quelle fürs Neu-Singen. Läuft zwischen Vorbereitung und Neu-Singen."""
@@ -2548,6 +2589,7 @@ def _hieltech_backing_v2_clean_sync(lead_ref_path, backing_ref_path, song_path, 
         # Text-Abgleich der Lead-Zeilen auf der Lead-Spur -> wo singt der Lead seinen Text
         lines = _hieltech_bv2_lead_lines(lyrics)
         lines_out = "-"
+        windows_out = "-"
         found = 0
         if lines:
             lj = os.path.join(work_dir, "lead_words.json")
@@ -2564,8 +2606,14 @@ def _hieltech_backing_v2_clean_sync(lead_ref_path, backing_ref_path, song_path, 
                 lines_out = os.path.join(work_dir, "lead_lines.json")
                 with open(lines_out, "w", encoding="utf-8") as f:
                     json.dump(segs, f)
+                if os.environ.get("HIELTECH_BACKING_V2_TEXT_WINDOWS", "1") != "0":
+                    wins = _hieltech_bv2_backing_windows(lyrics, inst)
+                    if wins:
+                        windows_out = os.path.join(work_dir, "backing_windows.json")
+                        with open(windows_out, "w", encoding="utf-8") as f:
+                            json.dump(wins, f)
         out_dir = os.path.join(work_dir, "out")
-        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "backing_v2_clean_step.py"), lead_ref, back_ref, song, f0l, f0b, lines_out, out_dir], timeout=900)
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "backing_v2_clean_step.py"), lead_ref, back_ref, song, f0l, f0b, lines_out, out_dir, windows_out], timeout=900)
         report = _hieltech_last_json_line(log)
         if not ok or not report:
             return {"ok": False, "error": "backing_v2_clean_failed", "message": "Saubere Background-Vorlage fehlgeschlagen: " + (log or "")[-500:]}
