@@ -2184,6 +2184,11 @@ def _hieltech_lead_v2_prepare_sync(src_bytes, filename):
                 return {"ok": False, "error": "lead_v2_prepare_failed", "message": f"{name} fehlt nach der Trennung."}
             conv, ext = _hieltech_wav_to_flac_file(p)
             paths[key], _tok = _hieltech_handoff_store(conv, ext)
+        # NEU (21. Okt 2026, Background V2): Song ohne Lead (optional)
+        p = os.path.join(out_dir, "song_ohne_lead.wav")
+        if os.path.isfile(p):
+            conv, ext = _hieltech_wav_to_flac_file(p)
+            paths["song_ohne_lead_path"], _tok = _hieltech_handoff_store(conv, ext)
         print(f"[HIELTECH-Info] Lead v2 Vorbereitung: {json.dumps(report, ensure_ascii=False)}", file=sys.stderr, flush=True)
         return {"ok": True, **paths, "report": report}
     finally:
@@ -2353,6 +2358,176 @@ def _hieltech_lead_v2_post_sync(src_bytes, filename, extract_path, lead_ref_path
                 "pick": pick_info}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ===========================================================================
+# NEU (21. Okt 2026): "Background V2" (.pth-Knopf) – dieselbe Kette wie Vocals V2,
+# nur für den Background: Quelle = Song OHNE Lead, Melodie-Vorlage = Original-
+# Background-Spur, je Stimme eigenes .pth (z.B. 1 Mann + 2 Frauen).
+#   Vorbereitung: /v1/hieltech_lead_v2_prepare_start (liefert song_ohne_lead_path)
+#   Neu singen:   (VPS) /release_task Extract, track backing_vocals, Base-Modell
+#   Nachbearbeitung: /v1/hieltech_backing_v2_post_start
+#     Auswahl beste Variante -> Zeitmaske (Background-Spur) -> Gate -> RMVPE ->
+#     Vocoder C mit Melodie-Lock + Melodie folgen (Original-Background) ->
+#     je Stimme: .pth (mit Index, Oktave je Geschlecht) bzw. ohne .pth Vocoder
+#     mit Transposition. KEIN WORLD, KEINE Wärmekette, KEINE Demucs-Nachtrennung.
+# ===========================================================================
+def _hieltech_backing_v2_post_sync(extract_paths, backing_text, backing_ref_path, lead_ref_path, voices_json, experiment=""):
+    warnings, steps = [], []
+    feat = (experiment or "").strip() or os.environ.get("HIELTECH_BACKING_V2_FEATURES", "melody_lock,melody_follow")
+    exp = set() if feat.strip().lower() == "none" else {x.strip() for x in feat.split(",") if x.strip()}
+    print(f"[HIELTECH-Info] Background v2 Verbesserungen: {', '.join(sorted(exp)) or 'keine'}", file=sys.stderr, flush=True)
+    try:
+        voices = [v for v in json.loads(voices_json or "[]") if isinstance(v, dict)][:3]
+    except ValueError:
+        voices = []
+    voices = voices or [{"slot": 1, "model": "", "gender": "female"}]
+    if not _hieltech_is_handoff_path(backing_ref_path):
+        return {"ok": False, "error": "backing_v2_ref_missing", "message": "Background-Referenz fehlt (falscher Worker?)."}
+    bref = os.path.realpath(backing_ref_path)
+    work_dir = tempfile.mkdtemp(prefix="hieltech_backing_v2_post_")
+    pick_info = None
+    try:
+        try:
+            cand = [p for p in json.loads(extract_paths or "[]") if isinstance(p, str)][:4]
+        except ValueError:
+            cand = []
+        cand = [c for c in (_hieltech_lead_v2_source_path(p) for p in cand) if c]
+        if not cand:
+            return {"ok": False, "error": "backing_v2_source_missing", "message": "Neu gesungener Background nicht gefunden (falscher Worker?)."}
+        current = cand[0]
+        if len(cand) >= 2:
+            text_file = os.path.join(work_dir, "backing_text.txt")
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(backing_text or "")
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_pick_step.py"), text_file, bref] + cand, timeout=1200)
+            pick_info = _hieltech_last_json_line(log)
+            if ok and pick_info and isinstance(pick_info.get("chosen"), int) and 0 <= pick_info["chosen"] < len(cand):
+                current = cand[pick_info["chosen"]]
+                steps.append(f"pick_variant_{pick_info['chosen'] + 1}")
+            else:
+                warnings.append("Variantenauswahl fehlgeschlagen, Variante 1 genommen: " + (log or "")[-300:])
+        wav = os.path.join(work_dir, "extract.wav")
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", current, wav], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.isfile(wav):
+            return {"ok": False, "error": "backing_v2_decode_failed", "message": (r.stderr or "")[-300:]}
+        current = wav
+
+        # 1. Zeitmaske: nur wo im Original der Background singt (Lead NICHT als
+        #    Gegenspieler - unter {…} singt der Lead lauter, der Background soll bleiben)
+        masked = os.path.join(work_dir, "masked.wav")
+        args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), current, bref, masked]
+        if "lyrics_mask" in exp and pick_info and isinstance(pick_info.get("scores"), list):
+            segs = next((sc.get("segments") for sc in pick_info["scores"] if sc.get("variant") == pick_info.get("chosen")), None)
+            if segs:
+                keep_file = os.path.join(work_dir, "backing_lines.json")
+                with open(keep_file, "w", encoding="utf-8") as f:
+                    json.dump(segs, f)
+                args.append(keep_file)
+                steps.append("lyrics_mask")
+        ok, log = _hieltech_run_step(args, timeout=600)
+        if ok and os.path.isfile(masked):
+            current = masked
+            steps.append("time_mask")
+        else:
+            warnings.append("Zeitmaske übersprungen: " + (log or "")[-300:])
+
+        # 2. Gate
+        gated = os.path.join(work_dir, "gated.wav")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", current, "--output", gated], timeout=300)
+        if ok and os.path.isfile(gated):
+            current = gated
+            steps.append("gate")
+        else:
+            warnings.append("Gate übersprungen: " + (log or "")[-300:])
+
+        # 3. Melodie (neu gesungen) + Melodie der Original-Background-Spur
+        f0_file = os.path.join(work_dir, "f0.npy")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), current, f0_file],
+                                     timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+        if not (ok and os.path.isfile(f0_file)):
+            return {"ok": False, "error": "backing_v2_f0_failed", "message": "Melodie-Erkennung fehlgeschlagen: " + (log or "")[-300:], "warnings": warnings}
+        ref_f0 = None
+        if "melody_lock" in exp:
+            ref_f0 = os.path.join(work_dir, "f0_backing_ref.npy")
+            ok_r, log_r = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), bref, ref_f0],
+                                             timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+            if ok_r and os.path.isfile(ref_f0):
+                steps.append("melody_lock")
+                if "melody_follow" in exp:
+                    steps.append("melody_follow")
+            else:
+                ref_f0 = None
+                warnings.append("Melodie-Lock übersprungen: " + (log_r or "")[-300:])
+
+        def vocode(out_path, shift=0):
+            a = [os.path.join(_HIELTECH_PROJECT_ROOT, "nsf_vocoder_step.py"), current, f0_file, out_path]
+            if ref_f0:
+                a.append(ref_f0)
+                if "melody_follow" in exp:
+                    a.append("--follow")
+            if shift:
+                a.append(f"--shift={int(shift)}")
+            return _hieltech_run_step(a, timeout=900)
+
+        base_voc = os.path.join(work_dir, "vocoder_c.wav")
+        ok, log = vocode(base_voc)
+        if not (ok and os.path.isfile(base_voc)):
+            return {"ok": False, "error": "backing_v2_vocoder_failed", "message": "Vocoder C fehlgeschlagen: " + (log or "")[-300:], "warnings": warnings}
+        steps.append("vocoder_c")
+        median_f0 = _hieltech_median_f0(base_voc)
+        print(f"[HIELTECH-Info] Background v2: mittlere Tonhöhe {median_f0 and round(median_f0)} Hz", file=sys.stderr, flush=True)
+
+        # 4. je Stimme: .pth (Oktave je Geschlecht wie bisher) oder Vocoder mit Transposition
+        results = []
+        for i, v in enumerate(voices):
+            slot = int(v.get("slot") or (i + 1))
+            model = str(v.get("model") or "").strip()
+            gender = "male" if str(v.get("gender") or "").lower() == "male" else "female"
+            shift = _hieltech_octave_shift(median_f0, gender)
+            voice_path, rvc_applied = base_voc, False
+            if model and not _HIELTECH_VOICE_MODEL_RE.match(model):
+                warnings.append(f"Stimme {slot}: ungültiger Modellname verworfen")
+                model = ""
+            if model:
+                rvc_out = os.path.join(work_dir, f"backing_{slot}_rvc.wav")
+                ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), base_voc, rvc_out, model, str(shift), "rmvpe"],
+                                             python_path=_HIELTECH_RVC_VENV_PYTHON)
+                if ok and os.path.isfile(rvc_out):
+                    voice_path, rvc_applied = rvc_out, True
+                else:
+                    warnings.append(f"Stimme {slot}: Stimmwechsel ('{model}') übersprungen, System-Stimme verwendet: " + (log or "")[-300:])
+            if not rvc_applied and shift:
+                shifted = os.path.join(work_dir, f"backing_{slot}_shift.wav")
+                ok, log = vocode(shifted, shift)
+                if ok and os.path.isfile(shifted):
+                    voice_path = shifted
+                else:
+                    warnings.append(f"Stimme {slot}: Transposition übersprungen: " + (log or "")[-300:])
+            print(f"[HIELTECH-Info] Background v2 Stimme {slot}: {gender}, {'Modell ' + model if rvc_applied else 'System-Stimme'}, Transposition {shift:+d}", file=sys.stderr, flush=True)
+            conv, ext = _hieltech_wav_to_flac_file(voice_path)
+            hp, token = _hieltech_handoff_store(conv, ext)
+            results.append({"slot": slot, "gender": gender, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": ext,
+                            "rvc_applied": rvc_applied, "pitch_shift": shift})
+        print(f"[HIELTECH-Info] Background v2 Nachbearbeitung: {', '.join(steps)}" + (f" | Warnungen: {len(warnings)}" if warnings else ""), file=sys.stderr, flush=True)
+        return {"ok": True, "voices": results, "steps_applied": steps, "warnings": warnings, "pick": pick_info, "median_f0": median_f0}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_backing_v2_post_start")
+async def _hieltech_backing_v2_post_start(
+    extract_paths: str = Form(default=""),
+    backing_text: str = Form(default=""),
+    backing_ref_path: str = Form(default=""),
+    lead_ref_path: str = Form(default=""),
+    voices: str = Form(default=""),
+    experiment: str = Form(default=""),
+):
+    """Antwort (über /v1/hieltech_job_status): {"ok", "voices": [{slot, gender,
+    result_token, size_bytes, audio_ext, rvc_applied, pitch_shift}], "steps_applied",
+    "warnings", "pick"} – je Stimme abholen über /v1/hieltech_fetch_chunk (selber Worker)."""
+    return _hieltech_job_start("backing_v2_post", _hieltech_backing_v2_post_sync, extract_paths, backing_text, backing_ref_path, lead_ref_path, voices, experiment)
 
 
 @app.post("/v1/hieltech_lead_v2_post_start")

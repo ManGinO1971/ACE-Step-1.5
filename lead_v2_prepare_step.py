@@ -29,7 +29,7 @@ import soundfile as sf
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from backing_separate_step import _load_stereo, run_karaoke  # noqa: E402
+from backing_separate_step import _load_stereo, run_karaoke, write_context_without_lead  # noqa: E402
 from vocal_separate_uvr_clean_step import (  # noqa: E402
     ROFORMER_VOCALS_MODEL,
     run_uvr_stage,
@@ -85,8 +85,26 @@ def main():
         sf.write(os.path.join(out_dir, "lead_ref.wav"), lead, lsr)
         braw, bsr = sf.read(backing_raw, always_2d=True)
         sf.write(os.path.join(out_dir, "backing_ref.wav"), braw, bsr)
+        # NEU (21. Okt 2026, Background V2): Song OHNE Lead (Quelle für das
+        # Neu-Singen des Backgrounds) + wie viele Sekunden Background es gibt.
+        backing_seconds = None
+        try:
+            write_context_without_lead(song, lead_path, sr, os.path.join(out_dir, "song_ohne_lead.wav"))
+            bm = braw.mean(axis=1)
+            hop = max(1, int(bsr * 0.01))
+            nfr = len(bm) // hop
+            if nfr:
+                e = np.sqrt(np.mean(bm[: nfr * hop].reshape(nfr, hop) ** 2, axis=1) + 1e-12)
+                db = 20 * np.log10(e)
+                lm = lead.mean(axis=1)
+                lhop = max(1, int(lsr * 0.01))
+                lfr = len(lm) // lhop
+                ref = float(np.percentile(20 * np.log10(np.sqrt(np.mean(lm[: lfr * lhop].reshape(lfr, lhop) ** 2, axis=1) + 1e-12)), 95)) if lfr else float(db.max())
+                backing_seconds = round(float(np.sum(db > max(ref, float(np.percentile(db, 95))) - 30)) / 100.0, 1)
+        except Exception as e:  # noqa: BLE001 - Lead-Kette braucht das nicht
+            print(f"Song ohne Lead nicht erzeugt: {e}", file=sys.stderr, flush=True)
 
-    report = {"ok": True, "separator": separator, "karaoke_model": karaoke_model, "samplerate": sr}
+    report = {"ok": True, "separator": separator, "karaoke_model": karaoke_model, "samplerate": sr, "backing_seconds": backing_seconds}
     print(json.dumps(report, ensure_ascii=False), flush=True)
     return 0
 

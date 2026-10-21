@@ -101,6 +101,7 @@ def main():
     # gehaltenen Ton), wird sie auf die Oktave des Originals zurückgesetzt.
     extra = sys.argv[4:]
     ref_path = next((a for a in extra if not a.startswith("--")), None)
+    # bei --shift die Referenz NACH der Transposition vergleichen (siehe unten): Lock zuerst, dann Shift
     if ref_path and os.path.isfile(ref_path):
         ref = np.load(ref_path).astype(np.float64)
         n = min(len(ref), len(f0))
@@ -134,6 +135,16 @@ def main():
                 else:
                     i += 1
             print(f"Melodie-Folgen (Original-Lead): {moved} Frames an kurzen schiefen Stellen an das Original angepasst", file=sys.stderr, flush=True)
+    # NEU (21. Okt 2026, Background V2): --shift=N Halbtöne (Stimme ohne .pth, z.B. Frau +12)
+    shift_arg = next((a for a in sys.argv[4:] if a.startswith("--shift=")), None)
+    if shift_arg:
+        try:
+            st = float(shift_arg.split("=", 1)[1])
+        except ValueError:
+            st = 0.0
+        if st:
+            f0 = np.where(f0 > 0, f0 * np.power(2.0, st / 12.0), 0.0)
+            print(f"Transposition: {st:+.0f} Halbtöne", file=sys.stderr, flush=True)
     voiced = f0 > 0
     if voiced.sum() < 2:
         print("FEHLER: zu wenig Melodie erkannt", file=sys.stderr)
