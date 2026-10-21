@@ -2516,6 +2516,84 @@ def _hieltech_backing_v2_post_sync(extract_paths, backing_text, backing_ref_path
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _hieltech_bv2_lead_lines(lyrics):
+    """Lead-Zeilen wie im VPS (leadOnlyLyrics): (…) raus, {…} bleibt; together = Zeile hatte {…}."""
+    out = []
+    for raw in (lyrics or "").splitlines():
+        t = raw.strip()
+        if not t or (t.startswith("[") and t.endswith("]")):
+            continue
+        lead = re.sub(r"\s+", " ", re.sub(r"\{([^{}]*)\}", r"\1", re.sub(r"\([^()]*\)", " ", t))).strip()
+        words = lead.split()
+        if words and re.search(r"[A-Za-zÀ-ÿ]", lead):
+            out.append({"words": words, "together": "{" in t})
+    return out
+
+
+def _hieltech_backing_v2_clean_sync(lead_ref_path, backing_ref_path, song_path, lyrics):
+    """NEU (21. Okt 2026): saubere Background-Vorlage (backing_v2_clean_step.py) +
+    Quelle fürs Neu-Singen. Läuft zwischen Vorbereitung und Neu-Singen."""
+    for pth in (lead_ref_path, backing_ref_path, song_path):
+        if not _hieltech_is_handoff_path(pth):
+            return {"ok": False, "error": "backing_v2_clean_input_missing", "message": "Vorbereitungs-Dateien fehlen (falscher Worker?)."}
+    lead_ref, back_ref, song = (os.path.realpath(x) for x in (lead_ref_path, backing_ref_path, song_path))
+    work_dir = tempfile.mkdtemp(prefix="hieltech_bv2_clean_")
+    try:
+        f0l, f0b = os.path.join(work_dir, "f0_lead.npy"), os.path.join(work_dir, "f0_backing.npy")
+        for src, dst in ((lead_ref, f0l), (back_ref, f0b)):
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), src, dst],
+                                         timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+            if not (ok and os.path.isfile(dst)):
+                return {"ok": False, "error": "backing_v2_clean_f0_failed", "message": "Melodie-Erkennung fehlgeschlagen: " + (log or "")[-300:]}
+        # Text-Abgleich der Lead-Zeilen auf der Lead-Spur -> wo singt der Lead seinen Text
+        lines = _hieltech_bv2_lead_lines(lyrics)
+        lines_out = "-"
+        found = 0
+        if lines:
+            lj = os.path.join(work_dir, "lead_words.json")
+            with open(lj, "w", encoding="utf-8") as f:
+                json.dump([x["words"] for x in lines], f, ensure_ascii=False)
+            aj = os.path.join(work_dir, "lead_align.json")
+            ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lyrics_align_step.py"), "--align", lead_ref, lj, aj], timeout=900)
+            if ok and os.path.isfile(aj):
+                inst = json.load(open(aj, encoding="utf-8")).get("instances", [])
+                segs = [{"t0": float(i["t0"]), "t1": float(i["t1"]), "conf": float(i.get("conf", 0)),
+                         "together": bool(lines[int(i["k"])]["together"]) if 0 <= int(i.get("k", -1)) < len(lines) else False}
+                        for i in inst if "t0" in i and "t1" in i]
+                found = len(segs)
+                lines_out = os.path.join(work_dir, "lead_lines.json")
+                with open(lines_out, "w", encoding="utf-8") as f:
+                    json.dump(segs, f)
+        out_dir = os.path.join(work_dir, "out")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "backing_v2_clean_step.py"), lead_ref, back_ref, song, f0l, f0b, lines_out, out_dir], timeout=900)
+        report = _hieltech_last_json_line(log)
+        if not ok or not report:
+            return {"ok": False, "error": "backing_v2_clean_failed", "message": "Saubere Background-Vorlage fehlgeschlagen: " + (log or "")[-500:]}
+        paths = {}
+        for key, name in (("clean_backing_path", "clean_backing.wav"), ("source_path", "source.wav")):
+            conv, ext = _hieltech_wav_to_flac_file(os.path.join(out_dir, name))
+            paths[key], tok = _hieltech_handoff_store(conv, ext)
+            if key == "clean_backing_path":  # zum Anhören (Terminal-Test)
+                paths["clean_backing_token"], paths["clean_backing_size"], paths["clean_backing_ext"] = tok, os.path.getsize(paths[key]), ext
+        report["lead_lines_found"] = found
+        report["lead_lines_total"] = len(lines)
+        print(f"[HIELTECH-Info] Background v2 Vorlage: {json.dumps(report, ensure_ascii=False)}", file=sys.stderr, flush=True)
+        return {"ok": True, **paths, "report": report}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_backing_v2_clean_start")
+async def _hieltech_backing_v2_clean_start(
+    lead_ref_path: str = Form(default=""),
+    backing_ref_path: str = Form(default=""),
+    song_path: str = Form(default=""),
+    lyrics: str = Form(default=""),
+):
+    """Antwort (über /v1/hieltech_job_status): {"ok", "clean_backing_path", "source_path", "report"}."""
+    return _hieltech_job_start("backing_v2_clean", _hieltech_backing_v2_clean_sync, lead_ref_path, backing_ref_path, song_path, lyrics)
+
+
 @app.post("/v1/hieltech_backing_v2_post_start")
 async def _hieltech_backing_v2_post_start(
     extract_paths: str = Form(default=""),
