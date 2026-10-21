@@ -2184,11 +2184,12 @@ def _hieltech_lead_v2_prepare_sync(src_bytes, filename):
                 return {"ok": False, "error": "lead_v2_prepare_failed", "message": f"{name} fehlt nach der Trennung."}
             conv, ext = _hieltech_wav_to_flac_file(p)
             paths[key], _tok = _hieltech_handoff_store(conv, ext)
-        # NEU (21. Okt 2026, Background V2): Song ohne Lead (optional)
-        p = os.path.join(out_dir, "song_ohne_lead.wav")
-        if os.path.isfile(p):
-            conv, ext = _hieltech_wav_to_flac_file(p)
-            paths["song_ohne_lead_path"], _tok = _hieltech_handoff_store(conv, ext)
+        # NEU (21. Okt 2026, Background V2): Song ohne Lead / mit lautem Background (optional)
+        for key, name in (("song_ohne_lead_path", "song_ohne_lead.wav"), ("song_backing_laut_path", "song_backing_laut.wav")):
+            p = os.path.join(out_dir, name)
+            if os.path.isfile(p):
+                conv, ext = _hieltech_wav_to_flac_file(p)
+                paths[key], _tok = _hieltech_handoff_store(conv, ext)
         print(f"[HIELTECH-Info] Lead v2 Vorbereitung: {json.dumps(report, ensure_ascii=False)}", file=sys.stderr, flush=True)
         return {"ok": True, **paths, "report": report}
     finally:

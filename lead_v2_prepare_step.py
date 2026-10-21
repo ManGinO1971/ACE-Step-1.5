@@ -90,6 +90,20 @@ def main():
         backing_seconds = None
         try:
             write_context_without_lead(song, lead_path, sr, os.path.join(out_dir, "song_ohne_lead.wav"))
+            # NEU (21. Okt 2026, Test 2): Background lauter (+6 dB) im Song ohne Lead,
+            # damit das Modell ihn wie eine Hauptstimme hört und richtig neu singt.
+            try:
+                ctx = _load_stereo(os.path.join(out_dir, "song_ohne_lead.wav"), sr)
+                bk = _load_stereo(backing_raw, sr)
+                n2 = min(ctx.shape[1], bk.shape[1])
+                loud = ctx.copy()
+                loud[:, :n2] = ctx[:, :n2] + float(os.environ.get("HIELTECH_BACKING_BOOST", "1.0")) * bk[:, :n2]
+                pk = float(np.max(np.abs(loud))) if loud.size else 0.0
+                if pk > 0.99:
+                    loud *= 0.99 / pk
+                sf.write(os.path.join(out_dir, "song_backing_laut.wav"), loud.T, sr)
+            except Exception as e:  # noqa: BLE001
+                print(f"Song mit lautem Background nicht erzeugt: {e}", file=sys.stderr, flush=True)
             bm = braw.mean(axis=1)
             hop = max(1, int(bsr * 0.01))
             nfr = len(bm) // hop
