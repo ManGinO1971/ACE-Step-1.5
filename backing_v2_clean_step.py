@@ -80,7 +80,6 @@ def main():
         print(__doc__)
         return 1
     lead_p, back_p, song_p, f0l_p, f0b_p, lines_p, out_dir = sys.argv[1:8]
-    win_p = sys.argv[8] if len(sys.argv) > 8 else "-"
     os.makedirs(out_dir, exist_ok=True)
     back, sr = load(back_p)
     lead, _ = load(lead_p, sr)
@@ -105,36 +104,18 @@ def main():
         if x.get("together"):
             together[max(0, int(x["t0"] / HOP_S)):min(n, int(x["t1"] / HOP_S))] = True
 
-    # NEU (21. Okt 2026, Wunsch des Inhabers "Fenster nur zum Aufräumen, nicht zum
-    # Abschalten"): Zeitfenster der (…)/{…}-Stellen aus Songtext + Text-Abgleich.
-    # IN den Fenstern: normale Regeln. AUSSERHALB: Lead-Anteil strenger raus, aber
-    # echter Background (klar anderer Ton als der Lead) bleibt überall erhalten.
-    windows = []
-    if win_p != "-" and os.path.isfile(win_p):
-        windows = [w for w in json.load(open(win_p)) if len(w) >= 2 and w[1] > w[0]]
-    win = np.ones(n, dtype=bool)
-    if windows:
-        win[:] = False
-        for a, b in windows:
-            win[max(0, int(a / HOP_S)):min(n, int(b / HOP_S) + 1)] = True
-
     # 1. Background-Spur: Durchsickern + Echo raus (nicht in {…}-Zeilen)
     act_b = (eB > refB + E("BV2_ACTIVE_DB", -25)) & ~np.isnan(B)
     same = np.zeros(n, dtype=bool)
     echo = np.zeros(n, dtype=bool)
     lo_f, hi_f = int(E("BV2_ECHO_MIN_S", 0.12) / HOP_S), int(E("BV2_ECHO_MAX_S", 0.8) / HOP_S)
-    hi_strict = int(E("BV2_STRICT_ECHO_MAX_S", 1.5) / HOP_S)
-    tol_same, tol_echo = 1.0, 0.5
-    tol_same_s, tol_echo_s = E("BV2_STRICT_SAME_ST", 2.0), E("BV2_STRICT_ECHO_ST", 1.0)
     for i in np.flatnonzero(act_b & ~together):
-        strict = windows and not win[i]
-        ts, te, hf = (tol_same_s, tol_echo_s, hi_strict) if strict else (tol_same, tol_echo, hi_f)
-        if not np.isnan(L[i]) and pc_dist(B[i], L[i]) < ts:
+        if not np.isnan(L[i]) and pc_dist(B[i], L[i]) < 1.0:
             same[i] = True
             continue
-        w = L[max(0, i - hf):max(0, i - lo_f)]
+        w = L[max(0, i - hi_f):max(0, i - lo_f)]
         w = w[~np.isnan(w)]
-        if len(w) and np.min(pc_dist(B[i], w)) < te:
+        if len(w) and np.min(pc_dist(B[i], w)) < 0.5:
             echo[i] = True
     keep_b = act_b & ~same & ~echo
 
@@ -192,10 +173,6 @@ def main():
         "solo_from_lead_s": round(solo.sum() * HOP_S, 1),
         "together_s": round(together.sum() * HOP_S, 1),
         "lead_lines_used": len(lines),
-        "text_windows": len(windows),
-        "text_windows_s": round(float(win.sum()) * HOP_S, 1) if windows else None,
-        "kept_inside_windows_s": round(float((keep_b & win).sum() + (solo & win).sum()) * HOP_S, 1) if windows else None,
-        "kept_outside_windows_s": round(float((keep_b & ~win).sum() + (solo & ~win).sum()) * HOP_S, 1) if windows else None,
         "boost_db": round(gain_db, 1),
     }
     print(f"Saubere Background-Vorlage: Linie {report['background_line_s']} s, Solo aus Lead-Spur {report['solo_from_lead_s']} s, "
