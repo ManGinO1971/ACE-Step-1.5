@@ -261,5 +261,3 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/en/awesome.md
 package-lock.json
-# NEU (23. Okt 2026): Stimmproben des Background-Chors gehören ins Repo
-!hieltech_chor/*.wav
