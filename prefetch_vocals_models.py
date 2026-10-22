@@ -53,7 +53,10 @@ def _uvr():
     # NEU (13. Okt 2026): Karaoke-Modelle fuer "Background Vocals erzeugen"
     # (backing_separate_step.py - Lead/Background-Trennung).
     for model in ("UVR-DeEcho-DeReverb.pth", "UVR-De-Echo-Aggressive.pth", "vocals_mel_band_roformer.ckpt",
-                  "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt", "6_HP-Karaoke-UVR.pth"):
+                  "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt", "6_HP-Karaoke-UVR.pth",
+                  # NEU (23. Okt 2026, Background-Chor): Mischung 8 + Hall/Rauschen raus
+                  "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "mel_band_roformer_kim_ft2_bleedless_unwa.ckpt",
+                  "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"):
         try:
             sep = Separator(model_file_dir=model_dir, output_dir=model_dir, log_level=logging.WARNING)
             sep.load_model(model_filename=model)
