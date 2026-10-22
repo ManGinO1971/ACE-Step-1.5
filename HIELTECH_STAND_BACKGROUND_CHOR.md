@@ -18,8 +18,11 @@ was er nicht braucht. Optional je Stimme ein eigenes .pth-Modell, optional Human
    → Hall raus `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt`
    → Rauschen raus `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`
    → Tonart-Schätzung (nur Rückfall, wenn die App keine Tonart schickt)
-2. `hieltech_chor/seedvc_multi.py` (Umgebung `/opt/seedvc_venv`, Seed-VC `/opt/seed-vc`,
-   Commit 51383ef, angepasst mit `seedvc_hieltech_patch.py`):
+2. `hieltech_chor/seedvc_multi.py` – Seed-VC liegt auf dem Netzwerk-Volume
+   `/runpod-volume/hieltech_seedvc` (venv + seed-vc, Commit 51383ef, angepasst mit
+   `seedvc_hieltech_patch.py`). Eingerichtet einmalig durch `hieltech_chor/seedvc_setup.sh`
+   (Route `/v1/hieltech_seedvc_setup_start` oder automatisch beim ersten Chor). Grund:
+   der RunPod-Build mit Seed-VC im Docker-Image brach ohne Meldung ab.
    Gesangsmodell 44,1 kHz mit Tonhöhe, 50 Schritte, cfg 0.7, Stimmprobe 15 s,
    keine Auto-Tonlage. Vor dem Singen wird die Melodie vorbereitet:
    Oktav-Sperre → Stabil (Ausreißer-Reparatur, Ton-Halt 0.3, ruhige Übergänge) →
@@ -43,7 +46,7 @@ Zuordnung: Stimme männlich → mann; weiblich → erste frau2, zweite frau1, dr
 Originale der Stimmen: Mac `~/ACE-Step-1.5/lead-neu-test/STIMMEN-ORIGINAL-Frau1-Frau2/` (mit Rezept).
 
 ## Schalter (RunPod-Umgebungsvariablen)
-- `HIELTECH_CHOR_STEPS` (50), `HIELTECH_SEEDVC_PYTHON` (/opt/seedvc_venv/bin/python)
+- `HIELTECH_CHOR_STEPS` (50), `HIELTECH_SEEDVC_HOME` (/runpod-volume/hieltech_seedvc)
 - `HIELTECH_CHOR_DEREVERB`, `HIELTECH_CHOR_DENOISE` (Modellnamen)
 - VPS: `BACKING_CHOR_MAX_WAIT_MS` (1 560 000 = 26 Min)
 

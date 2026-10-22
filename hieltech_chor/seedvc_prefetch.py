@@ -17,6 +17,7 @@ import soundfile as sf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+ok = False
 try:
     with tempfile.TemporaryDirectory() as d:
         sr = 44100
@@ -29,6 +30,9 @@ try:
         r = subprocess.run([sys.executable, os.path.join(HERE, "seedvc_multi.py"), jf], capture_output=True, text=True, timeout=3600)
         print(r.stdout[-2000:], r.stderr[-2000:], flush=True)
         print("[Vorab-Download] Seed-VC: " + ("OK" if r.returncode == 0 else f"Fehler {r.returncode}"), flush=True)
+        ok = r.returncode == 0
 except Exception as e:  # noqa: BLE001 - darf den Build nie abbrechen
     print(f"[Vorab-Download] Seed-VC übersprungen: {e}", flush=True)
-sys.exit(0)
+    ok = False
+# HIELTECH_PREFETCH_STRICT=1 (Einrichtung auf dem Volume): Fehler melden; sonst nie abbrechen
+sys.exit(0 if ok or os.environ.get("HIELTECH_PREFETCH_STRICT") != "1" else 1)

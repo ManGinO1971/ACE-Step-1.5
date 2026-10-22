@@ -2647,8 +2647,53 @@ async def _hieltech_lead_v2_post_start(
 #   4. optional .pth (RVC) je Stimme, optional Humanizer (kleine Zeitversätze je Phrase)
 # Der Kunde schneidet danach mit der Schere weg, was er nicht braucht.
 # =====================================================================
-_HIELTECH_SEEDVC_VENV_PYTHON = os.environ.get("HIELTECH_SEEDVC_PYTHON", "/opt/seedvc_venv/bin/python")
 _HIELTECH_CHOR_DIR = os.path.join(_HIELTECH_PROJECT_ROOT, "hieltech_chor")
+# Seed-VC liegt auf dem RunPod-Netzwerk-Volume (einmal eingerichtet, für alle Worker).
+# Grund (23. Okt 2026): der RunPod-Build mit Seed-VC im Docker-Image brach jedes Mal
+# ohne Meldung ab. Gibt es doch eine Image-Installation (/opt/seed-vc), hat sie Vorrang.
+_HIELTECH_SEEDVC_HOME = os.environ.get("HIELTECH_SEEDVC_HOME", "/runpod-volume/hieltech_seedvc")
+_HIELTECH_SEEDVC_LOCK = threading.Lock()
+
+
+def _hieltech_seedvc_paths():
+    if os.path.isfile("/opt/seedvc_venv/bin/python") and os.path.isfile("/opt/seed-vc/inference.py"):
+        return "/opt/seedvc_venv/bin/python", "/opt/seed-vc", True
+    py = os.path.join(_HIELTECH_SEEDVC_HOME, "venv", "bin", "python")
+    return py, os.path.join(_HIELTECH_SEEDVC_HOME, "seed-vc"), os.path.isfile(os.path.join(_HIELTECH_SEEDVC_HOME, ".hieltech_ok")) and os.path.isfile(py)
+
+
+def _hieltech_seedvc_ensure():
+    """Richtet Seed-VC einmal auf dem Volume ein (dauert beim ersten Mal einige Minuten).
+    Gibt (python, seedvc_ordner, ok, log) zurück."""
+    with _HIELTECH_SEEDVC_LOCK:
+        py, d, ok = _hieltech_seedvc_paths()
+        if ok:
+            return py, d, True, ""
+        lock_path = os.path.join(os.path.dirname(_HIELTECH_SEEDVC_HOME.rstrip("/")) or "/tmp", ".hieltech_seedvc.lock")
+        try:
+            import fcntl
+            lf = open(lock_path, "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)  # ein anderer Worker richtet evtl. gerade ein -> warten
+        except Exception:  # noqa: BLE001
+            lf = None
+        try:
+            py, d, ok = _hieltech_seedvc_paths()
+            if ok:
+                return py, d, True, ""
+            print(f"[HIELTECH-Info] Seed-VC wird auf dem Volume eingerichtet ({_HIELTECH_SEEDVC_HOME}) – einmalig, dauert einige Minuten", file=sys.stderr, flush=True)
+            t0 = time.time()
+            r = subprocess.run(["bash", os.path.join(_HIELTECH_CHOR_DIR, "seedvc_setup.sh"), _HIELTECH_SEEDVC_HOME],
+                               cwd=_HIELTECH_PROJECT_ROOT, capture_output=True, text=True, timeout=3600)
+            log = (r.stdout or "") + (r.stderr or "")
+            print(f"[HIELTECH-Zeitmessung] Seed-VC-Einrichtung: {time.time() - t0:.1f}s (ok={r.returncode == 0})", file=sys.stderr, flush=True)
+            py, d, ok = _hieltech_seedvc_paths()
+            return py, d, ok, log
+        finally:
+            if lf is not None:
+                try:
+                    lf.close()
+                except Exception:  # noqa: BLE001
+                    pass
 # Rollen = die drei gewählten Stimmen (Stimmproben im Ordner hieltech_chor/)
 _HIELTECH_CHOR_ROLES = {
     "mann": {"ref": "stimme_Mann.wav", "lage": "original", "oktave": 0, "halt": 0.3, "voc": (0.3, 1.0), "humanize_seed": 303},
@@ -2729,6 +2774,10 @@ def _hieltech_backing_chor_sync(src_bytes, filename, key_scale, voices_json, hum
         for p in plan:
             if p["role"] not in roles:
                 roles.append(p["role"])
+        svc_py, svc_dir_code, svc_ok, svc_log = _hieltech_seedvc_ensure()
+        if not svc_ok:
+            return {"ok": False, "error": "chor_seedvc_setup_failed", "message": "Seed-VC-Einrichtung fehlgeschlagen.", "log": (svc_log or "")[-1500:]}
+        os.environ["HIELTECH_SEEDVC_DIR"] = svc_dir_code
         svc_dir = os.path.join(work_dir, "svc")
         job = {"source": vorlage, "out_dir": svc_dir, "tonart": tonart, "steps": int(os.environ.get("HIELTECH_CHOR_STEPS", "50")),
                "voices": [{"name": r, "ref": os.path.join(_HIELTECH_CHOR_DIR, _HIELTECH_CHOR_ROLES[r]["ref"]), "lage": _HIELTECH_CHOR_ROLES[r]["lage"],
@@ -2736,7 +2785,7 @@ def _hieltech_backing_chor_sync(src_bytes, filename, key_scale, voices_json, hum
         job_file = os.path.join(work_dir, "seedvc_job.json")
         with open(job_file, "w", encoding="utf-8") as f:
             json.dump(job, f)
-        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_CHOR_DIR, "seedvc_multi.py"), job_file], timeout=5400, python_path=_HIELTECH_SEEDVC_VENV_PYTHON)
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_CHOR_DIR, "seedvc_multi.py"), job_file], timeout=5400, python_path=svc_py)
         svc_rep = _hieltech_last_json_line(log)
         if not ok or not svc_rep or not svc_rep.get("ok"):
             return {"ok": False, "error": "chor_seedvc_failed", "message": "Seed-VC (Neu-Singen) fehlgeschlagen.", "log": (log or "")[-1500:]}
@@ -2811,6 +2860,17 @@ def _hieltech_backing_chor_sync(src_bytes, filename, key_scale, voices_json, hum
         return {"ok": True, "voices": results, "steps_applied": steps, "warnings": warnings, "tonart": tonart, "prepare": prep}
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _hieltech_seedvc_setup_sync():
+    py, d, ok, log = _hieltech_seedvc_ensure()
+    return {"ok": ok, "seedvc_dir": d, "python": py, "log": (log or "")[-2500:]}
+
+
+@app.post("/v1/hieltech_seedvc_setup_start")
+async def _hieltech_seedvc_setup_start():
+    """Seed-VC einmal auf dem Netzwerk-Volume einrichten (Terminal-Test vor dem ersten Chor)."""
+    return _hieltech_job_start("seedvc_setup", _hieltech_seedvc_setup_sync)
 
 
 @app.post("/v1/hieltech_backing_chor_start")
