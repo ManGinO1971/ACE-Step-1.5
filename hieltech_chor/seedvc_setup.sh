@@ -9,11 +9,14 @@ COMMIT=51383efd921027683c89e5348211d93ff12ac2a8
 mkdir -p "$H"
 cd "$H"
 echo "Seed-VC-Einrichtung in $H"
-if [ ! -d seed-vc/.git ]; then
+echo "Freier Platz: $(df -h "$H" | tail -1)"
+# Reste eines abgebrochenen Versuchs (z. B. volles Volume) entfernen und neu holen
+rm -f seed-vc/.git/index.lock
+if ! git -C seed-vc checkout -q "$COMMIT" 2>/dev/null; then
   rm -rf seed-vc
   git clone -q https://github.com/Plachtaa/seed-vc.git seed-vc
+  git -C seed-vc checkout -q "$COMMIT"
 fi
-git -C seed-vc checkout -q "$COMMIT"
 # Umgebung mit uv statt "python -m venv"/pip (23. Okt 2026: ensurepip schlug auf dem
 # Netzwerk-Volume fehl). uv liegt im Image unter /bin/uv.
 export UV_LINK_MODE=copy UV_CACHE_DIR=/tmp/uv-cache-seedvc
