@@ -2862,6 +2862,45 @@ def _hieltech_backing_chor_sync(src_bytes, filename, key_scale, voices_json, hum
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _hieltech_vocals_clean_sync(src_bytes, filename):
+    """NEU (23. Okt 2026, Nutzerwunsch): alter Mikrofon-Knopf = Original-Gesang SAUBER getrennt,
+    genau wie die Vorlage des Background-Chors: Mischung 8 (3 Modelle, Min-Spec) -> Hall raus -> Rauschen raus.
+    Kein Neu-Singen, kein Stimmmodell - der echte Gesang des Songs (Lead + Background)."""
+    work_dir = tempfile.mkdtemp(prefix="hieltech_vclean_")
+    try:
+        src_ext = os.path.splitext(filename or "source.mp3")[1].lower() or ".mp3"
+        if not re.match(r"^\.[a-z0-9]{1,5}$", src_ext):
+            src_ext = ".mp3"
+        src_path = os.path.join(work_dir, "source" + src_ext)
+        with open(src_path, "wb") as f:
+            f.write(src_bytes)
+        prep_dir = os.path.join(work_dir, "prep")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "backing_chor_prepare_step.py"), src_path, prep_dir], timeout=3600)
+        prep = _hieltech_last_json_line(log)
+        vocals = os.path.join(prep_dir, "chor_vorlage.wav")
+        if not ok or not prep or not prep.get("ok") or not os.path.isfile(vocals):
+            return {"ok": False, "error": "vocals_clean_failed", "message": "Saubere Gesangstrennung (Mischung 8) fehlgeschlagen.", "log": (log or "")[-1500:]}
+        steps = [f"mischung8({len(prep.get('ensemble', []))})"]
+        if prep.get("dereverb"):
+            steps.append("dereverb")
+        if prep.get("denoise"):
+            steps.append("denoise")
+        conv, ext = _hieltech_wav_to_flac_file(vocals)
+        hp, token = _hieltech_handoff_store(conv, ext)
+        print(f"[HIELTECH-Info] Vocals sauber fertig: {', '.join(steps)}, {prep.get('seconds')} s", file=sys.stderr, flush=True)
+        return {"ok": True, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": ext, "steps_applied": steps, "prepare": prep}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_vocals_clean_start")
+async def _hieltech_vocals_clean_start(audio: UploadFile):
+    """Antwort (über /v1/hieltech_job_status): {"ok", "result_token", "size_bytes", "audio_ext",
+    "steps_applied"} – abholen über /v1/hieltech_fetch_chunk (selber Worker)."""
+    src_bytes = await audio.read()
+    return _hieltech_job_start("vocals_clean", _hieltech_vocals_clean_sync, src_bytes, audio.filename)
+
+
 def _hieltech_seedvc_setup_sync():
     py, d, ok, log = _hieltech_seedvc_ensure()
     return {"ok": ok, "seedvc_dir": d, "python": py, "log": (log or "")[-2500:]}

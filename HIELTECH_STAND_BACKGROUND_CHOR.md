@@ -53,3 +53,10 @@ Originale der Stimmen: Mac `~/ACE-Step-1.5/lead-neu-test/STIMMEN-ORIGINAL-Frau1-
 ## Rückweg
 - Ganzer Stand: `git checkout stand-lead-v2-2026-10-21 -- <datei>` (vorher) bzw. Revert des Chor-Commits.
 - Alte Background-Wege (original/pth) sind im Code noch vorhanden, in der App aber entfernt.
+
+## Alter Mikrofon-Knopf = „Vocals sauber“ (NEU, 23. Okt 2026)
+Route `/v1/hieltech_vocals_clean_start`: nur Schritt 1 des Chors (`backing_chor_prepare_step.py`,
+Mischung 8 -> Hall raus -> Rauschen raus) und fertig – der ORIGINAL-Gesang des Songs (Lead +
+Background), trocken, FLAC. Kein Neu-Singen, kein Stimmmodell, 1 Token.
+VPS: `generateVocals` -> `attemptVocalsClean`; alte Kette (ACE-Step Extract) per `.env VOCALS_OLD_CHAIN=1`.
+
