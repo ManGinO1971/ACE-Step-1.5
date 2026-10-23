@@ -14,18 +14,23 @@ if [ ! -d seed-vc/.git ]; then
   git clone -q https://github.com/Plachtaa/seed-vc.git seed-vc
 fi
 git -C seed-vc checkout -q "$COMMIT"
-if [ ! -x venv/bin/python ]; then
-  python3.10 -m venv venv
+# Umgebung mit uv statt "python -m venv"/pip (23. Okt 2026: ensurepip schlug auf dem
+# Netzwerk-Volume fehl). uv liegt im Image unter /bin/uv.
+export UV_LINK_MODE=copy UV_CACHE_DIR=/tmp/uv-cache-seedvc
+UV="$(command -v uv || echo /bin/uv)"
+if ! venv/bin/python -c "import sys" 2>/dev/null; then
+  rm -rf venv
+  "$UV" venv --python /usr/bin/python3.10 venv
 fi
-venv/bin/pip install -q --no-cache-dir "pip==24.0"
+UVP=("$UV" pip install --python "$H/venv/bin/python")
 venv/bin/python -c "import torch" 2>/dev/null || \
-  venv/bin/pip install -q --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 "torch==2.7.1" "torchaudio==2.7.1" || \
-  venv/bin/pip install -q --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchaudio
-venv/bin/pip install -q --no-cache-dir \
+  "${UVP[@]}" --index-url https://download.pytorch.org/whl/cu128 "torch==2.7.1" "torchaudio==2.7.1" || \
+  "${UVP[@]}" --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+"${UVP[@]}" \
   accelerate "scipy==1.13.1" "librosa==0.10.2" "huggingface-hub>=0.28.1" \
   "munch==4.0.0" "einops==0.8.0" "descript-audio-codec==1.0.0" "pydub==0.25.1" \
   "transformers==4.46.3" "soundfile==0.12.1" "modelscope==1.18.1" "funasr==1.1.5" \
-  "numpy==1.26.4" "hydra-core==1.3.2" pyyaml python-dotenv
+  "numpy==1.26.4" "hydra-core==1.3.2" pyyaml python-dotenv "torch==2.7.1" "torchaudio==2.7.1"
 cd "$H/seed-vc"
 "$H/venv/bin/python" "$HIER/seedvc_hieltech_patch.py"
 HIELTECH_SEEDVC_DIR="$H/seed-vc" HIELTECH_PREFETCH_STRICT=1 "$H/venv/bin/python" "$HIER/seedvc_prefetch.py"
