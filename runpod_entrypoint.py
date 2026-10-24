@@ -2901,6 +2901,278 @@ async def _hieltech_vocals_clean_start(audio: UploadFile):
     return _hieltech_job_start("vocals_clean", _hieltech_vocals_clean_sync, src_bytes, audio.filename)
 
 
+# ===========================================================================
+# NEU (24. Okt 2026): eigenes LoKr/LoRA-Training (HIELTECH-Instrumente, Gnawa, Reggae …)
+# Daten liegen auf dem Netzwerk-Volume: <HOME>/data/<datensatz>/ (Audio + <name>.json mit caption)
+# Ablauf im Auftrag: /v1/dataset/scan -> /v1/dataset/preprocess_async -> /v1/training/start_lokr
+# (die offiziellen ACE-Step-Routen, hier über localhost aufgerufen). Ergebnis: <HOME>/out/<name>/final/
+# Test: Adapter laden -> Songs erzeugen -> Adapter entladen -> dieselben Songs ohne Adapter (Vergleich).
+# ===========================================================================
+_HIELTECH_LORA_HOME = os.environ.get("HIELTECH_LORA_HOME", "/runpod-volume/hieltech_lora")
+_HIELTECH_LORA_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+_HIELTECH_LORA_FILE_RE = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_.\-]{0,127}$")
+_HIELTECH_LORA_EXT = (".wav", ".flac", ".mp3", ".ogg", ".opus", ".json", ".txt")
+_HIELTECH_LORA_PROGRESS = {}
+
+
+def _hieltech_lora_local(method, path, payload=None, timeout=600):
+    """Ruft eine Route dieses Servers über localhost auf (JSON). Gibt (http_status, json) zurück."""
+    import urllib.request
+    import urllib.error
+    url = f"http://127.0.0.1:{os.environ.get('PORT', '5000')}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    key = os.environ.get("ACESTEP_API_KEY", "").strip()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            body = {}
+        return e.code, body
+
+
+def _hieltech_lora_data(body):
+    """ACE-Step-Antworten: {"data": …, "code": …, "error": …}."""
+    if isinstance(body, dict) and "data" in body:
+        return body.get("data") or {}, body.get("error")
+    return body or {}, None
+
+
+def _hieltech_lora_set_progress(name, **kw):
+    cur = dict(_HIELTECH_LORA_PROGRESS.get(name) or {})
+    cur.update(kw)
+    cur["updated"] = time.time()
+    _HIELTECH_LORA_PROGRESS[name] = cur
+
+
+@app.post("/v1/hieltech_lora_upload")
+async def _hieltech_lora_upload(file: UploadFile, dataset: str = Form(...), filename: str = Form(...)):
+    """Eine Trainingsdatei aufs Volume legen: <HOME>/data/<dataset>/<filename>."""
+    if not _HIELTECH_LORA_NAME_RE.match(dataset or "") or not _HIELTECH_LORA_FILE_RE.match(filename or ""):
+        return Response(status_code=400, content=b"ungueltiger Name")
+    if not filename.lower().endswith(_HIELTECH_LORA_EXT):
+        return Response(status_code=400, content=b"Dateityp nicht erlaubt")
+    d = os.path.join(_HIELTECH_LORA_HOME, "data", dataset)
+    os.makedirs(d, exist_ok=True)
+    body = await file.read()
+    tmp = os.path.join(d, "." + filename + ".part")
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, os.path.join(d, filename))
+    return {"ok": True, "dataset": dataset, "filename": filename, "bytes": len(body)}
+
+
+@app.get("/v1/hieltech_lora_list")
+async def _hieltech_lora_list(dataset: str = ""):
+    """Dateien eines Datensatzes bzw. vorhandene Adapter auflisten."""
+    out = {"ok": True, "datasets": {}, "adapters": []}
+    base = os.path.join(_HIELTECH_LORA_HOME, "data")
+    if os.path.isdir(base):
+        for ds in sorted(os.listdir(base)):
+            if dataset and ds != dataset:
+                continue
+            p = os.path.join(base, ds)
+            if os.path.isdir(p):
+                fs = [f for f in sorted(os.listdir(p)) if not f.startswith(".")]
+                out["datasets"][ds] = {"files": len(fs), "audio": len([f for f in fs if not f.endswith((".json", ".txt"))]),
+                                       "bytes": sum(os.path.getsize(os.path.join(p, f)) for f in fs)}
+    ob = os.path.join(_HIELTECH_LORA_HOME, "out")
+    if os.path.isdir(ob):
+        for n in sorted(os.listdir(ob)):
+            w = os.path.join(ob, n, "final", "lokr_weights.safetensors")
+            if os.path.isfile(w) or os.path.isdir(os.path.join(ob, n, "final")):
+                out["adapters"].append(n)
+    return out
+
+
+def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
+    t0 = time.time()
+    try:
+        from acestep.training.path_safety import set_safe_root
+        os.makedirs(_HIELTECH_LORA_HOME, exist_ok=True)
+        set_safe_root(_HIELTECH_LORA_HOME)  # Volume liegt außerhalb von /app (sonst lehnt ACE-Step die Pfade ab); "/" ginge nicht (Prüfung auf root + "/")
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH-Info] LoRA: set_safe_root fehlgeschlagen: {e}", file=sys.stderr, flush=True)
+    audio_dir = os.path.join(_HIELTECH_LORA_HOME, "data", dataset)
+    tensor_dir = os.path.join(_HIELTECH_LORA_HOME, "tensors", name)
+    out_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name)
+    if not os.path.isdir(audio_dir):
+        return {"ok": False, "error": "no_dataset", "message": f"Datensatz fehlt: {audio_dir}"}
+    shutil.rmtree(tensor_dir, ignore_errors=True)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    os.makedirs(out_dir, exist_ok=True)
+    _hieltech_lora_set_progress(name, phase="scan", started=t0)
+
+    st, body = _hieltech_lora_local("POST", "/v1/dataset/scan", {"audio_dir": audio_dir, "dataset_name": name, "all_instrumental": True})
+    data, err = _hieltech_lora_data(body)
+    n = int((data or {}).get("num_samples") or 0)
+    labeled = sum(1 for x in (data or {}).get("samples", []) if x.get("labeled") or x.get("caption"))
+    if st >= 400 or err or n == 0:
+        return {"ok": False, "error": "scan_failed", "message": f"Scan: HTTP {st} {err or ''}"}
+    print(f"[HIELTECH-Info] LoRA {name}: {n} Dateien, {labeled} mit Beschreibung", file=sys.stderr, flush=True)
+    _hieltech_lora_set_progress(name, phase="preprocess", samples=n, labeled=labeled)
+
+    st, body = _hieltech_lora_local("POST", "/v1/dataset/preprocess_async", {"output_dir": tensor_dir})
+    data, err = _hieltech_lora_data(body)
+    task = (data or {}).get("task_id")
+    if st >= 400 or err or not task:
+        return {"ok": False, "error": "preprocess_failed", "message": f"Vorverarbeitung Start: HTTP {st} {err or ''}"}
+    while True:
+        time.sleep(5)
+        st, body = _hieltech_lora_local("GET", f"/v1/dataset/preprocess_status/{task}")
+        data, err = _hieltech_lora_data(body)
+        _hieltech_lora_set_progress(name, phase="preprocess", current=data.get("current"), total=data.get("total"))
+        if data.get("status") == "completed":
+            break
+        if data.get("status") == "failed" or st >= 400:
+            return {"ok": False, "error": "preprocess_failed", "message": str(data.get("error") or err or st)}
+        if time.time() - t0 > 2 * 3600:
+            return {"ok": False, "error": "preprocess_timeout", "message": "Vorverarbeitung > 2 Std."}
+
+    _hieltech_lora_set_progress(name, phase="train", epoch=0, epochs=epochs)
+    st, body = _hieltech_lora_local("POST", "/v1/training/start_lokr", {
+        "tensor_dir": tensor_dir, "output_dir": out_dir, "train_epochs": int(epochs), "learning_rate": float(learning_rate),
+        "save_every_n_epochs": int(save_every), "train_batch_size": 1, "gradient_accumulation": 4,
+    })
+    data, err = _hieltech_lora_data(body)
+    if st >= 400 or err:
+        return {"ok": False, "error": "train_start_failed", "message": f"Training Start: HTTP {st} {err or body}"}
+    last = {}
+    while True:
+        time.sleep(15)
+        st, body = _hieltech_lora_local("GET", "/v1/training/status")
+        data, err = _hieltech_lora_data(body)
+        last = data or {}
+        _hieltech_lora_set_progress(name, phase="train", epoch=last.get("current_epoch"), epochs=epochs, step=last.get("current_step"),
+                                    loss=last.get("current_loss"), status=str(last.get("status"))[:200],
+                                    eta_s=last.get("estimated_time_remaining"))
+        if not last.get("is_training"):
+            break
+    final_dir = os.path.join(out_dir, "final")
+    if last.get("error") or not os.path.isdir(final_dir):
+        return {"ok": False, "error": "train_failed", "message": str(last.get("error") or last.get("status"))[:500]}
+    result = {"ok": True, "name": name, "dataset": dataset, "samples": n, "epochs": int(epochs), "final": final_dir,
+              "files": sorted(os.listdir(final_dir)), "last_loss": last.get("current_loss"), "minutes": round((time.time() - t0) / 60, 1)}
+    with open(os.path.join(out_dir, "hieltech_ergebnis.json"), "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=1)
+    _hieltech_lora_set_progress(name, phase="done", result=result)
+    print(f"[HIELTECH-Info] LoRA {name} fertig: {result}", file=sys.stderr, flush=True)
+    return result
+
+
+@app.post("/v1/hieltech_lora_train_start")
+async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(...), epochs: str = Form(default="300"),
+                                     learning_rate: str = Form(default="0.03"), save_every: str = Form(default="50")):
+    if not _HIELTECH_LORA_NAME_RE.match(dataset or "") or not _HIELTECH_LORA_NAME_RE.match(name or ""):
+        return Response(status_code=400, content=b"ungueltiger Name")
+    try:
+        ep, lr, se = max(1, min(5000, int(epochs))), float(learning_rate), max(1, int(save_every))
+    except ValueError:
+        return Response(status_code=400, content=b"ungueltige Zahl")
+    _HIELTECH_LORA_PROGRESS.pop(name, None)
+    return _hieltech_job_start("lora_train", _hieltech_lora_train_sync, dataset, name, ep, lr, se)
+
+
+@app.get("/v1/hieltech_lora_progress")
+async def _hieltech_lora_progress(name: str = ""):
+    return {"ok": True, "progress": _HIELTECH_LORA_PROGRESS.get(name) or {}}
+
+
+@app.post("/v1/hieltech_lora_stop")
+async def _hieltech_lora_stop():
+    st, body = _hieltech_lora_local("POST", "/v1/training/stop", {})
+    return {"ok": st < 400, "http": st}
+
+
+def _hieltech_lora_generate(prompt, lyrics, duration, seed):
+    """Ein Song über die normale ACE-Step-Warteschlange dieses Workers; gibt den Dateipfad zurück."""
+    import urllib.parse
+    payload = {"prompt": prompt, "lyrics": lyrics or "[Instrumental]", "audio_duration": float(duration), "seed": int(seed),
+               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": True,
+               "audio_format": "mp3", "mp3_bitrate": "320k", "task_type": "text2music"}
+    st, body = _hieltech_lora_local("POST", "/release_task", payload)
+    data, err = _hieltech_lora_data(body)
+    tid = (data or {}).get("task_id")
+    if not tid:
+        raise RuntimeError(f"release_task: HTTP {st} {err or body}")
+    t0 = time.time()
+    while time.time() - t0 < 1200:
+        time.sleep(3)
+        st, body = _hieltech_lora_local("POST", "/query_result", {"task_id_list": [tid]})
+        items = (body or {}).get("data") or []
+        it = items[0] if items else {}
+        if it.get("status") == 1:
+            res = json.loads(it.get("result") or "[]")
+            first = res[0] if isinstance(res, list) and res else res
+            q = urllib.parse.urlparse(first.get("file") or "")
+            path = urllib.parse.parse_qs(q.query).get("path", [""])[0]
+            if not path or not os.path.isfile(path):
+                raise RuntimeError(f"Audiodatei nicht gefunden: {first.get('file')}")
+            return path, first.get("dit_model")
+        if it.get("status") == 2:
+            raise RuntimeError("Erzeugung fehlgeschlagen")
+    raise RuntimeError("Erzeugung > 20 Min")
+
+
+def _hieltech_lora_test_sync(name, items_json, scale):
+    try:
+        from acestep.training.path_safety import set_safe_root
+        set_safe_root(_HIELTECH_LORA_HOME)
+    except Exception:  # noqa: BLE001
+        pass
+    final_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name, "final")
+    w = os.path.join(final_dir, "lokr_weights.safetensors")
+    adapter = w if os.path.isfile(w) else final_dir
+    if not os.path.exists(adapter):
+        return {"ok": False, "error": "no_adapter", "message": f"Adapter fehlt: {adapter}"}
+    try:
+        items = [x for x in json.loads(items_json or "[]") if isinstance(x, dict)][:8]
+    except ValueError:
+        items = []
+    if not items:
+        return {"ok": False, "error": "no_items"}
+    results = []
+    for mode in ("mit", "ohne"):
+        if mode == "mit":
+            st, body = _hieltech_lora_local("POST", "/v1/lora/load", {"lora_path": adapter})
+            data, err = _hieltech_lora_data(body)
+            if st >= 400 or err:
+                return {"ok": False, "error": "lora_load_failed", "message": f"HTTP {st} {err or body}"}
+            if scale is not None:
+                _hieltech_lora_local("POST", "/v1/lora/scale", {"scale": float(scale)})
+        else:
+            _hieltech_lora_local("POST", "/v1/lora/unload", {})
+        for i, it in enumerate(items, 1):
+            try:
+                path, dit = _hieltech_lora_generate(it.get("prompt", ""), it.get("lyrics", ""), it.get("duration", 45), it.get("seed", 42))
+                hp, token = _hieltech_handoff_store(path, "mp3")
+                results.append({"nr": i, "mode": mode, "label": str(it.get("label") or i)[:40], "result_token": token,
+                                "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
+            except Exception as e:  # noqa: BLE001
+                results.append({"nr": i, "mode": mode, "label": str(it.get("label") or i)[:40], "error": str(e)[:300]})
+    _hieltech_lora_local("POST", "/v1/lora/unload", {})  # immer ohne Adapter zurücklassen (App!)
+    return {"ok": True, "adapter": adapter, "results": results}
+
+
+@app.post("/v1/hieltech_lora_test_start")
+async def _hieltech_lora_test_start(name: str = Form(...), items: str = Form(...), scale: str = Form(default="")):
+    if not _HIELTECH_LORA_NAME_RE.match(name or ""):
+        return Response(status_code=400, content=b"ungueltiger Name")
+    sc = None
+    if scale.strip():
+        try:
+            sc = max(0.0, min(1.0, float(scale)))
+        except ValueError:
+            return Response(status_code=400, content=b"ungueltige Staerke")
+    return _hieltech_job_start("lora_test", _hieltech_lora_test_sync, name, items, sc)
+
+
 def _hieltech_seedvc_setup_sync():
     py, d, ok, log = _hieltech_seedvc_ensure()
     return {"ok": ok, "seedvc_dir": d, "python": py, "log": (log or "")[-2500:]}

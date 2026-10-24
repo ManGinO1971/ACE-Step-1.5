@@ -60,3 +60,10 @@ Mischung 8 -> Hall raus -> Rauschen raus) und fertig – der ORIGINAL-Gesang des
 Background), trocken, FLAC. Kein Neu-Singen, kein Stimmmodell, 1 Token.
 VPS: `generateVocals` -> `attemptVocalsClean`; alte Kette (ACE-Step Extract) per `.env VOCALS_OLD_CHAIN=1`.
 
+## LoRA/LoKr-Training (NEU, 24. Okt 2026 – nur Terminal)
+Routen: `/v1/hieltech_lora_upload` (Datei -> `/runpod-volume/hieltech_lora/data/<datensatz>/`), `/v1/hieltech_lora_list`,
+`/v1/hieltech_lora_train_start` (scan -> preprocess_async -> training/start_lokr über localhost, Ergebnis
+`/runpod-volume/hieltech_lora/out/<name>/final/`), `/v1/hieltech_lora_progress`, `/v1/hieltech_lora_stop`,
+`/v1/hieltech_lora_test_start` (Songs mit und ohne Adapter, danach immer entladen).
+VPS-Werkzeug: `/root/lora/lora_tool.js` (upload | list | train | test | stop). Die App nutzt noch keinen Adapter.
+
