@@ -56,6 +56,10 @@ import tempfile
 import threading
 import time
 import uuid
+import faulthandler
+
+# Bei einem harten Absturz (exit code 139) den Python-Stand aller Threads ins Log schreiben (27. Okt 2026)
+faulthandler.enable(file=sys.stderr, all_threads=True)
 import asyncio
 import concurrent.futures
 
@@ -3038,7 +3042,17 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
         torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001
         pass
-    shutil.rmtree(tensor_dir, ignore_errors=True)
+    # Vorverarbeitete Dateien NICHT löschen: nach einem Absturz macht ein neuer Start dort weiter,
+    # wo er war (feste Datei-IDs je Audiodatei, skip_existing). Nur die zuletzt geschriebene Datei
+    # wird verworfen, weil sie beim Absturz halb geschrieben sein kann.
+    os.makedirs(tensor_dir, exist_ok=True)
+    try:
+        pts = sorted(glob.glob(os.path.join(tensor_dir, "*.pt")), key=os.path.getmtime)
+        if pts:
+            os.remove(pts[-1])
+            print(f"[HIELTECH-Info] LoRA {name}: {len(pts) - 1} vorverarbeitete Dateien vorhanden, mache dort weiter", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH-Info] LoRA {name}: Aufräumen fehlgeschlagen: {e}", file=sys.stderr, flush=True)
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
     _hieltech_lora_set_progress(name, phase="scan", started=t0)
@@ -3050,9 +3064,21 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
     if st >= 400 or err or n == 0:
         return {"ok": False, "error": "scan_failed", "message": f"Scan: HTTP {st} {err or ''}"}
     print(f"[HIELTECH-Info] LoRA {name}: {n} Dateien, {labeled} mit Beschreibung", file=sys.stderr, flush=True)
+    # feste IDs (statt Zufall) -> vorhandene .pt-Dateien werden beim Neustart wiedererkannt
+    try:
+        import hashlib
+        ids = set()
+        for smp in getattr(getattr(app.state, "dataset_builder", None), "samples", []) or []:
+            smp.id = hashlib.md5(os.path.basename(smp.audio_path).encode("utf-8")).hexdigest()[:8]
+            ids.add(smp.id)
+        for f in glob.glob(os.path.join(tensor_dir, "*.pt")):
+            if os.path.splitext(os.path.basename(f))[0] not in ids:
+                os.remove(f)  # Reste mit alten Zufalls-IDs
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH-Info] LoRA {name}: feste IDs fehlgeschlagen: {e}", file=sys.stderr, flush=True)
     _hieltech_lora_set_progress(name, phase="preprocess", samples=n, labeled=labeled)
 
-    st, body = _hieltech_lora_local("POST", "/v1/dataset/preprocess_async", {"output_dir": tensor_dir})
+    st, body = _hieltech_lora_local("POST", "/v1/dataset/preprocess_async", {"output_dir": tensor_dir, "skip_existing": True})
     data, err = _hieltech_lora_data(body)
     task = (data or {}).get("task_id")
     if st >= 400 or err or not task:
