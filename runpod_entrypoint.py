@@ -2991,6 +2991,15 @@ async def _hieltech_lora_list(dataset: str = ""):
     return out
 
 
+def _hieltech_lora_running_job():
+    """Job-ID eines laufenden LoRA-Trainings/-Tests auf diesem Worker (nur einer gleichzeitig erlaubt)."""
+    with _HIELTECH_JOBS_LOCK:
+        for jid, job in _HIELTECH_JOBS.items():
+            if job.get("label") in ("lora_train", "lora_test") and job.get("status") == "running":
+                return jid
+    return None
+
+
 def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
     t0 = time.time()
     try:
@@ -3004,6 +3013,10 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
     out_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name)
     if not os.path.isdir(audio_dir):
         return {"ok": False, "error": "no_dataset", "message": f"Datensatz fehlt: {audio_dir}"}
+    st, body = _hieltech_lora_local("GET", "/v1/training/status")
+    data, _ = _hieltech_lora_data(body)
+    if (data or {}).get("is_training"):
+        return {"ok": False, "error": "already_training", "message": "Auf diesem Worker läuft schon ein Training – erst mit 'stop' beenden."}
     shutil.rmtree(tensor_dir, ignore_errors=True)
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
@@ -3075,6 +3088,9 @@ async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(
         ep, lr, se = max(1, min(5000, int(epochs))), float(learning_rate), max(1, int(save_every))
     except ValueError:
         return Response(status_code=400, content=b"ungueltige Zahl")
+    laufend = _hieltech_lora_running_job()
+    if laufend:  # doppelte Start-Anfrage (z. B. Wiederholung nach 502 beim Kaltstart) -> denselben Auftrag zurückgeben
+        return {"ok": True, "job_id": laufend, "already_running": True}
     _HIELTECH_LORA_PROGRESS.pop(name, None)
     return _hieltech_job_start("lora_train", _hieltech_lora_train_sync, dataset, name, ep, lr, se)
 
@@ -3170,6 +3186,9 @@ async def _hieltech_lora_test_start(name: str = Form(...), items: str = Form(...
             sc = max(0.0, min(1.0, float(scale)))
         except ValueError:
             return Response(status_code=400, content=b"ungueltige Staerke")
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
     return _hieltech_job_start("lora_test", _hieltech_lora_test_sync, name, items, sc)
 
 
