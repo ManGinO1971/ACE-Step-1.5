@@ -3017,6 +3017,27 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
     data, _ = _hieltech_lora_data(body)
     if (data or {}).get("is_training"):
         return {"ok": False, "error": "already_training", "message": "Auf diesem Worker läuft schon ein Training – erst mit 'stop' beenden."}
+    # Sprachmodell (LM) für die ganze Trainingsdauer entladen: ACE-Step entlädt es sonst bei der
+    # Vorverarbeitung und lädt es danach wieder – genau dabei stürzte der Worker am 26. Okt ab
+    # (exit code 139, L4 mit 31 GB RAM). Ist es schon entladen, lädt ACE-Step es auch nicht neu.
+    try:
+        llm = getattr(app.state, "llm_handler", None)
+        if llm is not None and getattr(llm, "llm_initialized", False):
+            llm.unload()
+            app.state._llm_initialized = False
+            print("[HIELTECH-Info] LoRA: Sprachmodell für das Training entladen", file=sys.stderr, flush=True)
+        if llm is not None:
+            # verhindert das automatische Neuladen bei späteren Anfragen (Test-Songs) – bis zum nächsten Worker-Start
+            app.state._llm_init_error = "Sprachmodell wegen LoRA-Training entladen (Worker neu starten für normalen Betrieb)"
+    except Exception as e:  # noqa: BLE001
+        print(f"[HIELTECH-Info] LoRA: Sprachmodell entladen fehlgeschlagen: {e}", file=sys.stderr, flush=True)
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
     shutil.rmtree(tensor_dir, ignore_errors=True)
     shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
@@ -3110,7 +3131,7 @@ def _hieltech_lora_generate(prompt, lyrics, duration, seed):
     """Ein Song über die normale ACE-Step-Warteschlange dieses Workers; gibt den Dateipfad zurück."""
     import urllib.parse
     payload = {"prompt": prompt, "lyrics": lyrics or "[Instrumental]", "audio_duration": float(duration), "seed": int(seed),
-               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": True,
+               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": False,  # ohne Sprachmodell (bleibt nach dem Training entladen)
                "audio_format": "mp3", "mp3_bitrate": "320k", "task_type": "text2music"}
     st, body = _hieltech_lora_local("POST", "/release_task", payload)
     data, err = _hieltech_lora_data(body)
