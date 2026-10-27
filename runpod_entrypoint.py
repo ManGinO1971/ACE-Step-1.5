@@ -2995,6 +2995,9 @@ async def _hieltech_lora_list(dataset: str = ""):
     return out
 
 
+_HIELTECH_LORA_TRAINED_HERE = {"flag": False}  # nach einem Training ist das Modell im Speicher verändert -> Test erst nach Worker-Neustart
+
+
 def _hieltech_lora_running_job():
     """Job-ID eines laufenden LoRA-Trainings/-Tests auf diesem Worker (nur einer gleichzeitig erlaubt)."""
     with _HIELTECH_JOBS_LOCK:
@@ -3012,6 +3015,7 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
         set_safe_root(_HIELTECH_LORA_HOME)  # Volume liegt außerhalb von /app (sonst lehnt ACE-Step die Pfade ab); "/" ginge nicht (Prüfung auf root + "/")
     except Exception as e:  # noqa: BLE001
         print(f"[HIELTECH-Info] LoRA: set_safe_root fehlgeschlagen: {e}", file=sys.stderr, flush=True)
+    _HIELTECH_LORA_TRAINED_HERE["flag"] = True
     audio_dir = os.path.join(_HIELTECH_LORA_HOME, "data", dataset)
     tensor_dir = os.path.join(_HIELTECH_LORA_HOME, "tensors", name)
     out_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name)
@@ -3157,7 +3161,7 @@ def _hieltech_lora_generate(prompt, lyrics, duration, seed):
     """Ein Song über die normale ACE-Step-Warteschlange dieses Workers; gibt den Dateipfad zurück."""
     import urllib.parse
     payload = {"prompt": prompt, "lyrics": lyrics or "[Instrumental]", "audio_duration": float(duration), "seed": int(seed),
-               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": False,  # ohne Sprachmodell (bleibt nach dem Training entladen)
+               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": bool(getattr(app.state, "_llm_initialized", False)),  # wie in der App, wenn das Sprachmodell geladen ist
                "audio_format": "mp3", "mp3_bitrate": "320k", "task_type": "text2music"}
     st, body = _hieltech_lora_local("POST", "/release_task", payload)
     data, err = _hieltech_lora_data(body)
@@ -3189,6 +3193,9 @@ def _hieltech_lora_test_sync(name, items_json, scale):
         set_safe_root(_HIELTECH_LORA_HOME)
     except Exception:  # noqa: BLE001
         pass
+    if _HIELTECH_LORA_TRAINED_HERE["flag"]:
+        return {"ok": False, "error": "worker_neu_starten",
+                "message": "Auf diesem Worker wurde gerade trainiert – das Musikmodell ist im Speicher noch verändert. GPU aus- und wieder einschalten, dann testen."}
     final_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name, "final")
     w = os.path.join(final_dir, "lokr_weights.safetensors")
     adapter = w if os.path.isfile(w) else final_dir
@@ -3201,7 +3208,8 @@ def _hieltech_lora_test_sync(name, items_json, scale):
     if not items:
         return {"ok": False, "error": "no_items"}
     results = []
-    for mode in ("mit", "ohne"):
+    _hieltech_lora_local("POST", "/v1/lora/unload", {})
+    for mode in ("ohne", "mit"):
         if mode == "mit":
             st, body = _hieltech_lora_local("POST", "/v1/lora/load", {"lora_path": adapter})
             data, err = _hieltech_lora_data(body)
@@ -3209,8 +3217,6 @@ def _hieltech_lora_test_sync(name, items_json, scale):
                 return {"ok": False, "error": "lora_load_failed", "message": f"HTTP {st} {err or body}"}
             if scale is not None:
                 _hieltech_lora_local("POST", "/v1/lora/scale", {"scale": float(scale)})
-        else:
-            _hieltech_lora_local("POST", "/v1/lora/unload", {})
         for i, it in enumerate(items, 1):
             try:
                 path, dit = _hieltech_lora_generate(it.get("prompt", ""), it.get("lyrics", ""), it.get("duration", 45), it.get("seed", 42))
