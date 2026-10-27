@@ -3273,8 +3273,10 @@ def _hieltech_lora_test_sync(name, items_json, scales, checkpoint="final"):
             return {"ok": False, "error": "no_checkpoint", "message": f"Zwischenstand {checkpoint} nicht gefunden"}
         final_dir = treffer[0]
     w = os.path.join(final_dir, "lokr_weights.safetensors")
-    if os.path.isfile(os.path.join(final_dir, "adapter_config.json")):
-        adapter = final_dir  # normales PEFT-LoRA (Version 2): Ordner übergeben
+    if os.path.isfile(os.path.join(final_dir, "adapter", "adapter_config.json")):
+        adapter = os.path.join(final_dir, "adapter")  # PEFT-LoRA (Version 2): ACE-Step speichert in final/adapter/
+    elif os.path.isfile(os.path.join(final_dir, "adapter_config.json")):
+        adapter = final_dir
     else:
         adapter = w if os.path.isfile(w) else final_dir
     if not os.path.exists(adapter):
