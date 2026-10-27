@@ -3242,6 +3242,62 @@ async def _hieltech_lora_progress(name: str = ""):
     return {"ok": True, "progress": _HIELTECH_LORA_PROGRESS.get(name) or {}}
 
 
+def _hieltech_dir_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _hieltech_lora_platz_info():
+    home = _HIELTECH_LORA_HOME
+    info = {"ordner": {}}
+    for top in ("data", "tensors", "out"):
+        base = os.path.join(home, top)
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                info["ordner"][f"{top}/{name}"] = round(_hieltech_dir_bytes(os.path.join(base, name)) / 1e9, 2)
+    try:
+        du = shutil.disk_usage(home if os.path.isdir(home) else "/runpod-volume")
+        info["volume_gb"] = {"gesamt": round(du.total / 1e9, 1), "belegt": round(du.used / 1e9, 1), "frei": round(du.free / 1e9, 1)}
+    except Exception as e:  # noqa: BLE001
+        info["volume_gb"] = {"fehler": str(e)}
+    return info
+
+
+@app.get("/v1/hieltech_lora_platz")
+async def _hieltech_lora_platz():
+    return {"ok": True, **_hieltech_lora_platz_info()}
+
+
+@app.post("/v1/hieltech_lora_loeschen")
+async def _hieltech_lora_loeschen(pfade: str = Form(default=""), trainingsstaende: str = Form(default="0")):
+    """Löscht Ordner unter hieltech_lora (z. B. "tensors/gnawa_v1,out/gnawa_v1") und auf Wunsch die großen
+    training_state.pt-Dateien in allen Zwischenständen (die Adapter selbst bleiben)."""
+    if _hieltech_lora_running_job():
+        return {"ok": False, "error": "laeuft", "message": "Es läuft gerade ein Training/Test."}
+    geloescht = []
+    for rel in [x.strip().strip("/") for x in (pfade or "").split(",") if x.strip()]:
+        if ".." in rel or rel.count("/") != 1 or rel.split("/")[0] not in ("data", "tensors", "out"):
+            return {"ok": False, "error": "ungueltig", "message": f"Pfad nicht erlaubt: {rel}"}
+        ziel = os.path.join(_HIELTECH_LORA_HOME, rel)
+        if os.path.isdir(ziel):
+            shutil.rmtree(ziel, ignore_errors=True)
+            geloescht.append(rel)
+    if trainingsstaende.strip() == "1":
+        for f in glob.glob(os.path.join(_HIELTECH_LORA_HOME, "out", "*", "checkpoints", "*", "training_state.pt")):
+            try:
+                os.remove(f)
+                geloescht.append(os.path.relpath(f, _HIELTECH_LORA_HOME))
+            except OSError:
+                pass
+    return {"ok": True, "geloescht": geloescht, **_hieltech_lora_platz_info()}
+
+
 @app.post("/v1/hieltech_lora_stop")
 async def _hieltech_lora_stop():
     st, body = _hieltech_lora_local("POST", "/v1/training/stop", {})
