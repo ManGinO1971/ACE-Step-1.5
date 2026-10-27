@@ -3188,7 +3188,7 @@ def _hieltech_lora_generate(prompt, lyrics, duration, seed, steps=8, thinking=No
     raise RuntimeError("Erzeugung > 20 Min")
 
 
-def _hieltech_lora_test_sync(name, items_json, scale):
+def _hieltech_lora_test_sync(name, items_json, scales, checkpoint="final"):
     try:
         from acestep.training.path_safety import set_safe_root
         set_safe_root(_HIELTECH_LORA_HOME)
@@ -3198,6 +3198,12 @@ def _hieltech_lora_test_sync(name, items_json, scale):
         return {"ok": False, "error": "worker_neu_starten",
                 "message": "Auf diesem Worker wurde gerade trainiert – das Musikmodell ist im Speicher noch verändert. GPU aus- und wieder einschalten, dann testen."}
     final_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name, "final")
+    if checkpoint and checkpoint != "final":
+        treffer = sorted(glob.glob(os.path.join(_HIELTECH_LORA_HOME, "out", name, "checkpoints", checkpoint + "_*"))
+                         + glob.glob(os.path.join(_HIELTECH_LORA_HOME, "out", name, "checkpoints", checkpoint)))
+        if not treffer:
+            return {"ok": False, "error": "no_checkpoint", "message": f"Zwischenstand {checkpoint} nicht gefunden"}
+        final_dir = treffer[0]
     w = os.path.join(final_dir, "lokr_weights.safetensors")
     adapter = w if os.path.isfile(w) else final_dir
     if not os.path.exists(adapter):
@@ -3210,14 +3216,17 @@ def _hieltech_lora_test_sync(name, items_json, scale):
         return {"ok": False, "error": "no_items"}
     results = []
     _hieltech_lora_local("POST", "/v1/lora/unload", {})
-    for mode in ("ohne", "mit"):
-        if mode == "mit":
-            st, body = _hieltech_lora_local("POST", "/v1/lora/load", {"lora_path": adapter})
-            data, err = _hieltech_lora_data(body)
-            if st >= 400 or err:
-                return {"ok": False, "error": "lora_load_failed", "message": f"HTTP {st} {err or body}"}
-            if scale is not None:
-                _hieltech_lora_local("POST", "/v1/lora/scale", {"scale": float(scale)})
+    geladen = False
+    durchgaenge = [("ohne", None)] + [(("mit" if sc is None else f"mit{int(round(sc * 100))}"), sc) for sc in scales]
+    for mode, sc in durchgaenge:
+        if mode != "ohne":
+            if not geladen:
+                st, body = _hieltech_lora_local("POST", "/v1/lora/load", {"lora_path": adapter})
+                data, err = _hieltech_lora_data(body)
+                if st >= 400 or err:
+                    return {"ok": False, "error": "lora_load_failed", "message": f"HTTP {st} {err or body}"}
+                geladen = True
+            _hieltech_lora_local("POST", "/v1/lora/scale", {"scale": float(1.0 if sc is None else sc)})
         for i, it in enumerate(items, 1):
             try:
                 path, dit = _hieltech_lora_generate(it.get("prompt", ""), it.get("lyrics", ""), it.get("duration", 45), it.get("seed", 42),
@@ -3232,19 +3241,23 @@ def _hieltech_lora_test_sync(name, items_json, scale):
 
 
 @app.post("/v1/hieltech_lora_test_start")
-async def _hieltech_lora_test_start(name: str = Form(...), items: str = Form(...), scale: str = Form(default="")):
+async def _hieltech_lora_test_start(name: str = Form(...), items: str = Form(...), scale: str = Form(default=""),
+                                    checkpoint: str = Form(default="")):
     if not _HIELTECH_LORA_NAME_RE.match(name or ""):
         return Response(status_code=400, content=b"ungueltiger Name")
-    sc = None
-    if scale.strip():
-        try:
-            sc = max(0.0, min(1.0, float(scale)))
-        except ValueError:
-            return Response(status_code=400, content=b"ungueltige Staerke")
+    scales = []
+    for part in (scale or "").replace(";", ",").split(","):
+        if part.strip():
+            try:
+                scales.append(round(max(0.0, min(1.0, float(part))), 2))
+            except ValueError:
+                return Response(status_code=400, content=b"ungueltige Staerke")
+    if checkpoint and not re.match(r"^(final|epoch_\d{1,4})$", checkpoint):
+        return Response(status_code=400, content=b"ungueltiger Zwischenstand")
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
-    return _hieltech_job_start("lora_test", _hieltech_lora_test_sync, name, items, sc)
+    return _hieltech_job_start("lora_test", _hieltech_lora_test_sync, name, items, scales[:4] or [None], checkpoint or "final")
 
 
 def _hieltech_seedvc_setup_sync():
