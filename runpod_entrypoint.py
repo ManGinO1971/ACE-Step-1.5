@@ -3007,7 +3007,59 @@ def _hieltech_lora_running_job():
     return None
 
 
-def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
+def _hieltech_patch_lora_training():
+    """Ersetzt den Trainingsschritt des ACE-Step-LoRA-Trainers durch die korrigierte Fassung aus
+    acestep/training_v2 (Side-Step): kontinuierliche Zeitschritte (logit-normal, wie das Modell selbst
+    trainiert wurde) statt nur der 8 Turbo-Schritte, plus 15 % CFG-Dropout. Nur für diesen Prozess."""
+    from contextlib import nullcontext
+    import torch
+    import torch.nn.functional as F
+    from acestep.training import trainer as _T
+    from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
+    cls = _T.PreprocessedLoRAModule
+    if getattr(cls, "_hieltech_corrected", False):
+        return
+
+    def training_step(self, batch, record_loss=True):
+        if self.device_type in ("cuda", "xpu", "mps") and self.dtype != torch.float32:
+            ctx = torch.autocast(device_type=self.device_type, dtype=self.dtype)
+        else:
+            ctx = nullcontext()
+        nb = self.transfer_non_blocking
+        with ctx:
+            target_latents = batch["target_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            attention_mask = batch["attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            encoder_hidden_states = batch["encoder_hidden_states"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            encoder_attention_mask = batch["encoder_attention_mask"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            context_latents = batch["context_latents"].to(self.device, dtype=self.dtype, non_blocking=nb)
+            null_emb = getattr(self.model, "null_condition_emb", None)
+            if null_emb is not None:
+                encoder_hidden_states = apply_cfg_dropout(encoder_hidden_states, null_emb.to(self.device, dtype=self.dtype), cfg_ratio=0.15)
+            cfg = getattr(self.model, "config", None)
+            x1 = torch.randn_like(target_latents)
+            x0 = target_latents
+            t, _ = sample_timesteps(target_latents.shape[0], self.device, self.dtype,
+                                    timestep_mu=float(getattr(cfg, "timestep_mu", -0.4)),
+                                    timestep_sigma=float(getattr(cfg, "timestep_sigma", 1.0)), use_meanflow=False)
+            t_ = t.unsqueeze(-1).unsqueeze(-1)
+            xt = t_ * x1 + (1.0 - t_) * x0
+            if getattr(self, "force_input_grads_for_checkpointing", False):
+                xt = xt.requires_grad_(True)
+            out = self.model.decoder(hidden_states=xt, timestep=t, timestep_r=t, attention_mask=attention_mask,
+                                     encoder_hidden_states=encoder_hidden_states, encoder_attention_mask=encoder_attention_mask,
+                                     context_latents=context_latents)
+            loss = F.mse_loss(out[0], x1 - x0)
+        loss = loss.float()
+        if record_loss:
+            self.training_losses.append(loss.item())
+        return loss
+
+    cls.training_step = training_step
+    cls._hieltech_corrected = True
+    print("[HIELTECH-Info] LoRA: korrigierter Trainingsschritt aktiv (alle Zeitschritte + CFG-Dropout)", file=sys.stderr, flush=True)
+
+
+def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every, methode="lora"):
     t0 = time.time()
     try:
         from acestep.training.path_safety import set_safe_root
@@ -3100,10 +3152,23 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
             return {"ok": False, "error": "preprocess_timeout", "message": "Vorverarbeitung > 2 Std."}
 
     _hieltech_lora_set_progress(name, phase="train", epoch=0, epochs=epochs)
-    st, body = _hieltech_lora_local("POST", "/v1/training/start_lokr", {
-        "tensor_dir": tensor_dir, "output_dir": out_dir, "train_epochs": int(epochs), "learning_rate": float(learning_rate),
-        "save_every_n_epochs": int(save_every), "train_batch_size": 1, "gradient_accumulation": 4,
-    })
+    if methode == "lokr":
+        st, body = _hieltech_lora_local("POST", "/v1/training/start_lokr", {
+            "tensor_dir": tensor_dir, "output_dir": out_dir, "train_epochs": int(epochs), "learning_rate": float(learning_rate),
+            "save_every_n_epochs": int(save_every), "train_batch_size": 1, "gradient_accumulation": 4,
+        })
+    else:
+        # Version 2 (27. Okt 2026): normales PEFT-LoRA (offiziell ladbar) mit korrigiertem Trainingsschritt
+        # (alle Zeitschritte + CFG-Dropout wie im Original-Training des Modells, siehe _hieltech_patch_lora_training)
+        try:
+            _hieltech_patch_lora_training()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": "patch_failed", "message": f"Korrigierter Trainingsschritt nicht möglich: {e}"}
+        st, body = _hieltech_lora_local("POST", "/v1/training/start", {
+            "tensor_dir": tensor_dir, "lora_output_dir": out_dir, "train_epochs": int(epochs), "learning_rate": float(learning_rate),
+            "save_every_n_epochs": int(save_every), "train_batch_size": 1, "gradient_accumulation": 4,
+            "lora_rank": 64, "lora_alpha": 128, "lora_dropout": 0.1, "gradient_checkpointing": True,
+        })
     data, err = _hieltech_lora_data(body)
     if st >= 400 or err:
         return {"ok": False, "error": "train_start_failed", "message": f"Training Start: HTTP {st} {err or body}"}
@@ -3131,19 +3196,22 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every):
 
 
 @app.post("/v1/hieltech_lora_train_start")
-async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(...), epochs: str = Form(default="300"),
-                                     learning_rate: str = Form(default="0.03"), save_every: str = Form(default="50")):
+async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(...), epochs: str = Form(default="150"),
+                                     learning_rate: str = Form(default=""), save_every: str = Form(default="25"),
+                                     methode: str = Form(default="lora")):
     if not _HIELTECH_LORA_NAME_RE.match(dataset or "") or not _HIELTECH_LORA_NAME_RE.match(name or ""):
         return Response(status_code=400, content=b"ungueltiger Name")
     try:
-        ep, lr, se = max(1, min(5000, int(epochs))), float(learning_rate), max(1, int(save_every))
+        methode = "lokr" if (methode or "").strip().lower() == "lokr" else "lora"
+        lr_default = 0.03 if methode == "lokr" else 1e-4
+        ep, lr, se = max(1, min(5000, int(epochs))), (float(learning_rate) if learning_rate.strip() else lr_default), max(1, int(save_every))
     except ValueError:
         return Response(status_code=400, content=b"ungueltige Zahl")
     laufend = _hieltech_lora_running_job()
     if laufend:  # doppelte Start-Anfrage (z. B. Wiederholung nach 502 beim Kaltstart) -> denselben Auftrag zurückgeben
         return {"ok": True, "job_id": laufend, "already_running": True}
     _HIELTECH_LORA_PROGRESS.pop(name, None)
-    return _hieltech_job_start("lora_train", _hieltech_lora_train_sync, dataset, name, ep, lr, se)
+    return _hieltech_job_start("lora_train", _hieltech_lora_train_sync, dataset, name, ep, lr, se, methode)
 
 
 @app.get("/v1/hieltech_lora_progress")
@@ -3205,7 +3273,10 @@ def _hieltech_lora_test_sync(name, items_json, scales, checkpoint="final"):
             return {"ok": False, "error": "no_checkpoint", "message": f"Zwischenstand {checkpoint} nicht gefunden"}
         final_dir = treffer[0]
     w = os.path.join(final_dir, "lokr_weights.safetensors")
-    adapter = w if os.path.isfile(w) else final_dir
+    if os.path.isfile(os.path.join(final_dir, "adapter_config.json")):
+        adapter = final_dir  # normales PEFT-LoRA (Version 2): Ordner übergeben
+    else:
+        adapter = w if os.path.isfile(w) else final_dir
     if not os.path.exists(adapter):
         return {"ok": False, "error": "no_adapter", "message": f"Adapter fehlt: {adapter}"}
     try:
