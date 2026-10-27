@@ -3007,6 +3007,27 @@ def _hieltech_lora_running_job():
     return None
 
 
+_HIELTECH_LORA_ZIELE = {"mlp": True}  # Version 3: LoRA auch auf die MLP-Schichten (dort sitzt viel vom Klang/Timbre)
+
+
+def _hieltech_patch_lora_targets():
+    """Ergänzt die Standard-Ziele des ACE-Step-LoRA (nur Attention q/k/v/o) um die MLP-Schichten,
+    wenn _HIELTECH_LORA_ZIELE["mlp"] gesetzt ist. Wirkt nur auf neu erzeugte LoRAConfig-Objekte."""
+    from acestep.training import configs as _C
+    cls = _C.LoRAConfig
+    if not getattr(cls, "_hieltech_targets_patched", False):
+        orig_init = cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            if _HIELTECH_LORA_ZIELE.get("mlp") and "target_modules" not in kwargs:
+                self.target_modules = list(self.target_modules) + [m for m in ("gate_proj", "up_proj", "down_proj")
+                                                                   if m not in self.target_modules]
+        cls.__init__ = __init__
+        cls._hieltech_targets_patched = True
+    print(f"[HIELTECH-Info] LoRA-Ziele: Attention{' + MLP' if _HIELTECH_LORA_ZIELE.get('mlp') else ''}", file=sys.stderr, flush=True)
+
+
 def _hieltech_patch_lora_training():
     """Ersetzt den Trainingsschritt des ACE-Step-LoRA-Trainers durch die korrigierte Fassung aus
     acestep/training_v2 (Side-Step): kontinuierliche Zeitschritte (logit-normal, wie das Modell selbst
@@ -3162,6 +3183,7 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every, 
         # (alle Zeitschritte + CFG-Dropout wie im Original-Training des Modells, siehe _hieltech_patch_lora_training)
         try:
             _hieltech_patch_lora_training()
+            _hieltech_patch_lora_targets()
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": "patch_failed", "message": f"Korrigierter Trainingsschritt nicht möglich: {e}"}
         st, body = _hieltech_lora_local("POST", "/v1/training/start", {
@@ -3198,7 +3220,7 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every, 
 @app.post("/v1/hieltech_lora_train_start")
 async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(...), epochs: str = Form(default="150"),
                                      learning_rate: str = Form(default=""), save_every: str = Form(default="25"),
-                                     methode: str = Form(default="lora")):
+                                     methode: str = Form(default="lora"), ziele: str = Form(default="attn_mlp")):
     if not _HIELTECH_LORA_NAME_RE.match(dataset or "") or not _HIELTECH_LORA_NAME_RE.match(name or ""):
         return Response(status_code=400, content=b"ungueltiger Name")
     try:
@@ -3210,6 +3232,7 @@ async def _hieltech_lora_train_start(dataset: str = Form(...), name: str = Form(
     laufend = _hieltech_lora_running_job()
     if laufend:  # doppelte Start-Anfrage (z. B. Wiederholung nach 502 beim Kaltstart) -> denselben Auftrag zurückgeben
         return {"ok": True, "job_id": laufend, "already_running": True}
+    _HIELTECH_LORA_ZIELE["mlp"] = (ziele or "").strip().lower() != "attn"
     _HIELTECH_LORA_PROGRESS.pop(name, None)
     return _hieltech_job_start("lora_train", _hieltech_lora_train_sync, dataset, name, ep, lr, se, methode)
 
