@@ -3157,11 +3157,12 @@ async def _hieltech_lora_stop():
     return {"ok": st < 400, "http": st}
 
 
-def _hieltech_lora_generate(prompt, lyrics, duration, seed):
+def _hieltech_lora_generate(prompt, lyrics, duration, seed, steps=8, thinking=None):
     """Ein Song über die normale ACE-Step-Warteschlange dieses Workers; gibt den Dateipfad zurück."""
     import urllib.parse
     payload = {"prompt": prompt, "lyrics": lyrics or "[Instrumental]", "audio_duration": float(duration), "seed": int(seed),
-               "use_random_seed": False, "batch_size": 1, "inference_steps": 64, "guidance_scale": 7.0, "thinking": bool(getattr(app.state, "_llm_initialized", False)),  # wie in der App, wenn das Sprachmodell geladen ist
+               "use_random_seed": False, "batch_size": 1, "inference_steps": int(steps), "guidance_scale": 7.0,
+               "thinking": bool(getattr(app.state, "_llm_initialized", False)) if thinking is None else bool(thinking),
                "audio_format": "mp3", "mp3_bitrate": "320k", "task_type": "text2music"}
     st, body = _hieltech_lora_local("POST", "/release_task", payload)
     data, err = _hieltech_lora_data(body)
@@ -3202,7 +3203,7 @@ def _hieltech_lora_test_sync(name, items_json, scale):
     if not os.path.exists(adapter):
         return {"ok": False, "error": "no_adapter", "message": f"Adapter fehlt: {adapter}"}
     try:
-        items = [x for x in json.loads(items_json or "[]") if isinstance(x, dict)][:8]
+        items = [x for x in json.loads(items_json or "[]") if isinstance(x, dict)][:12]
     except ValueError:
         items = []
     if not items:
@@ -3219,7 +3220,8 @@ def _hieltech_lora_test_sync(name, items_json, scale):
                 _hieltech_lora_local("POST", "/v1/lora/scale", {"scale": float(scale)})
         for i, it in enumerate(items, 1):
             try:
-                path, dit = _hieltech_lora_generate(it.get("prompt", ""), it.get("lyrics", ""), it.get("duration", 45), it.get("seed", 42))
+                path, dit = _hieltech_lora_generate(it.get("prompt", ""), it.get("lyrics", ""), it.get("duration", 45), it.get("seed", 42),
+                                                    max(1, min(100, int(it.get("steps", 8)))), it.get("thinking"))
                 hp, token = _hieltech_handoff_store(path, "mp3")
                 results.append({"nr": i, "mode": mode, "label": str(it.get("label") or i)[:40], "result_token": token,
                                 "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
