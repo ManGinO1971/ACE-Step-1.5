@@ -3414,6 +3414,100 @@ async def _hieltech_lora_test_start(name: str = Form(...), items: str = Form(...
     return _hieltech_job_start("lora_test", _hieltech_lora_test_sync, name, items, scales[:4] or [None], checkpoint or "final")
 
 
+def _hieltech_release_and_wait(payload, timeout_s=1500):
+    """Schickt einen Auftrag an die ACE-Step-Warteschlange dieses Workers und gibt (Dateipfad, dit_model) zurück."""
+    import urllib.parse
+    st, body = _hieltech_lora_local("POST", "/release_task", payload)
+    data, err = _hieltech_lora_data(body)
+    tid = (data or {}).get("task_id")
+    if not tid:
+        raise RuntimeError(f"release_task: HTTP {st} {err or body}")
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        time.sleep(3)
+        st, body = _hieltech_lora_local("POST", "/query_result", {"task_id_list": [tid]})
+        items = (body or {}).get("data") or []
+        it = items[0] if items else {}
+        if it.get("status") == 1:
+            res = json.loads(it.get("result") or "[]")
+            first = res[0] if isinstance(res, list) and res else res
+            q = urllib.parse.urlparse(first.get("file") or "")
+            path = urllib.parse.parse_qs(q.query).get("path", [""])[0]
+            if not path or not os.path.isfile(path):
+                raise RuntimeError(f"Audiodatei nicht gefunden: {first.get('file')}")
+            return path, first.get("dit_model")
+        if it.get("status") == 2:
+            raise RuntimeError(f"Erzeugung fehlgeschlagen: {str(it.get('result') or '')[:300]}")
+    raise RuntimeError("Erzeugung dauert zu lange")
+
+
+_HIELTECH_TRACKS = {"woodwinds", "brass", "fx", "synth", "strings", "percussion", "keyboard", "guitar", "bass", "drums",
+                    "backing_vocals", "vocals"}
+
+
+def _hieltech_complete_sync(dataset, items_json):
+    """Test 28. Okt 2026: echte Aufnahme (aus data/<dataset>/) + ACE-Step-"complete"/"lego" mit dem base-Modell.
+    Liefert je Stück das Original und das Ergebnis."""
+    try:
+        items = [x for x in json.loads(items_json or "[]") if isinstance(x, dict)][:12]
+    except ValueError:
+        items = []
+    if not items:
+        return {"ok": False, "error": "no_items"}
+    _hieltech_lora_local("POST", "/v1/lora/unload", {})
+    results = []
+    for i, it in enumerate(items, 1):
+        label = str(it.get("label") or i)[:40]
+        datei = os.path.basename(str(it.get("src") or ""))
+        src = os.path.join(_HIELTECH_LORA_HOME, "data", dataset, datei)
+        if not datei or not os.path.isfile(src):
+            results.append({"nr": i, "mode": "fehler", "label": label, "error": f"Quelle fehlt: {datei}"})
+            continue
+        work = tempfile.mkdtemp(prefix="hieltech_complete_")
+        try:
+            tmp_src = os.path.join(work, datei)
+            shutil.copy(src, tmp_src)
+            if it.get("original", True):
+                hp, token = _hieltech_handoff_store(tmp_src, os.path.splitext(datei)[1].lstrip(".") or "flac")
+                results.append({"nr": i, "mode": "original", "label": label, "result_token": token,
+                                "size_bytes": os.path.getsize(hp), "audio_ext": os.path.splitext(datei)[1].lstrip("."), "dit_model": "-"})
+            task = "lego" if it.get("task") == "lego" else "complete"
+            payload = {"prompt": it.get("prompt", ""), "lyrics": it.get("lyrics") or "[Instrumental]",
+                       "task_type": task, "src_audio_path": tmp_src, "model": str(it.get("model") or "acestep-v15-base"),
+                       "seed": int(it.get("seed", 42)), "use_random_seed": False, "batch_size": 1,
+                       "inference_steps": int(it.get("steps", 50)), "guidance_scale": float(it.get("guidance", 7.0)),
+                       "thinking": bool(it.get("thinking", True)), "audio_format": "mp3", "mp3_bitrate": "320k"}
+            if task == "complete":
+                tc = [t for t in (it.get("tracks") or []) if t in _HIELTECH_TRACKS]
+                if tc:
+                    payload["track_classes"] = tc
+            else:
+                tn = str(it.get("track") or "")
+                if tn in _HIELTECH_TRACKS:
+                    payload["track_name"] = tn
+            if it.get("language"):
+                payload["vocal_language"] = str(it["language"])[:8]
+            path, dit = _hieltech_release_and_wait(payload)
+            hp, token = _hieltech_handoff_store(path, "mp3")
+            results.append({"nr": i, "mode": task, "label": label, "result_token": token,
+                            "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
+        except Exception as e:  # noqa: BLE001
+            results.append({"nr": i, "mode": "fehler", "label": label, "error": str(e)[:300]})
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    return {"ok": True, "results": results}
+
+
+@app.post("/v1/hieltech_complete_start")
+async def _hieltech_complete_start(dataset: str = Form(...), items: str = Form(...)):
+    if not _HIELTECH_LORA_NAME_RE.match(dataset or ""):
+        return Response(status_code=400, content=b"ungueltiger Datensatz")
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    return _hieltech_job_start("lora_test", _hieltech_complete_sync, dataset, items)
+
+
 def _hieltech_seedvc_setup_sync():
     py, d, ok, log = _hieltech_seedvc_ensure()
     return {"ok": ok, "seedvc_dir": d, "python": py, "log": (log or "")[-2500:]}
