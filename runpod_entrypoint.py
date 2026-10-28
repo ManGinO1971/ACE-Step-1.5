@@ -3454,7 +3454,7 @@ def _hieltech_complete_sync(dataset, items_json):
         items = []
     if not items:
         return {"ok": False, "error": "no_items"}
-    _hieltech_lora_local("POST", "/v1/lora/unload", {})
+    _hieltech_lora_local("POST", "/v1/lora/unload", {})  # complete/stapel
     results = []
     for i, it in enumerate(items, 1):
         label = str(it.get("label") or i)[:40]
@@ -3464,6 +3464,14 @@ def _hieltech_complete_sync(dataset, items_json):
             results.append({"nr": i, "mode": "fehler", "label": label, "error": f"Quelle fehlt: {datei}"})
             continue
         work = tempfile.mkdtemp(prefix="hieltech_complete_")
+        if it.get("schichten"):
+            try:
+                _hieltech_stapel_item(i, it, src, work, results)
+            except Exception as e:  # noqa: BLE001
+                results.append({"nr": i, "mode": "fehler", "label": label, "error": str(e)[:300]})
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            continue
         try:
             tmp_src = os.path.join(work, datei)
             shutil.copy(src, tmp_src)
@@ -3471,31 +3479,131 @@ def _hieltech_complete_sync(dataset, items_json):
                 hp, token = _hieltech_handoff_store(tmp_src, os.path.splitext(datei)[1].lstrip(".") or "flac")
                 results.append({"nr": i, "mode": "original", "label": label, "result_token": token,
                                 "size_bytes": os.path.getsize(hp), "audio_ext": os.path.splitext(datei)[1].lstrip("."), "dit_model": "-"})
-            task = "lego" if it.get("task") == "lego" else "complete"
-            payload = {"prompt": it.get("prompt", ""), "lyrics": it.get("lyrics") or "[Instrumental]",
-                       "task_type": task, "src_audio_path": tmp_src, "model": str(it.get("model") or "acestep-v15-base"),
-                       "seed": int(it.get("seed", 42)), "use_random_seed": False, "batch_size": 1,
-                       "inference_steps": int(it.get("steps", 50)), "guidance_scale": float(it.get("guidance", 7.0)),
-                       "thinking": bool(it.get("thinking", True)), "audio_format": "mp3", "mp3_bitrate": "320k"}
-            if task == "complete":
-                tc = [t for t in (it.get("tracks") or []) if t in _HIELTECH_TRACKS]
-                if tc:
-                    payload["track_classes"] = tc
-            else:
-                tn = str(it.get("track") or "")
-                if tn in _HIELTECH_TRACKS:
-                    payload["track_name"] = tn
-            if it.get("language"):
-                payload["vocal_language"] = str(it["language"])[:8]
-            path, dit = _hieltech_release_and_wait(payload)
-            hp, token = _hieltech_handoff_store(path, "mp3")
-            results.append({"nr": i, "mode": task, "label": label, "result_token": token,
-                            "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
+            # Schichtweise (28. Okt 2026): "schritte" = Liste; jeder Schritt nimmt das Ergebnis des vorigen als Quelle.
+            schritte = it.get("schritte") if isinstance(it.get("schritte"), list) and it.get("schritte") else [it]
+            cur = tmp_src
+            for k, sch in enumerate(schritte[:6], 1):
+                sch = {**it, **sch} if sch is not it else it
+                task = "lego" if sch.get("task") == "lego" else "complete"
+                payload = {"prompt": sch.get("prompt", ""), "lyrics": sch.get("lyrics") or "[Instrumental]",
+                           "task_type": task, "src_audio_path": cur, "model": str(sch.get("model") or "acestep-v15-base"),
+                           "seed": int(sch.get("seed", 42)), "use_random_seed": False, "batch_size": 1,
+                           "inference_steps": int(sch.get("steps", 50)), "guidance_scale": float(sch.get("guidance", 7.0)),
+                           "thinking": bool(sch.get("thinking", True)), "audio_format": "mp3", "mp3_bitrate": "320k"}
+                if task == "complete":
+                    tc = [t for t in (sch.get("tracks") or []) if t in _HIELTECH_TRACKS]
+                    if tc:
+                        payload["track_classes"] = tc
+                else:
+                    tn = str(sch.get("track") or "")
+                    if tn in _HIELTECH_TRACKS:
+                        payload["track_name"] = tn
+                if sch.get("language"):
+                    payload["vocal_language"] = str(sch["language"])[:8]
+                if sch.get("bpm"):
+                    payload["bpm"] = int(sch["bpm"])
+                for key in ("key_scale", "time_signature"):
+                    if sch.get(key):
+                        payload[key] = str(sch[key])[:20]
+                if sch.get("cover_strength") is not None:
+                    payload["audio_cover_strength"] = float(sch["cover_strength"])
+                if sch.get("cot_caption") is not None:
+                    payload["use_cot_caption"] = bool(sch["cot_caption"])
+                path, dit = _hieltech_release_and_wait(payload)
+                zusatz = sch.get("track") or "+".join(sch.get("tracks") or []) or task
+                nxt = os.path.join(work, f"schritt{k}.mp3")
+                if task == "lego" and sch.get("mischen", True):
+                    # Lego liefert (laut ACE-Step-Aufbau) nur die neue Spur -> Spur einzeln abliefern und mit der Quelle mischen.
+                    hp, token = _hieltech_handoff_store(path, "mp3")
+                    results.append({"nr": i, "mode": f"s{k}_{zusatz}_nurspur", "label": label, "result_token": token,
+                                    "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
+                    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", cur, "-i", path, "-filter_complex",
+                                        "[0:a][1:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[m]",
+                                        "-map", "[m]", "-c:a", "libmp3lame", "-b:a", "320k", nxt],
+                                       capture_output=True, text=True, timeout=300)
+                    if r.returncode != 0:
+                        raise RuntimeError(f"Mischen fehlgeschlagen: {r.stderr[-300:]}")
+                    path = nxt
+                else:
+                    shutil.copy(path, nxt)
+                cur = nxt
+                mode = task if len(schritte) == 1 else f"s{k}_{zusatz}"
+                hp, token = _hieltech_handoff_store(path, "mp3")
+                results.append({"nr": i, "mode": mode, "label": label, "result_token": token,
+                                "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": dit})
         except Exception as e:  # noqa: BLE001
             results.append({"nr": i, "mode": "fehler", "label": label, "error": str(e)[:300]})
         finally:
             shutil.rmtree(work, ignore_errors=True)
     return {"ok": True, "results": results}
+
+
+def _hieltech_wav48(src, dst):
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ar", "48000", "-ac", "2", "-c:a", "pcm_f32le", dst],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg: " + (r.stderr or "")[-200:])
+    import soundfile as sf
+    data, _sr = sf.read(dst, dtype="float32", always_2d=True)
+    return data
+
+
+def _hieltech_stapel_item(i, it, src, work, results):
+    """Echte Aufnahme bleibt UNVERÄNDERT; die KI baut Spur für Spur ("lego") dazu.
+    Liefert Original, jede neue Spur einzeln (FLAC, zum Mischen in LUNA/Logic) und eine Rohmischung (MP3)."""
+    import numpy as np
+    import soundfile as sf
+    label = str(it.get("label") or i)[:40]
+    orig = _hieltech_wav48(src, os.path.join(work, "orig.wav"))
+    n = orig.shape[0]
+    hp, token = _hieltech_handoff_store(src, os.path.splitext(src)[1].lstrip(".") or "flac")
+    results.append({"nr": i, "mode": "0_original", "label": label, "result_token": token, "size_bytes": os.path.getsize(hp),
+                    "audio_ext": os.path.splitext(src)[1].lstrip("."), "dit_model": "-"})
+    mix = orig.copy()
+    stems = []
+    for k, sch in enumerate((it.get("schichten") or [])[:5], 1):
+        track = str(sch.get("track") or "")
+        if track not in _HIELTECH_TRACKS:
+            results.append({"nr": i, "mode": f"{k}_fehler", "label": label, "error": f"unbekannte Spur {track}"})
+            continue
+        ctx = os.path.join(work, f"ctx{k}.wav")
+        peak = float(np.abs(mix).max()) or 1.0
+        sf.write(ctx, mix / max(peak, 1.0), 48000, subtype="PCM_24")
+        payload = {"prompt": sch.get("prompt", ""), "global_caption": it.get("global", ""), "lyrics": "[Instrumental]",
+                   "task_type": "lego", "track_name": track, "src_audio_path": ctx,
+                   "model": str(it.get("model") or "acestep-v15-base"), "seed": int(it.get("seed", 42)) + k,
+                   "use_random_seed": False, "batch_size": 1, "inference_steps": int(it.get("steps", 50)),
+                   "guidance_scale": float(it.get("guidance", 7.0)), "thinking": bool(it.get("thinking", False)),
+                   "audio_format": "flac"}
+        if it.get("bpm"):
+            payload["bpm"] = int(it["bpm"])
+        if it.get("key"):
+            payload["key_scale"] = str(it["key"])[:20]
+        try:
+            path, dit = _hieltech_release_and_wait(payload)
+            st = _hieltech_wav48(path, os.path.join(work, f"stem{k}.wav"))
+            st = st[:n] if st.shape[0] >= n else np.pad(st, ((0, n - st.shape[0]), (0, 0)))
+            # Anteil der Aufnahme im Ergebnis (hoch = Modell hat den Kontext mitgeliefert statt nur die neue Spur)
+            a, b = mix[:, 0], st[:, 0]
+            korr = float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) or 1.0))
+            stem_path = os.path.join(work, f"{k}_{track}.flac")
+            sf.write(stem_path, st, 48000, subtype="PCM_24")
+            hp, token = _hieltech_handoff_store(stem_path, "flac")
+            results.append({"nr": i, "mode": f"{k}_{track}", "label": label, "result_token": token,
+                            "size_bytes": os.path.getsize(hp), "audio_ext": "flac", "dit_model": f"{dit} · Korrelation {korr:.2f}"})
+            stems.append(st)
+            mix = mix + st * float(sch.get("pegel", 0.8))
+        except Exception as e:  # noqa: BLE001
+            results.append({"nr": i, "mode": f"{k}_{track}", "label": label, "error": str(e)[:300]})
+    if stems:
+        mix = mix / max(float(np.abs(mix).max()) / 0.95, 1.0)
+        mw = os.path.join(work, "mix.wav")
+        sf.write(mw, mix, 48000, subtype="PCM_24")
+        mp = os.path.join(work, "mix.mp3")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", mw, "-b:a", "320k", mp], timeout=300, check=True)
+        hp, token = _hieltech_handoff_store(mp, "mp3")
+        results.append({"nr": i, "mode": "9_mischung", "label": label, "result_token": token,
+                        "size_bytes": os.path.getsize(hp), "audio_ext": "mp3", "dit_model": "-"})
 
 
 @app.post("/v1/hieltech_complete_start")
