@@ -1,0 +1,36 @@
+# HIELTECH – eigener RunPod-Worker für YuE2-3B + MLTNT-Reggae-Stile (28. Okt 2026).
+# Getrennt vom ACE-Step-Image (Dockerfile.runpod). In RunPod als EIGENER Serverless-Endpoint
+# (Typ Load Balancer) aus diesem Repo bauen: Dockerfile-Pfad "Dockerfile.yue2", Build-Kontext "/".
+# Modelle liegen auf dem Netzwerk-Volume unter /runpod-volume/yue2 (werden beim ersten Start geladen).
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUNBUFFERED=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_TELEMETRY=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev git curl ffmpeg libsndfile1 build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+
+# ComfyUI mit nativer YuE2-Unterstützung (fest auf v0.43.0)
+RUN git clone --depth 1 --branch v0.43.0 https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+    && pip install --no-cache-dir -r /opt/ComfyUI/requirements.txt
+
+# FS_Audio Suite (YuE2-Knoten), fest auf den geprüften Stand vom 16. Sept 2026
+RUN git clone https://github.com/KytraScript/ComfyUI-FS_Audio_Suite.git /opt/ComfyUI/custom_nodes/ComfyUI-FS_Audio_Suite \
+    && cd /opt/ComfyUI/custom_nodes/ComfyUI-FS_Audio_Suite \
+    && git checkout 26fe2e91d20ebf3531cf053c0c654fd3b849e5de \
+    && pip install --no-cache-dir -r requirements.txt
+
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" huggingface_hub hf_transfer
+
+COPY yue2_worker/server.py /opt/yue2/server.py
+
+EXPOSE 5000
+CMD ["python", "/opt/yue2/server.py"]
