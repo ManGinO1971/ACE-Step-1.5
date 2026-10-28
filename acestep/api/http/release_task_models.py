@@ -161,6 +161,10 @@ class GenerateMusicRequest(BaseModel):
     allow_lm_batch: bool = True
     track_name: Optional[str] = None
     track_classes: Optional[List[str]] = None
+    # HIELTECH (28. Okt 2026): eigener Stil-Adapter (LoRA) nur für diesen Auftrag, z. B. "gnawa_v3".
+    # Leer = ohne Adapter. Wird in runpod_entrypoint.py direkt vor der Erzeugung geladen/abgeschaltet.
+    hieltech_lora: str = ""
+    hieltech_lora_scale: float = 1.0
 
     lm_temperature: float = 0.85
     lm_cfg_scale: float = 2.5

@@ -3089,6 +3089,10 @@ def _hieltech_lora_train_sync(dataset, name, epochs, learning_rate, save_every, 
     except Exception as e:  # noqa: BLE001
         print(f"[HIELTECH-Info] LoRA: set_safe_root fehlgeschlagen: {e}", file=sys.stderr, flush=True)
     _HIELTECH_LORA_TRAINED_HERE["flag"] = True
+    try:
+        app.state.handler._hieltech_lora_name = None
+    except Exception:  # noqa: BLE001
+        pass
     audio_dir = os.path.join(_HIELTECH_LORA_HOME, "data", dataset)
     tensor_dir = os.path.join(_HIELTECH_LORA_HOME, "tensors", name)
     out_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name)
@@ -3337,7 +3341,18 @@ def _hieltech_lora_generate(prompt, lyrics, duration, seed, steps=8, thinking=No
     raise RuntimeError("Erzeugung > 20 Min")
 
 
+_HIELTECH_LORA_MANUELL = {"an": False}  # Terminal-Test steuert den Adapter selbst
+
+
 def _hieltech_lora_test_sync(name, items_json, scales, checkpoint="final"):
+    _HIELTECH_LORA_MANUELL["an"] = True
+    try:
+        return _hieltech_lora_test_sync_inner(name, items_json, scales, checkpoint)
+    finally:
+        _HIELTECH_LORA_MANUELL["an"] = False
+
+
+def _hieltech_lora_test_sync_inner(name, items_json, scales, checkpoint="final"):
     try:
         from acestep.training.path_safety import set_safe_root
         set_safe_root(_HIELTECH_LORA_HOME)
@@ -3346,6 +3361,10 @@ def _hieltech_lora_test_sync(name, items_json, scales, checkpoint="final"):
     if _HIELTECH_LORA_TRAINED_HERE["flag"]:
         return {"ok": False, "error": "worker_neu_starten",
                 "message": "Auf diesem Worker wurde gerade trainiert – das Musikmodell ist im Speicher noch verändert. GPU aus- und wieder einschalten, dann testen."}
+    try:
+        app.state.handler._hieltech_lora_name = None
+    except Exception:  # noqa: BLE001
+        pass
     final_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name, "final")
     if checkpoint and checkpoint != "final":
         treffer = sorted(glob.glob(os.path.join(_HIELTECH_LORA_HOME, "out", name, "checkpoints", checkpoint + "_*"))
@@ -3639,6 +3658,87 @@ async def _hieltech_backing_chor_start(
     abholen über /v1/hieltech_fetch_chunk (selber Worker)."""
     src_bytes = await audio.read()
     return _hieltech_job_start("backing_chor", _hieltech_backing_chor_sync, src_bytes, audio.filename, key_scale, voices, humanize)
+
+
+# ---------------------------------------------------------------------------
+# HIELTECH (28. Okt 2026): Stil-Adapter (LoRA) pro Auftrag in der App.
+# /release_task bekommt optional "hieltech_lora" (z. B. "gnawa_v3") und "hieltech_lora_scale".
+# Direkt vor der Erzeugung (im selben Arbeits-Thread, Aufträge laufen nacheinander) wird der Adapter
+# geladen + eingeschaltet – oder bei Aufträgen ohne Adapter abgeschaltet, damit nichts in andere
+# Songs durchsickert. Nur für das Hauptmodell (turbo), auf dem der Adapter trainiert wurde.
+# ---------------------------------------------------------------------------
+def _hieltech_lora_adapter_path(name):
+    final_dir = os.path.join(_HIELTECH_LORA_HOME, "out", name, "final")
+    if os.path.isfile(os.path.join(final_dir, "adapter", "adapter_config.json")):
+        return os.path.join(final_dir, "adapter")
+    if os.path.isfile(os.path.join(final_dir, "adapter_config.json")):
+        return final_dir
+    return None
+
+
+def _hieltech_lora_apply(app_state, handler, want, scale):
+    if handler is None or handler is not getattr(app_state, "handler", None):
+        return  # anderes Modell (z. B. base) – Adapter passt nicht
+    cur = getattr(handler, "_hieltech_lora_name", None)
+    if not want and _HIELTECH_LORA_MANUELL["an"]:
+        return  # LoRA-Terminal-Test läuft – nichts anfassen
+    if not want:
+        if getattr(handler, "lora_loaded", False) and getattr(handler, "use_lora", False):
+            handler.set_use_lora(False)
+            print(f"[HIELTECH-Info] Stil-Adapter aus (vorher {cur or '?'})", file=sys.stderr, flush=True)
+        return
+    if not _HIELTECH_LORA_NAME_RE.match(want):
+        raise ValueError(f"ungültiger Adaptername {want!r}")
+    if not getattr(handler, "lora_loaded", False) or cur != want:
+        path = _hieltech_lora_adapter_path(want)
+        if not path:
+            raise FileNotFoundError(f"Adapter {want} nicht auf dem Volume")
+        if getattr(handler, "lora_loaded", False):
+            handler.unload_lora()
+        handler._hieltech_lora_name = None
+        msg = handler.load_lora(path)
+        if not str(msg).startswith("\u2705"):
+            raise RuntimeError(str(msg)[:300])
+        handler._hieltech_lora_name = want
+        print(f"[HIELTECH-Info] Stil-Adapter {want} geladen ({path})", file=sys.stderr, flush=True)
+    handler.set_use_lora(True)
+    handler.set_lora_scale(max(0.0, min(1.0, float(scale))))
+
+
+def _hieltech_patch_lora_per_request():
+    import acestep.api_server as _api
+    orig = _api.run_blocking_generate
+    if getattr(orig, "_hieltech_lora_wrapped", False):
+        return
+
+    def wrapped(*args, **kwargs):
+        req = kwargs.get("req")
+        want = str(getattr(req, "hieltech_lora", "") or "").strip()
+        try:
+            scale = float(getattr(req, "hieltech_lora_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        try:
+            _hieltech_lora_apply(kwargs.get("app_state"), kwargs.get("selected_handler"), want, scale)
+        except Exception as e:  # noqa: BLE001
+            # Lieber ein Song ohne Adapter als gar keiner – Adapter sicher abschalten und weiter.
+            print(f"[HIELTECH-Info] Stil-Adapter {want or '-'} nicht nutzbar: {e} – erzeuge ohne", file=sys.stderr, flush=True)
+            try:
+                h = kwargs.get("selected_handler")
+                if h is not None and getattr(h, "lora_loaded", False):
+                    h.set_use_lora(False)
+            except Exception:  # noqa: BLE001
+                pass
+        return orig(*args, **kwargs)
+
+    wrapped._hieltech_lora_wrapped = True
+    _api.run_blocking_generate = wrapped
+
+
+try:
+    _hieltech_patch_lora_per_request()
+except Exception as _e:  # noqa: BLE001
+    print(f"[HIELTECH-Info] Stil-Adapter-Patch fehlgeschlagen: {_e}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

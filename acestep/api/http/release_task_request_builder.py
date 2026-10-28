@@ -106,6 +106,8 @@ def build_generate_music_request(
         allow_lm_batch=parser.bool("allow_lm_batch", True),
         track_name=parser.str("track_name"),
         track_classes=track_classes,
+        hieltech_lora=parser.str("hieltech_lora", ""),
+        hieltech_lora_scale=parser.float("hieltech_lora_scale", 1.0),
     )
     payload.update(overrides)
     return request_model_cls(**payload)
