@@ -3907,6 +3907,11 @@ def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds,
                 bericht.setdefault("instrumente", {}).setdefault("bass", {})["vocoder_c_fehler"] = "RMVPE: " + log1[-200:]
         dateien = [(os.path.join(sep_dir, i + ".wav"), f"{i}_0_getrennt") for i in insts]
         dateien += [(os.path.join(out, fn), fn[:-4]) for fn in sorted(os.listdir(out)) if fn.endswith(".wav")]
+        # Unterordner (z. B. drums_teile/) mitliefern, Zwischendateien nicht
+        for sub in sorted(os.listdir(out)):
+            sp = os.path.join(out, sub)
+            if os.path.isdir(sp) and not sub.startswith("_"):
+                dateien += [(os.path.join(sp, fn), f"{sub}/{fn[:-4]}") for fn in sorted(os.listdir(sp)) if fn.endswith(".wav")]
         for p, name in dateien:
             if not os.path.isfile(p):
                 continue

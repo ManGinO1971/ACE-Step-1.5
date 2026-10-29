@@ -15,8 +15,9 @@ LIZENZ-HINWEIS: DrumSep-Gewichte haben keine dokumentierte Lizenz (Code MIT) –
 wie bei den Vocoder-C-Gewichten.
 
 Aufruf: python stems_drums_step.py <getrennt_ordner> <kandidaten.json> <ausgabeordner>
-Ausgabe je Teil: drums_<teil>_0_original.wav, drums_<teil>_A_roh.wav, drums_<teil>_B_behandelt.wav,
-         dazu drums_gesamt_B.wav (alle behandelten Teile zusammen). Letzte stdout-Zeile: JSON-Bericht.
+Ausgabe: drums_1_ohne_master.wav, drums_2_master_sanft.wav, drums_3_master_kraeftig.wav (Schlagzeug komplett)
+         + drums_teile/<kick|snare|toms|hihat|becken>.wav (dieselben Teile, gleich behandelt, ohne Bus-Master).
+  4. Je Teil eigene Kompression, dann Schlagzeug-Bus-Master: Parallel-Kompression + Bus-Kompressor + Limiter. Letzte stdout-Zeile: JSON-Bericht.
 """
 import json
 import logging
@@ -43,6 +44,27 @@ k.EINST.update({
     "becken": (-62.0, -72.0, 2.00, 0.30),
 })
 _SEP = {}
+
+
+SCHAERFE = float(os.environ.get("HIELTECH_DRUMSEP_SCHAERFE", "3.0"))
+
+
+def nachsortieren(roh):
+    """Test 6: in der Snare hingen Hi-Hat und teils Toms. Jede Zeit-Frequenz-Zelle wird dem Teil
+    zugeordnet, das dort am stärksten ist (weiche Maske mit Schärfe 3) – Summe bleibt gleich,
+    nur falsch einsortierte Reste wandern ins richtige Teil."""
+    import librosa
+    keys = list(roh)
+    n = roh[keys[0]].shape[0]
+    out = {key: np.zeros_like(roh[key]) for key in keys}
+    for ch in range(2):
+        S = np.stack([librosa.stft(roh[key][:, ch], n_fft=2048, hop_length=512) for key in keys])
+        mix = S.sum(0)
+        w = np.abs(S) ** SCHAERFE
+        m = w / (w.sum(0, keepdims=True) + 1e-12)
+        for i, key in enumerate(keys):
+            out[key][:, ch] = librosa.istft(m[i] * mix, hop_length=512, length=n)
+    return out
 
 
 def zerlegen(path, work):
@@ -82,9 +104,44 @@ def zerlegen(path, work):
     if fehlt:
         raise RuntimeError(f"DrumSep: Teile fehlen {fehlt} in {[os.path.basename(f) for f in files]}{hinweis}")
     n = max(a.shape[0] for a in roh.values())
-    roh = {key: fit(a, n) for key, a in roh.items()}
+    roh = nachsortieren({key: fit(a, n) for key, a in roh.items()})
     becken = roh.get("ride", np.zeros((n, 2), np.float32)) + roh.get("crash", np.zeros((n, 2), np.float32))
     return {"kick": roh["kick"], "snare": roh["snare"], "toms": roh["toms"], "hihat": roh["hh"], "becken": becken}
+
+
+# Je Teil eigene Kompression (wie im Studio: jedes Teil auf eigenem Kanal) – Tiefen-Filter gegen Rumpeln,
+# Attack so lang, dass der Anschlag durchkommt.
+TEIL_KETTE = {
+    "kick": "highpass=f=30,acompressor=threshold=-20dB:ratio=4:attack=20:release=120:makeup=2",
+    "snare": "highpass=f=80,acompressor=threshold=-20dB:ratio=4:attack=8:release=100:makeup=2",
+    "toms": "highpass=f=50,acompressor=threshold=-20dB:ratio=3:attack=15:release=150:makeup=1.5",
+    "hihat": "highpass=f=300,acompressor=threshold=-22dB:ratio=2:attack=5:release=80:makeup=1.2",
+    "becken": "highpass=f=250,acompressor=threshold=-24dB:ratio=1.5:attack=10:release=200",
+}
+# Schlagzeug-Bus-Master: Parallel-Kompression (New York) + Bus-Kompressor ("Kleber") + Limiter (-1 dB).
+MASTER = {
+    "sanft": ("0.25", "threshold=-18dB:ratio=2:attack=30:release=150:makeup=1.5", "2dB"),
+    "kraeftig": ("0.45", "threshold=-20dB:ratio=3:attack=20:release=120:makeup=2", "4dB"),
+}
+
+
+def ffmpeg_kette(src, dst, kette=None, komplex=None):
+    import subprocess
+    args = ["ffmpeg", "-y", "-loglevel", "error", "-i", src]
+    args += ["-filter_complex", komplex, "-map", "[m]"] if komplex else ["-af", kette]
+    r = subprocess.run(args + ["-c:a", "pcm_f32le", dst], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg: " + (r.stderr or "")[-200:])
+    a, _ = sf.read(dst, dtype="float32", always_2d=True)
+    return a
+
+
+def master(src, dst, art):
+    nyc, bus, gain = MASTER[art]
+    komplex = (f"[0:a]highpass=f=25,asplit=2[d][w];[w]acompressor=threshold=-30dB:ratio=8:attack=1:release=60:makeup=4[c];"
+               f"[d][c]amix=inputs=2:weights='1 {nyc}':normalize=0,acompressor={bus},volume={gain},"
+               f"alimiter=limit=0.89:attack=5:release=50:level=0[m]")
+    return ffmpeg_kette(src, dst, komplex=komplex)
 
 
 def main():
@@ -108,11 +165,11 @@ def main():
         if not neu:
             raise RuntimeError("keine neue Schlagzeug-Fassung zerlegbar: " + info.get("zerlegen_fehler", ""))
         gesamt = np.zeros((n, 2), np.float32)
+        teile = {}
         for teil in TEILE:
             ti = {"kandidaten": []}
             try:
                 o = fit(orig[teil], n)
-                sf.write(os.path.join(out, f"drums_{teil}_0_original.wav"), k.schutz(o), SR, subtype="PCM_24")
                 if float(np.abs(o).max()) < 1e-3:
                     ti["hinweis"] = "im Original praktisch nicht vorhanden"
                 best, best_s = None, -9.0
@@ -122,7 +179,6 @@ def main():
                     ti["kandidaten"].append({"datei": name, "punkte": sc[0]})
                     if sc[0] > best_s:
                         best, best_s, ti["gewaehlt"] = c, sc[0], name
-                sf.write(os.path.join(out, f"drums_{teil}_A_roh.wav"), k.schutz(best), SR, subtype="PCM_24")
                 mg, anteil, _nr = k.maske_gate(o, best, teil)
                 ti["klingt_anteil"] = round(anteil, 3)
                 try:
@@ -130,13 +186,34 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     ti["vocoder_fehler"] = str(e)[:200]
                     b = mg
-                gesamt += b.astype(np.float32)
-                sf.write(os.path.join(out, f"drums_{teil}_B_behandelt.wav"), k.schutz(b), SR, subtype="PCM_24")
+                bp = os.path.join(work, f"teil_{teil}.wav")
+                sf.write(bp, b.astype(np.float32), SR, subtype="FLOAT")
+                try:
+                    b = fit(ffmpeg_kette(bp, os.path.join(work, f"teil_{teil}_k.wav"), TEIL_KETTE[teil]), n)
+                except Exception as e:  # noqa: BLE001
+                    ti["kompressor_fehler"] = str(e)[:200]
+                teile[teil] = b.astype(np.float32)
+                gesamt += teile[teil]
             except Exception as e:  # noqa: BLE001
                 ti["fehler"] = str(e)[:300]
             info["teile"][teil] = ti
             print(f"[Stems-Test6] {teil}: {json.dumps(ti, ensure_ascii=False)}", file=sys.stderr, flush=True)
-        sf.write(os.path.join(out, "drums_gesamt_B.wav"), k.schutz(gesamt), SR, subtype="PCM_24")
+        # Ordner: Schlagzeug komplett + Unterordner mit allen Teilen (gleich behandelt, gleiche Balance)
+        ordner = os.path.join(out, "drums_teile")
+        os.makedirs(ordner, exist_ok=True)
+        spitze = max([float(np.abs(gesamt).max())] + [float(np.abs(a).max()) for a in teile.values()] + [1e-9])
+        fak = min(1.0, 0.98 / spitze)
+        for teil, a in teile.items():
+            sf.write(os.path.join(ordner, f"{teil}.wav"), a * fak, SR, subtype="PCM_24")
+        sf.write(os.path.join(out, "drums_1_ohne_master.wav"), gesamt * fak, SR, subtype="PCM_24")
+        gp = os.path.join(work, "gesamt.wav")
+        sf.write(gp, gesamt, SR, subtype="FLOAT")
+        for i, art in enumerate(("sanft", "kraeftig"), start=2):
+            try:
+                m = fit(master(gp, os.path.join(work, f"master_{art}.wav"), art), n)
+                sf.write(os.path.join(out, f"drums_{i}_master_{art}.wav"), m, SR, subtype="PCM_24")
+            except Exception as e:  # noqa: BLE001
+                info[f"master_{art}_fehler"] = str(e)[:200]
     except Exception as e:  # noqa: BLE001
         info["fehler"] = str(e)[:300]
     bericht["instrumente"]["drums"] = info
