@@ -83,8 +83,11 @@ def _download_models():
                     p = hf_hub_download(LORA_REPO, f, local_dir=os.path.join(VOLUME, "hf_mltnt"), token=token)
                     dst = os.path.join(MODELS, "loras", os.path.basename(f))
                     if not os.path.exists(dst):
-                        shutil.copyfile(p, dst + ".part")
-                        os.replace(dst + ".part", dst)
+                        try:
+                            os.symlink(p, dst)  # spart Platz (keine zweite Kopie)
+                        except OSError:
+                            shutil.copyfile(p, dst + ".part")
+                            os.replace(dst + ".part", dst)
                 still = [f for f in wanted if not os.path.isfile(os.path.join(MODELS, "loras", f))]
                 if still:
                     log(f"Nicht im Repo gefunden: {still}")
@@ -108,7 +111,7 @@ def _start_comfy():
     STATE["phase"] = "starte ComfyUI"
     cmd = [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", "8188",
            "--extra-model-paths-config", yaml_path, "--output-directory", OUT_DIR,
-           "--disable-auto-launch", "--dont-print-server"]
+           "--disable-auto-launch", "--dont-print-server"] + os.environ.get("COMFY_EXTRA_ARGS", "").split()
     STATE["comfy"] = subprocess.Popen(cmd, cwd=COMFY_DIR, stdout=sys.stderr, stderr=sys.stderr)
     t0 = time.time()
     while time.time() - t0 < 900:
@@ -209,14 +212,18 @@ def _generate(job_id, body):
             a = audio[0]
             flac = os.path.join(OUT_DIR, a.get("subfolder", ""), a["filename"])
             mp3 = flac[:-5] + ".mp3"
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", flac, "-b:a", "320k", mp3], check=True, timeout=300)
+            ext = "mp3"
+            if shutil.which("ffmpeg"):
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", flac, "-b:a", "320k", mp3], check=True, timeout=300)
+            else:  # z. B. Mac ohne ffmpeg: FLAC direkt liefern
+                shutil.copyfile(flac, mp3 + ".flac"); mp3 = mp3 + ".flac"; ext = "flac"
             info = {}
             try:
                 with open(flac[:-5] + ".json") as f:
                     info = json.load(f)
             except (OSError, ValueError):
                 pass
-            hp, token = _store_handoff(mp3, "mp3")
+            hp, token = _store_handoff(mp3, ext)
             for p in (flac, mp3, flac[:-5] + ".json", flac[:-5] + ".abc"):
                 try:
                     os.remove(p)
@@ -224,7 +231,7 @@ def _generate(job_id, body):
                     pass
             secs = round(time.time() - t0)
             log(f"{variant}: fertig in {secs}s, Song {info.get('seconds', '?')}s")
-            return {"ok": True, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": "mp3",
+            return {"ok": True, "result_token": token, "size_bytes": os.path.getsize(hp), "audio_ext": ext,
                     "variant": variant, "seed": seed, "song_seconds": info.get("seconds"), "gpu_seconds": secs}
         return {"ok": False, "error": "timeout", "message": "Erzeugung dauerte über 25 Minuten"}
 
@@ -262,6 +269,12 @@ async def mltnt_start(request: Request):
             res = _generate(job_id, body)
         except Exception as e:  # noqa: BLE001
             res = {"ok": False, "error": "job_exception", "message": f"{type(e).__name__}: {e}"}
+        if os.environ.get("HIELTECH_FREE_AFTER") == "1":  # Mac: Arbeitsspeicher nach jedem Song wieder freigeben
+            try:
+                _http("POST", "/free", {"unload_models": True, "free_memory": True}, timeout=30)
+                log("Arbeitsspeicher freigegeben")
+            except Exception as e:  # noqa: BLE001
+                log(f"Freigeben fehlgeschlagen: {e}")
         with JOBS_LOCK:
             JOBS[job_id].update(status="done", result=res, finished=time.time())
 

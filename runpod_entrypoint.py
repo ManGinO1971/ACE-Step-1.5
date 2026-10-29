@@ -3741,6 +3741,91 @@ except Exception as _e:  # noqa: BLE001
     print(f"[HIELTECH-Info] Stil-Adapter-Patch fehlgeschlagen: {_e}", file=sys.stderr, flush=True)
 
 
+# ---------------------------------------------------------------------------
+# HIELTECH Stems – Test (29. Okt 2026, nur Terminal): Song auf der GPU trennen und
+# ausgewählte Spuren mit dem Base-Modell ("extract") NEU erzeugen.
+# Quelle für das Neu-Erzeugen: die getrennte Spur ("stem") oder der ganze Song ("song").
+# ---------------------------------------------------------------------------
+_HIELTECH_STEM_TRACKS = {"lead": "vocals", "backing": "backing_vocals", "drums": "drums", "bass": "bass",
+                         "guitar": "guitar", "piano": "keyboard", "other": "keyboard"}
+
+
+def _hieltech_stems_test_sync(src_bytes, filename, regen_json, lyrics, caption):
+    work = tempfile.mkdtemp(prefix="hieltech_stems_")
+    results = []
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        out = os.path.join(work, "stems")
+        t0 = time.time()
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_separate_step.py"), song, out], timeout=1800)
+        report = None
+        for line in reversed(output.splitlines()):
+            if line.strip().startswith("{") and '"ok"' in line:
+                try:
+                    report = json.loads(line.strip())
+                except ValueError:
+                    pass
+                break
+        if not ok or not report:
+            return {"ok": False, "error": "trennung_fehlgeschlagen", "message": output[-800:]}
+        report["trennung_gesamt_s"] = round(time.time() - t0, 1)
+        for name in report.get("spuren", []):
+            p = os.path.join(out, name + ".wav")
+            conv, fext = _hieltech_wav_to_flac_file(p)
+            hp, token = _hieltech_handoff_store(conv, fext)
+            results.append({"datei": f"getrennt_{name}.{fext}", "result_token": token, "size_bytes": os.path.getsize(hp)})
+        try:
+            regen = [x for x in json.loads(regen_json or "[]") if isinstance(x, dict)][:10]
+        except ValueError:
+            regen = []
+        for it in regen:
+            stem = str(it.get("stem") or "")
+            quelle = "song" if it.get("src") == "song" else "stem"
+            track = str(it.get("track") or _HIELTECH_STEM_TRACKS.get(stem, ""))
+            name = f"neu_{stem}_aus_{quelle}"
+            src = song if quelle == "song" else os.path.join(out, stem + ".wav")
+            if track not in _HIELTECH_TRACKS or not os.path.isfile(src):
+                results.append({"datei": name, "error": f"unbekannte Spur {stem}/{track}"})
+                continue
+            t1 = time.time()
+            tmp_src = os.path.join(work, f"src_{stem}_{quelle}" + os.path.splitext(src)[1])
+            shutil.copyfile(src, tmp_src)
+            gesang = track in ("vocals", "backing_vocals")
+            payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": track, "src_audio_path": tmp_src,
+                       "prompt": str(it.get("prompt") or caption or "")[:500],
+                       "lyrics": (lyrics or "[Instrumental]") if gesang else "[Instrumental]",
+                       "seed": int(it.get("seed", 42)), "use_random_seed": False, "batch_size": 1,
+                       "inference_steps": int(it.get("steps", 50)), "guidance_scale": float(it.get("guidance", 7.0)),
+                       "thinking": False, "audio_format": "flac"}
+            if gesang:
+                payload["vocal_language"] = str(it.get("language") or "en")[:8]
+            try:
+                path, dit = _hieltech_release_and_wait(payload)
+                hp, token = _hieltech_handoff_store(path, os.path.splitext(path)[1].lstrip(".") or "flac")
+                results.append({"datei": f"{name}{os.path.splitext(path)[1]}", "result_token": token,
+                                "size_bytes": os.path.getsize(hp), "sekunden": round(time.time() - t1, 1), "modell": dit})
+            except Exception as e:  # noqa: BLE001
+                results.append({"datei": name, "error": str(e)[:300]})
+        return {"ok": True, "bericht": report, "results": results}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_test_start")
+async def _hieltech_stems_test_start(audio: UploadFile, regen: str = Form(default="[]"), lyrics: str = Form(default=""),
+                                     caption: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_test_sync, src_bytes, audio.filename, regen, lyrics[:6000], caption)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
