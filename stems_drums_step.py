@@ -67,8 +67,8 @@ def nachsortieren(roh):
     return out
 
 
-def zerlegen(path, work):
-    """-> {kick, snare, toms, hihat, becken}: (n, 2) bei 44,1 kHz."""
+def drumsep_roh(path, work):
+    """DrumSep einmal -> {kick, snare, toms, hh, ride, crash}: (n, 2)."""
     from audio_separator.separator import Separator
     if "s" not in _SEP:
         s = Separator(output_dir=work, output_format="WAV", model_file_dir=os.path.join(HERE, "uvr_models"),
@@ -104,11 +104,37 @@ def zerlegen(path, work):
     if fehlt:
         raise RuntimeError(f"DrumSep: Teile fehlen {fehlt} in {[os.path.basename(f) for f in files]}{hinweis}")
     n = max(a.shape[0] for a in roh.values())
-    roh = nachsortieren({key: fit(a, n) for key, a in roh.items()})
+    return {key: fit(a, n) for key, a in roh.items()}
+
+
+SNARE_DURCHGAENGE = int(os.environ.get("HIELTECH_SNARE_DURCHGAENGE", "2"))
+
+
+def zerlegen(path, work):
+    """-> {kick, snare, toms, hihat, becken}: (n, 2) bei 44,1 kHz.
+    Test 7 (Hörtest): in der Snare-Spur waren Hi-Hat, Toms und Becken noch deutlich zu hören.
+    -> Snare-Spur ein zweites (und drittes) Mal durch DrumSep: nur der Snare-Anteil bleibt in der Snare,
+       Hi-Hat/Toms/Becken/Kick daraus werden NICHT weggeworfen, sondern ihrer eigenen Spur zugeschlagen."""
+    roh = drumsep_roh(path, work)
+    n = roh["snare"].shape[0]
+    for i in range(SNARE_DURCHGAENGE):
+        sp = os.path.join(work, f"snare_runde{i}_{os.path.splitext(os.path.basename(path))[0]}.wav")
+        sf.write(sp, roh["snare"], SR, subtype="FLOAT")
+        try:
+            r = drumsep_roh(sp, work)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Stems-Test7] Snare-Reinigung Runde {i + 1} übersprungen: {e}", file=sys.stderr, flush=True)
+            break
+        roh["snare"] = fit(r["snare"], n)
+        for key in ("kick", "toms", "hh", "ride", "crash"):
+            if key in r:
+                roh[key] = roh.get(key, np.zeros((n, 2), np.float32)) + fit(r[key], n)
+    roh = nachsortieren(roh)
     becken = roh.get("ride", np.zeros((n, 2), np.float32)) + roh.get("crash", np.zeros((n, 2), np.float32))
     return {"kick": roh["kick"], "snare": roh["snare"], "toms": roh["toms"], "hihat": roh["hh"], "becken": becken}
 
 
+KOMPRESSION = os.environ.get("HIELTECH_DRUMS_KOMPRESSION", "0") == "1"  # Hörtest 29.10.: erst ganz am Ende
 # Je Teil eigene Kompression (wie im Studio: jedes Teil auf eigenem Kanal) – Tiefen-Filter gegen Rumpeln,
 # Attack so lang, dass der Anschlag durchkommt.
 TEIL_KETTE = {
@@ -188,10 +214,11 @@ def main():
                     b = mg
                 bp = os.path.join(work, f"teil_{teil}.wav")
                 sf.write(bp, b.astype(np.float32), SR, subtype="FLOAT")
-                try:
-                    b = fit(ffmpeg_kette(bp, os.path.join(work, f"teil_{teil}_k.wav"), TEIL_KETTE[teil]), n)
-                except Exception as e:  # noqa: BLE001
-                    ti["kompressor_fehler"] = str(e)[:200]
+                if KOMPRESSION:
+                    try:
+                        b = fit(ffmpeg_kette(bp, os.path.join(work, f"teil_{teil}_k.wav"), TEIL_KETTE[teil]), n)
+                    except Exception as e:  # noqa: BLE001
+                        ti["kompressor_fehler"] = str(e)[:200]
                 teile[teil] = b.astype(np.float32)
                 gesamt += teile[teil]
             except Exception as e:  # noqa: BLE001
@@ -205,10 +232,10 @@ def main():
         fak = min(1.0, 0.98 / spitze)
         for teil, a in teile.items():
             sf.write(os.path.join(ordner, f"{teil}.wav"), a * fak, SR, subtype="PCM_24")
-        sf.write(os.path.join(out, "drums_1_ohne_master.wav"), gesamt * fak, SR, subtype="PCM_24")
+        sf.write(os.path.join(out, "drums_1_komplett.wav"), gesamt * fak, SR, subtype="PCM_24")
         gp = os.path.join(work, "gesamt.wav")
         sf.write(gp, gesamt, SR, subtype="FLOAT")
-        for i, art in enumerate(("sanft", "kraeftig"), start=2):
+        for i, art in enumerate(("sanft", "kraeftig") if KOMPRESSION else (), start=2):
             try:
                 m = fit(master(gp, os.path.join(work, f"master_{art}.wav"), art), n)
                 sf.write(os.path.join(out, f"drums_{i}_master_{art}.wav"), m, SR, subtype="PCM_24")
