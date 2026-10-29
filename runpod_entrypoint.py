@@ -3836,7 +3836,7 @@ _HIELTECH_STEMS3_PROMPTS = {
 }
 
 
-def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds):
+def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds, nach="stems_post_step.py"):
     work = tempfile.mkdtemp(prefix="hieltech_stems3_")
     results = []
     try:
@@ -3875,7 +3875,7 @@ def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds)
         with open(cj, "w") as f:
             json.dump(kandidaten, f)
         out = os.path.join(work, "ergebnis")
-        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_post_step.py"), sep_dir, cj, out], timeout=1800)
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, nach), sep_dir, cj, out], timeout=2400)
         bericht = None
         for line in reversed(output.splitlines()):
             if line.strip().startswith("{") and '"ok"' in line:
@@ -3887,6 +3887,24 @@ def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds)
         if not bericht:
             return {"ok": False, "error": "nachbearbeitung_fehlgeschlagen", "message": output[-800:]}
         bericht["erzeugen_sekunden"] = zeiten
+        # Test 4: Bass zusätzlich genau wie der Gesang (Lead V2): RMVPE-Melodie -> Vocoder C,
+        # Melodie-Lock + Melodie folgen an der getrennten Bass-Spur (nur Vorlage).
+        bass_in = os.path.join(out, "_zwischen", "bass_maske.wav")
+        if nach == "stems_karte_step.py" and os.path.isfile(bass_in):
+            f0n, f0r = os.path.join(work, "bass_f0.npy"), os.path.join(work, "bass_ref_f0.npy")
+            ok1, log1 = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), bass_in, f0n],
+                                           timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+            ok2, _log2 = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), os.path.join(sep_dir, "bass.wav"), f0r],
+                                            timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+            if ok1 and os.path.isfile(f0n):
+                args = [os.path.join(_HIELTECH_PROJECT_ROOT, "nsf_vocoder_step.py"), bass_in, f0n, os.path.join(out, "bass_D_vocoder_c.wav")]
+                if ok2 and os.path.isfile(f0r):
+                    args += [f0r, "--follow"]
+                ok3, log3 = _hieltech_run_step(args, timeout=900)
+                if not ok3:
+                    bericht.setdefault("instrumente", {}).setdefault("bass", {})["vocoder_c_fehler"] = log3[-200:]
+            else:
+                bericht.setdefault("instrumente", {}).setdefault("bass", {})["vocoder_c_fehler"] = "RMVPE: " + log1[-200:]
         dateien = [(os.path.join(sep_dir, i + ".wav"), f"{i}_0_getrennt") for i in insts]
         dateien += [(os.path.join(out, fn), fn[:-4]) for fn in sorted(os.listdir(out)) if fn.endswith(".wav")]
         for p, name in dateien:
@@ -3908,6 +3926,19 @@ async def _hieltech_stems_test3_start(audio: UploadFile, caption: str = Form(def
         return {"ok": True, "job_id": laufend, "already_running": True}
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_test3_sync, src_bytes, audio.filename, caption[:500], instrumente, seeds)
+
+
+# HIELTECH Stems – Test 4 (29. Okt 2026): Instrumente wie den Gesang neu aufbauen
+# (Extract aus dem ganzen Song -> Zeitmaske -> Gate -> Karte -> Instrumenten-Vocoder; Bass zusätzlich Vocoder C).
+@app.post("/v1/hieltech_stems_test4_start")
+async def _hieltech_stems_test4_start(audio: UploadFile, caption: str = Form(default=""), instrumente: str = Form(default=""),
+                                      seeds: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_test3_sync, src_bytes, audio.filename, caption[:500], instrumente, seeds,
+                               "stems_karte_step.py")
 
 
 if __name__ == "__main__":
