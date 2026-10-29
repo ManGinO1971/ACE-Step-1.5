@@ -3826,6 +3826,90 @@ async def _hieltech_stems_test_start(audio: UploadFile, regen: str = Form(defaul
     return _hieltech_job_start("lora_test", _hieltech_stems_test_sync, src_bytes, audio.filename, regen, lyrics[:6000], caption)
 
 
+# HIELTECH Stems – Test 3 (29. Okt 2026): je Instrument 3 Fassungen aus dem GANZEN Song, die genaueste
+# automatisch wählen, Lautstärkeverlauf wie im Original, dann A ohne / B Denoise / C Apollo zum Vergleich.
+_HIELTECH_STEMS3_PROMPTS = {
+    "drums": ("drums", "isolated drum kit only, tight live drums, punchy kick, crisp rimshot snare, clean hi-hats, dry studio recording, no other instruments"),
+    "bass": ("bass", "isolated electric bass only, deep round warm bass guitar, clean DI studio recording, no other instruments"),
+    "guitar": ("guitar", "isolated electric guitar only, clean offbeat rhythm guitar, studio recording, no other instruments"),
+    "piano": ("keyboard", "isolated keyboards only, organ and piano, clean studio recording, no other instruments"),
+}
+
+
+def _hieltech_stems_test3_sync(src_bytes, filename, caption, instrumente, seeds):
+    work = tempfile.mkdtemp(prefix="hieltech_stems3_")
+    results = []
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        sep_dir = os.path.join(work, "getrennt")
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_separate_step.py"), song, sep_dir], timeout=1800)
+        if not ok or not os.path.isfile(os.path.join(sep_dir, "bass.wav")):
+            return {"ok": False, "error": "trennung_fehlgeschlagen", "message": output[-800:]}
+        insts = [i for i in (instrumente or "drums,bass,guitar,piano").split(",") if i in _HIELTECH_STEMS3_PROMPTS][:4]
+        seed_list = [int(x) for x in (seeds or "11,22,33").split(",") if x.strip().isdigit()][:4] or [11, 22, 33]
+        kandidaten, zeiten = {}, {}
+        for inst in insts:
+            track, extra = _HIELTECH_STEMS3_PROMPTS[inst]
+            t1 = time.time()
+            for sd in seed_list:
+                tmp_src = os.path.join(work, f"src_{inst}_{sd}{ext}")
+                shutil.copyfile(song, tmp_src)
+                payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": track, "src_audio_path": tmp_src,
+                           "prompt": f"{caption}, {extra}"[:600] if caption else extra, "lyrics": "[Instrumental]",
+                           "seed": sd, "use_random_seed": False, "batch_size": 1, "inference_steps": 50, "guidance_scale": 7.0,
+                           "thinking": False, "audio_format": "flac"}
+                try:
+                    path, _dit = _hieltech_release_and_wait(payload)
+                    keep = os.path.join(work, f"neu_{inst}_seed{sd}.flac")
+                    shutil.copyfile(path, keep)
+                    kandidaten.setdefault(inst, []).append(keep)
+                except Exception as e:  # noqa: BLE001
+                    results.append({"datei": f"neu_{inst}_seed{sd}", "error": str(e)[:300]})
+            zeiten[inst] = round(time.time() - t1, 1)
+        cj = os.path.join(work, "kandidaten.json")
+        with open(cj, "w") as f:
+            json.dump(kandidaten, f)
+        out = os.path.join(work, "ergebnis")
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_post_step.py"), sep_dir, cj, out], timeout=1800)
+        bericht = None
+        for line in reversed(output.splitlines()):
+            if line.strip().startswith("{") and '"ok"' in line:
+                try:
+                    bericht = json.loads(line.strip())
+                except ValueError:
+                    pass
+                break
+        if not bericht:
+            return {"ok": False, "error": "nachbearbeitung_fehlgeschlagen", "message": output[-800:]}
+        bericht["erzeugen_sekunden"] = zeiten
+        dateien = [(os.path.join(sep_dir, i + ".wav"), f"{i}_0_getrennt") for i in insts]
+        dateien += [(os.path.join(out, fn), fn[:-4]) for fn in sorted(os.listdir(out)) if fn.endswith(".wav")]
+        for p, name in dateien:
+            if not os.path.isfile(p):
+                continue
+            conv, fext = _hieltech_wav_to_flac_file(p)
+            hp, token = _hieltech_handoff_store(conv, fext)
+            results.append({"datei": f"{name}.{fext}", "result_token": token, "size_bytes": os.path.getsize(hp)})
+        return {"ok": True, "bericht": bericht, "results": results}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_test3_start")
+async def _hieltech_stems_test3_start(audio: UploadFile, caption: str = Form(default=""), instrumente: str = Form(default=""),
+                                      seeds: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_test3_sync, src_bytes, audio.filename, caption[:500], instrumente, seeds)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
