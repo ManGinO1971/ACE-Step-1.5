@@ -3958,6 +3958,167 @@ async def _hieltech_stems_test6_start(audio: UploadFile, caption: str = Form(def
                                "stems_drums_step.py")
 
 
+
+# ===================================================================================================
+# HIELTECH Stems – "Neu erzeugen" (29. Okt 2026): EINE Route für alle 53 Instrumente nach Rezept-Tabelle
+# (stems_rezepte.py). Vorlage je Instrument = 53er-Trennung auf der GPU (stems53_ref_step.py), beim
+# Schlagzeug die bewährte Trennung + Zerlegung (stems_drums_step.py). Je Instrument 3 Versuche aus dem
+# GANZEN Song (Extract), bester automatisch, dann Rezept (stems_neu_step.py). Ausgabe sortiert nach Familie.
+# ===================================================================================================
+def _hieltech_stems_neu_sync(src_bytes, filename, caption, instrumente, seeds, lyrics):
+    import importlib
+    sys.path.insert(0, _HIELTECH_PROJECT_ROOT)
+    rz = importlib.import_module("stems_rezepte")
+    work = tempfile.mkdtemp(prefix="hieltech_stems_neu_")
+    results, bericht = [], {"instrumente": {}, "zeiten": {}}
+    t_ges = time.time()
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        wanted = []
+        for i in (instrumente or "").split(","):
+            i = i.strip()
+            if i in rz.REZEPTE and i not in wanted:
+                wanted.append(i)
+        if not wanted:
+            return {"ok": False, "error": "keine_instrumente", "message": "Keine bekannten Instrumente angegeben."}
+        drums = [i for i in wanted if rz.REZEPTE[i]["rezept"] == "schlagzeug"]
+        andere = [i for i in wanted if i not in drums]
+        seed_list = [int(x) for x in (seeds or "11,22,33").split(",") if x.strip().isdigit()][:4] or [11, 22, 33]
+        out = os.path.join(work, "ergebnis")
+        roh = os.path.join(out, "_getrennt")
+        os.makedirs(roh, exist_ok=True)
+
+        # 1) Vorlagen: 53er-Trennung (alle anderen Instrumente in EINEM Aufruf)
+        refs = {}
+        if andere:
+            t1 = time.time()
+            args = [os.path.join(_HIELTECH_PROJECT_ROOT, "stems53_ref_step.py"), song]
+            for i in andere:
+                args += [os.path.join(roh, f"{i}.wav"), i]
+            ok, output = _hieltech_run_step(args, timeout=3600)
+            for line in reversed(output.splitlines()):
+                if line.strip().startswith("{") and '"instrumente"' in line:
+                    try:
+                        bericht["trennung53"] = json.loads(line.strip())
+                    except ValueError:
+                        pass
+                    break
+            for i in andere:
+                p = os.path.join(roh, f"{i}.wav")
+                if os.path.isfile(p) and os.path.getsize(p) > 1000:
+                    refs[i] = p
+            bericht["zeiten"]["trennung53"] = round(time.time() - t1, 1)
+            if not refs and not drums:
+                return {"ok": False, "error": "trennung53_fehlgeschlagen", "message": output[-800:]}
+        # Rückfall/Schlagzeug: bewährte Trennung (Demucs 6 + Gesang)
+        sep_dir = os.path.join(work, "getrennt6")
+        fehlend = [i for i in andere if i not in refs]
+        if drums or fehlend:
+            t1 = time.time()
+            ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_separate_step.py"), song, sep_dir], timeout=1800)
+            bericht["zeiten"]["trennung6"] = round(time.time() - t1, 1)
+            ersatz = {"Bass": "bass", "Gitarre": "guitar", "Tasten": "piano", "Schlagzeug": "drums"}
+            for i in fehlend:
+                fam = rz.REZEPTE[i]["familie"]
+                q = os.path.join(sep_dir, ("lead" if i in ("lead-vocal", "vocal") else "backing" if i == "back-vocal" else ersatz.get(fam, "other")) + ".wav")
+                if os.path.isfile(q):
+                    refs[i] = q
+                    bericht["instrumente"].setdefault(i, {})["vorlage"] = "Ersatz (6er-Trennung): " + os.path.basename(q)
+            if drums and os.path.isfile(os.path.join(sep_dir, "drums.wav")):
+                shutil.copyfile(os.path.join(sep_dir, "drums.wav"), os.path.join(roh, "drums.wav"))
+
+        # 2) Neu erzeugen: je Instrument 3 Versuche aus dem GANZEN Song
+        def erzeugen(name, spur, text):
+            pfade = []
+            for sd in seed_list:
+                tmp_src = os.path.join(work, f"src_{name}_{sd}{ext}")
+                shutil.copyfile(song, tmp_src)
+                gesang = spur in ("vocals", "backing_vocals")
+                payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": spur, "src_audio_path": tmp_src,
+                           "prompt": text, "lyrics": (lyrics or "[Instrumental]") if gesang else "[Instrumental]",
+                           "seed": sd, "use_random_seed": False, "batch_size": 1, "inference_steps": 50, "guidance_scale": 7.0,
+                           "thinking": False, "audio_format": "flac"}
+                try:
+                    path, _dit = _hieltech_release_and_wait(payload)
+                    keep = os.path.join(work, f"neu_{name}_seed{sd}.flac")
+                    shutil.copyfile(path, keep)
+                    pfade.append(keep)
+                except Exception as e:  # noqa: BLE001
+                    bericht["instrumente"].setdefault(name, {}).setdefault("erzeugen_fehler", []).append(str(e)[:200])
+            return pfade
+
+        if drums:
+            t1 = time.time()
+            r0 = rz.REZEPTE["drums"]
+            pf = erzeugen("drums", r0["spur"], rz.prompt("drums", caption))
+            cj = os.path.join(work, "kand_drums.json")
+            with open(cj, "w") as f:
+                json.dump({"drums": pf}, f)
+            ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_drums_step.py"), sep_dir, cj,
+                                             os.path.join(out, "Schlagzeug")], timeout=2400)
+            for line in reversed(output.splitlines()):
+                if line.strip().startswith("{") and '"ok"' in line:
+                    try:
+                        bericht["instrumente"]["schlagzeug"] = json.loads(line.strip()).get("instrumente", {}).get("drums", {})
+                    except ValueError:
+                        pass
+                    break
+            bericht["zeiten"]["schlagzeug"] = round(time.time() - t1, 1)
+        for i in andere:
+            if i not in refs:
+                bericht["instrumente"].setdefault(i, {})["fehler"] = "keine Vorlage"
+                continue
+            t1 = time.time()
+            r0 = rz.REZEPTE[i]
+            pf = erzeugen(i, r0["spur"], rz.prompt(i, caption))
+            cj = os.path.join(work, f"kand_{i}.json")
+            with open(cj, "w") as f:
+                json.dump(pf, f)
+            ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_neu_step.py"), i, refs[i], cj,
+                                             os.path.join(out, r0["familie"])], timeout=1800)
+            for line in reversed(output.splitlines()):
+                if line.strip().startswith("{") and '"instrument"' in line:
+                    try:
+                        bericht["instrumente"].setdefault(i, {}).update(json.loads(line.strip()))
+                    except ValueError:
+                        pass
+                    break
+            else:
+                bericht["instrumente"].setdefault(i, {})["fehler"] = output[-300:]
+            bericht["zeiten"][i] = round(time.time() - t1, 1)
+
+        # 3) Ausgabe: alle WAVs (mit Unterordnern) als FLAC
+        for root, dirs, files in os.walk(out):
+            dirs[:] = [d for d in dirs if not d.startswith("_zwischen")]
+            for fn in sorted(files):
+                if not fn.endswith(".wav"):
+                    continue
+                p = os.path.join(root, fn)
+                rel = os.path.relpath(p, out)[:-4]
+                conv, fext = _hieltech_wav_to_flac_file(p)
+                hp, token = _hieltech_handoff_store(conv, fext)
+                results.append({"datei": f"{rel}.{fext}", "result_token": token, "size_bytes": os.path.getsize(hp)})
+        bericht["gesamt_sekunden"] = round(time.time() - t_ges, 1)
+        return {"ok": True, "bericht": bericht, "results": results}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_neu_start")
+async def _hieltech_stems_neu_start(audio: UploadFile, instrumente: str = Form(default=""), caption: str = Form(default=""),
+                                    seeds: str = Form(default=""), lyrics: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_neu_sync, src_bytes, audio.filename, caption[:500],
+                               instrumente[:2000], seeds, lyrics[:6000])
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))

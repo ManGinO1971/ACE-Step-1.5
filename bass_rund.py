@@ -13,10 +13,13 @@ from scipy.signal import butter, sosfiltfilt
 
 NFFT, HOP = 8192, 512
 
-def tonhoehe(mono, sr):
-    sr2, hop2 = 2205, 32
+def tonhoehe(mono, sr, fmin=30, fmax=330):
+    """Tonhöhe je ~15 ms. Abtastrate passend zum Tonbereich (Bass 2205 Hz, Bläser/Flöte höher)."""
+    sr2 = 2205 if fmax <= 400 else (8820 if fmax <= 1800 else 11025)
+    hop2 = int(round(sr2 * 0.0145))
+    fl = 512 if sr2 == 2205 else (1024 if fmin >= 60 else 2048)
     y = librosa.resample(mono, orig_sr=sr, target_sr=sr2)
-    f0, v, _ = librosa.pyin(y, fmin=30, fmax=330, sr=sr2, frame_length=512, hop_length=hop2)
+    f0, v, _ = librosa.pyin(y, fmin=fmin, fmax=fmax, sr=sr2, frame_length=fl, hop_length=hop2)
     f0 = np.where(v & np.isfinite(f0), f0, 0.0)
     return f0, np.arange(len(f0)) * hop2 / sr2
 
@@ -67,7 +70,7 @@ def fett(x, sr, f0, tf):
     lo = sosfiltfilt(butter(2, 100, "low", fs=sr, output="sos"), z, axis=0)
     return (z + 0.4 * lo) * p
 
-def neu_bauen(x, sr, f0, tf, K=12):
+def neu_bauen(x, sr, f0, tf, K=12, obergrenze=5000.0):
     mono = x.mean(1)
     X = np.abs(librosa.stft(mono, n_fft=NFFT, hop_length=HOP))
     freq = librosa.fft_frequencies(sr=sr, n_fft=NFFT)
@@ -78,7 +81,7 @@ def neu_bauen(x, sr, f0, tf, K=12):
     for k in range(1, K + 1):
         fk = k * ff
         for j in range(X.shape[1]):
-            if st[j] < 0.5 or fk[j] > 5000:
+            if st[j] < 0.5 or fk[j] > obergrenze:
                 continue
             lo, hi = np.searchsorted(freq, [fk[j] * 0.97, fk[j] * 1.03])
             if hi > lo:
@@ -91,7 +94,7 @@ def neu_bauen(x, sr, f0, tf, K=12):
     y = np.zeros(len(mono))
     for k in range(1, K + 1):
         ak = np.interp(t, tfr, amps[k - 1])
-        y += ak * np.sin(k * ph) * (k * fs_ < 5000)
+        y += ak * np.sin(k * ph) * (k * fs_ < obergrenze)
     k = int(0.005 * sr)
     y *= np.convolve(np.clip(ss_, 0, 1), np.ones(k) / k, mode="same")
     return np.stack([y, y], 1)
@@ -120,9 +123,10 @@ def rms_aktiv(x, sr=44100):
     return float(np.sqrt((r[r > r.max() * 0.05] ** 2).mean())) if n else 0.0
 
 
-def bass_fertig(a, sr):
-    """Hörtest 29.10.: V3 'neu aufgebaut' gewählt – mit der Lautstärke des Originals (A)."""
-    f0, tf = tonhoehe(a.mean(1), sr)
-    v = neu_bauen(a, sr, f0, tf)
+def bass_fertig(a, sr, fmin=30, fmax=330, K=12, obergrenze=5000.0):
+    """Hörtest 29.10.: V3 'neu aufgebaut' gewählt – mit der Lautstärke des Originals (A).
+    Mit anderem Tonbereich/mehr Obertönen auch für einstimmige Melodie-Instrumente (Bläser, Flöte …)."""
+    f0, tf = tonhoehe(a.mean(1), sr, fmin, fmax)
+    v = neu_bauen(a, sr, f0, tf, K, obergrenze)
     rv = rms_aktiv(v, sr)
     return v * (rms_aktiv(a, sr) / rv if rv > 0 else 1.0)
