@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HIELTECH Stems – Test 4 (29. Okt 2026): Instrumente wie den Gesang (Lead V2) neu aufbauen.
+HIELTECH Stems – Test 4/5 (29. Okt 2026): Instrumente wie den Gesang (Lead V2) neu aufbauen.
 
 Gesang-Kette (Lead V2): Extract aus dem ganzen Song -> Zeitmaske -> Gate -> Melodie-Karte -> Vocoder C.
 Für Instrumente dasselbe Prinzip:
@@ -49,6 +49,11 @@ def frame_db(x):
     return 20 * np.log10(r)
 
 
+# Je Instrument: (Maske dB, Gate dB, Halten s, Blende s). Schlagzeug: Becken klingen lange aus (Test 4: in langer
+# Pause abgeschnitten) -> tiefere Schwellen, 1,5 s halten, weich ausblenden.
+EINST = {"drums": (-62.0, -72.0, 1.5, 0.25)}
+
+
 def weich(mask, halte_s=0.15, blende_s=0.02):
     """Maske aufweiten (Ausklang/Anschlag nicht abschneiden) und weich überblenden -> je Sample."""
     h = max(1, int(halte_s * SR / HOP))
@@ -58,14 +63,34 @@ def weich(mask, halte_s=0.15, blende_s=0.02):
     return np.clip(m, 0, 1)
 
 
-def maske_gate(sep, neu):
+def maske_gate(sep, neu, inst=""):
+    """-> (maskiert, Anteil klingend, Frame-Maske 'Original schweigt, neue Spur rauscht' für das Rauschprofil)."""
+    mdb, gdb, halte, blende = EINST.get(inst, (MASKE_DB, GATE_DB, 0.15, 0.02))
     n = neu.shape[0]
     ds, dn = frame_db(sep), frame_db(neu)
     m = min(len(ds), len(dn))
-    an = (ds[:m] > ds.max() + MASKE_DB) & (dn[:m] > dn.max() + GATE_DB)
-    g = weich(an)
+    an = (ds[:m] > ds.max() + mdb) & (dn[:m] > dn.max() + gdb)
+    g = weich(an, halte, blende)
     gain = np.interp(np.arange(n), np.arange(m) * HOP + HOP / 2, g)
-    return neu * gain[:, None], float(an.mean())
+    nur_rauschen = (g < 0.01) & (dn[:m] > dn.max() - 75)
+    return neu * gain[:, None], float(an.mean()), nur_rauschen
+
+
+def rauschprofil(neu, nur_rauschen):
+    """Rauschabdruck (wie 'Noise Print' im Studio) aus den Stellen, wo das Original schweigt,
+    die neue Spur aber rauscht -> je Kanal (128 Mel-Bänder). None, wenn zu wenig solche Stellen."""
+    import torch
+    m, h, mel_fn, _dev = bigvgan()
+    prof = []
+    for ch in range(neu.shape[1]):
+        y = torch.from_numpy(np.clip(neu[:, ch], -1, 1).astype(np.float32)).unsqueeze(0)
+        lin = np.exp(mel_fn(y, h)[0].numpy())
+        k = min(lin.shape[1], len(nur_rauschen))
+        sel = nur_rauschen[:k]
+        if sel.sum() < 40:
+            return None
+        prof.append(np.median(lin[:, :k][:, sel], axis=1, keepdims=True))
+    return prof
 
 
 _BV = {}
@@ -120,7 +145,7 @@ def saeubern(mel_log):
     return np.log(np.maximum(sauber, 1e-5))
 
 
-def neu_aufbauen(x, sauber):
+def neu_aufbauen(x, sauber, profil=None):
     """x: (n, 2) -> Klang aus der Karte neu aufgebaut, je Kanal, in Stücken mit Überblendung."""
     import torch
     m, h, mel_fn, dev = bigvgan()
@@ -130,7 +155,10 @@ def neu_aufbauen(x, sauber):
     for ch in range(x.shape[1]):
         y = torch.from_numpy(np.clip(x[:, ch], -1, 1).astype(np.float32)).unsqueeze(0)
         mel = mel_fn(y, h)[0].numpy()  # (128, T)
-        if sauber:
+        if profil is not None:
+            lin = np.exp(mel)
+            mel = np.log(np.maximum(np.maximum(lin - 1.3 * profil[ch], 0.05 * lin), 1e-5))
+        elif sauber:
             mel = saeubern(mel)
         T = mel.shape[1]
         wav = np.zeros(T * HOP, dtype=np.float32)
@@ -151,6 +179,30 @@ def neu_aufbauen(x, sauber):
         wav = wav / np.maximum(wsum, 1e-6)
         out[:, ch] = fit(wav[:, None], n)[:, 0]
     return out
+
+
+def bass_fundament(x):
+    """Bass rund + tief: sauberen Grundton (Sinus) aus der EIGENEN Tonhöhe der neuen Spur darunterlegen
+    (wie ein Sub-Bass-Prozessor im Studio). Lautstärke folgt dem Tiefenanteil der Spur."""
+    import librosa
+    from scipy.signal import butter, sosfiltfilt
+    mono = x.mean(1)
+    sr2, hop2 = 2205, 32
+    y = librosa.resample(mono, orig_sr=SR, target_sr=sr2)
+    f0, vflag, _p = librosa.pyin(y, fmin=30, fmax=330, sr=sr2, frame_length=512, hop_length=hop2)
+    f0 = np.where(vflag & np.isfinite(f0), f0, 0.0)
+    t_f = np.arange(len(f0)) * hop2 / sr2
+    t = np.arange(len(mono)) / SR
+    stimmhaft = np.interp(t, t_f, (f0 > 0).astype(float))
+    lf = np.interp(t_f, t_f[f0 > 0], np.log(f0[f0 > 0])) if (f0 > 0).sum() > 10 else np.zeros_like(t_f)
+    freq = np.exp(np.interp(t, t_f, lf))
+    phase = 2 * np.pi * np.cumsum(freq) / SR
+    tief = sosfiltfilt(butter(4, 150, "low", fs=SR, output="sos"), mono)
+    k = int(0.03 * SR)
+    hull = np.sqrt(np.convolve(tief ** 2, np.ones(k) / k, mode="same")) * np.sqrt(2)
+    s_glatt = np.convolve(stimmhaft, np.ones(k) / k, mode="same")
+    sub = np.sin(phase) * hull * s_glatt * 0.8
+    return x + sub[:, None], float((f0 > 0).mean())
 
 
 def schutz(x):
@@ -179,14 +231,31 @@ def main():
                     best, best_s = c, sc[0]
             info["gewaehlt"] = max(info["kandidaten"], key=lambda k: k["punkte"])["datei"]
             sf.write(os.path.join(out, f"{inst}_A_neu_roh.wav"), schutz(best), SR, subtype="PCM_24")
-            mg, anteil = maske_gate(sep, best)
+            mg, anteil, nur_r = maske_gate(sep, best, inst)
             info["klingt_anteil"] = round(anteil, 3)
-            sf.write(os.path.join(zw, f"{inst}_maske.wav"), schutz(mg), SR, subtype="PCM_24")
-            for tag, sauber in (("B_karte", False), ("C_karte_sauber", True)):
+            if inst == "bass":
+                # Test 4: Vocoder (B, D) nahm dem Bass Tiefe/Rundung -> Bass bleibt beim echten Klang (A),
+                # nur Maske/Gate + sauberer Grundton darunter.
+                sf.write(os.path.join(out, "bass_B_maske.wav"), schutz(mg), SR, subtype="PCM_24")
                 try:
-                    sf.write(os.path.join(out, f"{inst}_{tag}.wav"), schutz(neu_aufbauen(mg, sauber)), SR, subtype="PCM_24")
+                    fb, sh = bass_fundament(mg)
+                    info["grundton_anteil"] = round(sh, 3)
+                    sf.write(os.path.join(out, "bass_C_fundament.wav"), schutz(fb), SR, subtype="PCM_24")
                 except Exception as e:  # noqa: BLE001
-                    info[f"{tag}_fehler"] = str(e)[:200]
+                    info["C_fundament_fehler"] = str(e)[:200]
+            else:
+                try:
+                    sf.write(os.path.join(out, f"{inst}_B_karte.wav"), schutz(neu_aufbauen(mg, False)), SR, subtype="PCM_24")
+                except Exception as e:  # noqa: BLE001
+                    info["B_karte_fehler"] = str(e)[:200]
+                if inst != "drums":
+                    try:
+                        prof = rauschprofil(best, nur_r)
+                        info["rauschabdruck"] = prof is not None
+                        sf.write(os.path.join(out, f"{inst}_C_karte_entrauscht.wav"),
+                                 schutz(neu_aufbauen(mg, True, prof)), SR, subtype="PCM_24")
+                    except Exception as e:  # noqa: BLE001
+                        info["C_fehler"] = str(e)[:200]
         except Exception as e:  # noqa: BLE001
             info["fehler"] = str(e)[:300]
         bericht["instrumente"][inst] = info
