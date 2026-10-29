@@ -134,6 +134,7 @@ def zerlegen(path, work):
     return {"kick": roh["kick"], "snare": roh["snare"], "toms": roh["toms"], "hihat": roh["hh"], "becken": becken}
 
 
+BECKEN_AUSKLANG = float(os.environ.get("HIELTECH_BECKEN_AUSKLANG", "1.6"))
 KOMPRESSION = os.environ.get("HIELTECH_DRUMS_KOMPRESSION", "0") == "1"  # Hörtest 29.10.: erst ganz am Ende
 # Je Teil eigene Kompression (wie im Studio: jedes Teil auf eigenem Kanal) – Tiefen-Filter gegen Rumpeln,
 # Attack so lang, dass der Anschlag durchkommt.
@@ -212,6 +213,14 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     ti["vocoder_fehler"] = str(e)[:200]
                     b = mg
+                if teil == "becken":
+                    # Hörtest 29.10.: "Becken NEU lang genau was ich brauche" – Ausklang halten, Faktor 1,6
+                    try:
+                        from becken_halt import halten
+                        b = np.stack([halten(b[:, c].astype(np.float32), SR, BECKEN_AUSKLANG) for c in range(b.shape[1])], 1)
+                        ti["ausklang_gehalten"] = BECKEN_AUSKLANG
+                    except Exception as e:  # noqa: BLE001
+                        ti["ausklang_fehler"] = str(e)[:200]
                 bp = os.path.join(work, f"teil_{teil}.wav")
                 sf.write(bp, b.astype(np.float32), SR, subtype="FLOAT")
                 if KOMPRESSION:
