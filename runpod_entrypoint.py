@@ -3941,6 +3941,18 @@ async def _hieltech_stems_test4_start(audio: UploadFile, caption: str = Form(def
                                "stems_karte_step.py")
 
 
+# HIELTECH Stems – Test 6 (29. Okt 2026): Schlagzeug in Kick/Snare/Toms/Hi-Hat/Becken zerlegen (DrumSep),
+# je Teil die beste von 3 neu erzeugten Fassungen + eigene Behandlung (Maske, Gate, Karte -> Vocoder).
+@app.post("/v1/hieltech_stems_test6_start")
+async def _hieltech_stems_test6_start(audio: UploadFile, caption: str = Form(default=""), seeds: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_test3_sync, src_bytes, audio.filename, caption[:500], "drums", seeds,
+                               "stems_drums_step.py")
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
