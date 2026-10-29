@@ -54,8 +54,25 @@ def zerlegen(path, work):
         s.load_model(model_filename=DRUMSEP)
         _SEP["s"] = s
     s = _SEP["s"]
-    files = [f if os.path.isabs(f) else os.path.join(work, f) for f in s.separate(path)]
-    roh = {}
+    roh, files, hinweis = {}, [], ""
+    # Test 6: die installierte audio-separator-Fassung speichert bei Mehrspur-Modellen nur 2 Spuren
+    # (Kick, Snare). Das Modell liefert intern aber alle 6 -> direkt abholen.
+    try:
+        mi = s.model_instance
+        mi.audio_file_path = path
+        mi.audio_file_base = os.path.splitext(os.path.basename(path))[0]
+        mix = mi.prepare_mix(path)
+        src = mi.demix(mix=mix)
+        if isinstance(src, dict):
+            for stem in ("kick", "snare", "toms", "hh", "ride", "crash"):
+                if stem in src:
+                    a = np.asarray(src[stem], dtype=np.float32)
+                    roh[stem] = a.T if a.shape[0] == 2 else a
+    except Exception as e:  # noqa: BLE001
+        hinweis = f" (direkt: {str(e)[:150]})"
+    if not all(x in roh for x in ("kick", "snare", "toms", "hh")):
+        roh = {}
+        files = [f if os.path.isabs(f) else os.path.join(work, f) for f in s.separate(path)]
     for f in files:
         low = os.path.basename(f).lower()
         for stem in ("kick", "snare", "toms", "hh", "ride", "crash"):
@@ -63,7 +80,7 @@ def zerlegen(path, work):
                 roh[stem] = load(f)
     fehlt = [x for x in ("kick", "snare", "toms", "hh") if x not in roh]
     if fehlt:
-        raise RuntimeError(f"DrumSep: Teile fehlen {fehlt} in {[os.path.basename(f) for f in files]}")
+        raise RuntimeError(f"DrumSep: Teile fehlen {fehlt} in {[os.path.basename(f) for f in files]}{hinweis}")
     n = max(a.shape[0] for a in roh.values())
     roh = {key: fit(a, n) for key, a in roh.items()}
     becken = roh.get("ride", np.zeros((n, 2), np.float32)) + roh.get("crash", np.zeros((n, 2), np.float32))
