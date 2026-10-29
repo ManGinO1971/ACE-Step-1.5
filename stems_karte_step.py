@@ -243,6 +243,13 @@ def main():
                     sf.write(os.path.join(out, "bass_C_fundament.wav"), schutz(fb), SR, subtype="PCM_24")
                 except Exception as e:  # noqa: BLE001
                     info["C_fundament_fehler"] = str(e)[:200]
+                try:
+                    # Hörtest 29.10.: "3_bass_V3_neu_aufgebaut sehr gut" – Bass aus Grundton + 12 Obertönen neu,
+                    # Lautstärke wie A (das Original-Niveau der neuen Spur)
+                    from bass_rund import bass_fertig
+                    sf.write(os.path.join(out, "bass_D_neu_aufgebaut.wav"), schutz(bass_fertig(best.astype(np.float64), SR)), SR, subtype="PCM_24")
+                except Exception as e:  # noqa: BLE001
+                    info["D_neu_aufgebaut_fehler"] = str(e)[:200]
             else:
                 try:
                     sf.write(os.path.join(out, f"{inst}_B_karte.wav"), schutz(neu_aufbauen(mg, False)), SR, subtype="PCM_24")
