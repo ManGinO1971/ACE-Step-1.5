@@ -54,7 +54,18 @@ def main():
         if best is None:
             raise RuntimeError("keine neu erzeugte Fassung")
         sf.write(os.path.join(out, f"{inst}_A_roh.wav"), k.schutz(best), SR, subtype="PCM_24")
-        if art == "bass":
+        if art == "blaeser_satz":
+            # Hörtest 29.10.: 4_brass_NEU_hall gewählt – aus der UNMASKIERTEN Fassung (ganzer Ausklang)
+            from blaeser_zusammen import verarbeite
+            from blaeser_trennen import satz_und_teile
+            v = verarbeite(best.astype(np.float64), ref.astype(np.float64), SR, 1.0)
+            satz, teile = satz_und_teile(v, SR)
+            sf.write(os.path.join(out, f"{inst}.wav"), satz, SR, subtype="PCM_24")
+            # Hörtest 29.10.: Aufteilung nach Stimmlage (B) – Unterordner wie beim Schlagzeug, Summe = Satz
+            os.makedirs(os.path.join(out, "teile"), exist_ok=True)
+            for name, spur in teile.items():
+                sf.write(os.path.join(out, "teile", f"{name}.wav"), spur, SR, subtype="PCM_24")
+        elif art == "bass":
             from bass_rund import bass_fertig
             fmin, fmax = r.get("ton", (30, 330))
             sf.write(os.path.join(out, f"{inst}.wav"), k.schutz(bass_fertig(best.astype(np.float64), SR, fmin, fmax)), SR, subtype="PCM_24")

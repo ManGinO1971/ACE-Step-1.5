@@ -17,6 +17,8 @@ Felder:
               melodie      – einstimmig: Karte (B) UND Grundton+Obertöne neu (C) zum Vergleich (TEST)
               perkussion   – kurze Maske + Gate + Karte, Anschläge bleiben (TEST)
               gesang       – vorerst Karte; Gesangskette (Lead V2 ohne .pth) folgt
+              blaeser_satz – Bläser zusammen: entrauschen, Ausklang bis zum Ende, Lücken füllen, Raum-Hall (fertig, Hörtest 29.10.)
+                             + Unterordner teile/ nach Stimmlage: hoch (Trompete) / mitte (Sax) / tief (Posaune) (Hörtest: B besser)
   ton       (fmin, fmax) Hz – nur für "melodie"/"bass": Tonbereich für die Tonhöhen-Erkennung
   status    "fertig" (per Hörtest bestätigt) oder "test"
 """
@@ -54,7 +56,9 @@ REZEPTE = {
     "accordion":     dict(familie="Tasten", spur="keyboard", text="accordion", rezept="karte", status="test"),
     "synth":         dict(familie="Tasten", spur="synth", text="synthesizer", rezept="karte", status="test"),
     # ---------------- Bläser (Blech) ----------------
-    "brass":        dict(familie="Bläser", spur="brass", text="brass section, trumpets, trombones and saxophones", rezept="karte", status="test"),
+    # Hörtest 29.10.: "4_brass_NEU_hall der bessere" – Bläser-Satz zusammen: entrauschen -> natürlicher Ausklang
+    # -> Lücken füllen (wie Becken) -> leichter Raum-Hall 1,8 s
+    "brass":        dict(familie="Bläser", spur="brass", text="brass section, trumpets, trombones and saxophones", rezept="blaeser_satz", status="fertig"),
     "trumpet":      dict(familie="Bläser", spur="brass", text="trumpet", rezept="melodie", ton=(160, 1100), status="test"),
     "trombone":     dict(familie="Bläser", spur="brass", text="trombone", rezept="melodie", ton=(70, 600), status="test"),
     "french-horn":  dict(familie="Bläser", spur="brass", text="french horn", rezept="melodie", ton=(60, 800), status="test"),
