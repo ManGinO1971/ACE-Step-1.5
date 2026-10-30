@@ -88,6 +88,9 @@ def main():
             if hh is not None:
                 satz = hihat_raus(satz, SR, R_all.astype(np.float32), hh.astype(np.float32), 2.0)
             satz = hihat_raus_klang(satz, SR)
+            # Hörtest 30.10.: Fell-Resonanz als letzter Schritt (wie 3_percussion_NEU_resonanz)
+            from percussion_zusammen import resonanz
+            satz = resonanz(satz, SR)
             sf.write(os.path.join(out, f"{inst}.wav"), k.schutz(satz), SR, subtype="PCM_24")
         elif art == "blaeser_satz":
             # Hörtest 29.10.: 4_brass_NEU_hall gewählt – aus der UNMASKIERTEN Fassung (ganzer Ausklang)

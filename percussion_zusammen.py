@@ -100,3 +100,16 @@ if __name__ == "__main__":
         if res:
             sf.write(os.path.join(outdir, "teile", "trommeln.wav"), trom / p, sr, subtype="PCM_24")
             sf.write(os.path.join(outdir, "teile", "klein_percussion.wav"), (satz - trom) / p, sr, subtype="PCM_24")
+
+
+RESONANZ_S = float(os.environ.get("HIELTECH_PERC_RESONANZ_S", "0.35"))
+
+
+def resonanz(x, sr, t60=RESONANZ_S):
+    """Hörtest 30.10.: Fell-Resonanz wie in 3_percussion_NEU_resonanz ("gut wegen die Resonanz"), jetzt als
+    LETZTER Schritt auf der sauberen Spur: je Frequenz 50–1500 Hz kurz halten (Nachhallzeit t60), Shaker/Höhen nicht."""
+    n = len(x); out = np.zeros_like(x)
+    for c in range(x.shape[1]):
+        X = librosa.stft(x[:, c].astype(np.float64), n_fft=NFFT, hop_length=HOP)
+        out[:, c] = librosa.istft(halten(X, sr, t60), hop_length=HOP, length=n)
+    return out

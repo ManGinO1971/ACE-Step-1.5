@@ -18,7 +18,7 @@ Felder:
               perkussion   – kurze Maske + Gate + Karte, Anschläge bleiben (TEST)
               gesang       – vorerst Karte; Gesangskette (Lead V2 ohne .pth) folgt
               perkussion_satz – Djembe/Percussion zusammen: entrauschen, Fremdes raus, Kick/Toms schlagweise raus
-                             (an_schlagzeug/), Hi-Hat raus (fertig, Hörtest 30.10.)
+                             (an_schlagzeug/), Hi-Hat raus, zuletzt Fell-Resonanz 0,35 s (fertig, Hörtest 30.10.)
               blaeser_satz – Bläser zusammen: entrauschen, Ausklang bis zum Ende, Lücken füllen, Raum-Hall (fertig, Hörtest 29.10.)
                              + Unterordner teile/ nach Stimmlage: hoch (Trompete) / mitte (Sax) / tief (Posaune) (Hörtest: B besser)
   ton       (fmin, fmax) Hz – nur für "melodie"/"bass": Tonbereich für die Tonhöhen-Erkennung
