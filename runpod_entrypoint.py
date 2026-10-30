@@ -4176,6 +4176,44 @@ async def _hieltech_stems53_start(audio: UploadFile, instrumente: str = Form(def
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems53_sync, src_bytes, audio.filename, instrumente[:500])
 
+
+# HIELTECH Stems (30. Okt 2026): Songtext automatisch mitschreiben – Song -> Gesang trennen (wie Lead V2:
+# lead_v2_prepare_step.py) -> Whisper large-v3 auf Lead- und Background-Spur -> Text mit ( … ) für Background.
+# Der Text wird in der App angezeigt und kann korrigiert werden, danach "Gesang neu erzeugen".
+def _hieltech_stems_text_sync(src_bytes, filename):
+    work = tempfile.mkdtemp(prefix="hieltech_stems_text_")
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        out_dir = os.path.join(work, "prep")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_prepare_step.py"), song, out_dir], timeout=2400)
+        lead, back = os.path.join(out_dir, "lead_ref.wav"), os.path.join(out_dir, "backing_ref.wav")
+        if not os.path.isfile(lead):
+            return {"ok": False, "error": "trennung_fehlgeschlagen", "message": log[-800:]}
+        js = os.path.join(work, "text.json")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_text_step.py"), lead, back, js], timeout=1800)
+        if not os.path.isfile(js):
+            return {"ok": False, "error": "mitschreiben_fehlgeschlagen", "message": log[-800:]}
+        with open(js, encoding="utf-8") as f:
+            res = json.load(f)
+        return {"ok": True, "lyrics": res.get("lyrics", ""), "lead": res.get("lead", []), "backing": res.get("backing", []),
+                "modell": res.get("modell")}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_text_start")
+async def _hieltech_stems_text_start(audio: UploadFile):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_text_sync, src_bytes, audio.filename)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
