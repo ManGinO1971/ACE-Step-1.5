@@ -45,7 +45,7 @@ def nach_53(bus, trp, brs):
     tr = istft2([X[:, :T] * m for X in Xs], n)
     return {"trompete": tr, "uebrige_blaeser": bus - tr}
 
-def nach_lage(bus, sr):
+def nach_lage(bus, sr, namen=("tief_posaune", "mitte_sax", "hoch_trompete")):
     mono = bus.mean(1)
     X = librosa.stft(mono, n_fft=NFFT, hop_length=HOP); mag = np.abs(X).astype(np.float32); del X
     freq = librosa.fft_frequencies(sr=sr, n_fft=NFFT); df = freq[1]
@@ -95,7 +95,7 @@ def nach_lage(bus, sr):
             for c, Xc in enumerate(Xs):
                 teile[v][c][:, a0:b0] = Xc[:, a0:b0] * anteil[v]
     out = {}
-    for v, name in enumerate(("tief_posaune", "mitte_sax", "hoch_trompete")):
+    for v, name in enumerate(namen):
         out[name] = istft2(teile[v], len(bus))
     return out, f0s
 
@@ -150,7 +150,7 @@ if __name__ == "__main__":
         print(f"Summe {name} = Satz? max Abweichung", round(float(np.abs(s_ - r).max()), 5))
 
 
-def satz_und_teile(bus, sr):
+def satz_und_teile(bus, sr, namen=("tief_posaune", "mitte_sax", "hoch_trompete")):
     """Hörtest 29.10.: Variante B (nach Stimmlage) gewählt. -> (Satz mit Hall, {teil: Spur mit Hall}),
     gleiche Raum-Antwort/Stärke wie 4_brass_NEU_hall, gleicher Übersteuerungsschutz -> Teile ergeben zusammen den Satz."""
     ir = hall_ir(sr)
@@ -158,5 +158,5 @@ def satz_und_teile(bus, sr):
     g = 0.18 * np.sqrt((bus ** 2).mean()) / (np.sqrt((nass ** 2).mean()) + 1e-12)
     satz = hall_lin(bus, ir, g)
     p = max(float(np.abs(satz).max()) / 0.98, 1.0)
-    teile = stueckweise(lambda seg: nach_lage(seg, sr)[0], [bus], len(bus), sr)
+    teile = stueckweise(lambda seg: nach_lage(seg, sr, namen)[0], [bus], len(bus), sr)
     return satz / p, {k: hall_lin(v, ir, g) / p for k, v in teile.items()}

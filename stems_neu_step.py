@@ -92,12 +92,14 @@ def main():
             from percussion_zusammen import resonanz
             satz = resonanz(satz, SR)
             sf.write(os.path.join(out, f"{inst}.wav"), k.schutz(satz), SR, subtype="PCM_24")
-        elif art == "blaeser_satz":
+        elif art in ("blaeser_satz", "streicher_satz"):
             # Hörtest 29.10.: 4_brass_NEU_hall gewählt – aus der UNMASKIERTEN Fassung (ganzer Ausklang)
+            # 30.10. TEST: Streicher-Satz genauso (gehaltene Töne, Hall, Lücken füllen), Teile Geige/Bratsche/Cello nach Lage
             from blaeser_zusammen import verarbeite
             from blaeser_trennen import satz_und_teile
             v = verarbeite(best.astype(np.float64), ref.astype(np.float64), SR, 1.0)
-            satz, teile = satz_und_teile(v, SR)
+            namen = ("tief_cello", "mitte_bratsche", "hoch_geige") if art == "streicher_satz" else ("tief_posaune", "mitte_sax", "hoch_trompete")
+            satz, teile = satz_und_teile(v, SR, namen)
             sf.write(os.path.join(out, f"{inst}.wav"), satz, SR, subtype="PCM_24")
             # Hörtest 29.10.: Aufteilung nach Stimmlage (B) – Unterordner wie beim Schlagzeug, Summe = Satz
             os.makedirs(os.path.join(out, "teile"), exist_ok=True)

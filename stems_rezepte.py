@@ -75,8 +75,9 @@ REZEPTE = {
     "bassoon":      dict(familie="Holzbläser", spur="woodwinds", text="bassoon", rezept="melodie", ton=(55, 600), status="test"),
     "harmonica":    dict(familie="Holzbläser", spur="woodwinds", text="harmonica", rezept="melodie", ton=(250, 2000), status="test"),
     # ---------------- Streicher ----------------
-    "strings":       dict(familie="Streicher", spur="strings", text="string section", rezept="karte", status="test"),
-    "bowed_strings": dict(familie="Streicher", spur="strings", text="bowed string section", rezept="karte", status="test"),
+    # 30.10. TEST: wie Bläser-Satz (entrauschen, Ausklang, Lücken füllen, Raum-Hall) + teile/ hoch Geige / mitte Bratsche / tief Cello
+    "strings":       dict(familie="Streicher", spur="strings", text="string section, violins, violas and cellos", rezept="streicher_satz", status="test"),
+    "bowed_strings": dict(familie="Streicher", spur="strings", text="bowed string section", rezept="streicher_satz", status="test"),
     "violin":        dict(familie="Streicher", spur="strings", text="violin", rezept="melodie", ton=(190, 2100), status="test"),
     "viola":         dict(familie="Streicher", spur="strings", text="viola", rezept="melodie", ton=(125, 1100), status="test"),
     "cello":         dict(familie="Streicher", spur="strings", text="cello", rezept="melodie", ton=(60, 800), status="test"),
