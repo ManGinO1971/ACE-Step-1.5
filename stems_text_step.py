@@ -3,7 +3,7 @@
 HIELTECH Stems – Songtext automatisch mitschreiben (30. Okt 2026).
 
 Die Gesangskette (Lead V2 / Background V2 aus dem Musik-Generator) braucht den Songtext. In der Stems-App gibt es
-keinen – deshalb hört ein Spracherkennungs-Modell (Whisper large-v3, MIT-Lizenz) den GETRENNTEN Gesang ab:
+keinen – deshalb hört ein Spracherkennungs-Modell (Whisper large-v3-turbo, MIT-Lizenz) den GETRENNTEN Gesang ab:
   - Lead-Spur  -> Lead-Zeilen (eine Zeile je erkanntem Satzstück, Zeitstempel)
   - Background-Spur -> Text in ( … ) an der passenden Stelle eingefügt (wie im Musik-Generator)
 Der Text wird in der App ANGEZEIGT und kann korrigiert werden, bevor neu gesungen wird (Wunsch 30.10.).
@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import soundfile as sf
 
-MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3")
+MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3-turbo")   # 1,6 GB statt 3 GB, fast gleich genau
 CACHE = os.environ.get("HIELTECH_WHISPER_CACHE") or ("/runpod-volume/hf_whisper" if os.path.isdir("/runpod-volume") else None)
 SR16 = 16000
 
@@ -30,13 +30,27 @@ def lade16(p):
     return librosa.resample(a.mean(1), orig_sr=sr, target_sr=SR16)
 
 
+def _laden(cache, dt):
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    m = AutoModelForSpeechSeq2Seq.from_pretrained(MODELL, torch_dtype=dt, low_cpu_mem_usage=True, cache_dir=cache)
+    p = AutoProcessor.from_pretrained(MODELL, cache_dir=cache)
+    return m, p
+
+
 def erkenner():
+    import tempfile
     import torch
-    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+    from transformers import pipeline
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     dt = torch.float16 if dev == "cuda" else torch.float32
-    m = AutoModelForSpeechSeq2Seq.from_pretrained(MODELL, torch_dtype=dt, low_cpu_mem_usage=True, cache_dir=CACHE).to(dev)
-    p = AutoProcessor.from_pretrained(MODELL, cache_dir=CACHE)
+    # 31.10.: "Disk quota exceeded" – das Netz-Volume ist voll. Dann ins Arbeitsverzeichnis des Workers laden
+    # (bei jedem Kaltstart neu, ~1,6 GB) statt abzubrechen.
+    try:
+        m, p = _laden(CACHE, dt)
+    except OSError as e:
+        print(f"[Stems-Text] Volume-Zwischenspeicher nicht nutzbar ({e}) – lade ins Arbeitsverzeichnis", file=sys.stderr, flush=True)
+        m, p = _laden(tempfile.mkdtemp(prefix="whisper_", dir=os.environ.get("TMPDIR", "/tmp")), dt)
+    m = m.to(dev)
     return pipeline("automatic-speech-recognition", model=m, tokenizer=p.tokenizer, feature_extractor=p.feature_extractor,
                     torch_dtype=dt, device=dev, chunk_length_s=30, batch_size=8)
 

@@ -4214,6 +4214,43 @@ async def _hieltech_stems_text_start(audio: UploadFile):
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_text_sync, src_bytes, audio.filename)
 
+
+# HIELTECH (31. Okt 2026): Belegung des Netz-Volumes anzeigen (nur LESEN, löscht nichts) – "Disk quota exceeded".
+def _hieltech_volume_info_sync():
+    basis = "/runpod-volume"
+    if not os.path.isdir(basis):
+        return {"ok": False, "error": "kein_volume"}
+    def groesse(p):
+        r = subprocess.run(["du", "-sb", p], capture_output=True, text=True, timeout=600)
+        try:
+            return int(r.stdout.split()[0])
+        except (ValueError, IndexError):
+            return -1
+    eintraege = []
+    for name in sorted(os.listdir(basis)):
+        p = os.path.join(basis, name)
+        g = groesse(p)
+        unter = []
+        if os.path.isdir(p) and g > 500 * 1024 * 1024:
+            for n2 in sorted(os.listdir(p)):
+                g2 = groesse(os.path.join(p, n2))
+                if g2 > 200 * 1024 * 1024:
+                    unter.append({"name": n2, "gb": round(g2 / 1e9, 2)})
+            unter.sort(key=lambda e: -e["gb"])
+        eintraege.append({"name": name, "gb": round(g / 1e9, 2), "unter": unter[:15]})
+    eintraege.sort(key=lambda e: -e["gb"])
+    st = os.statvfs(basis)
+    return {"ok": True, "frei_gb": round(st.f_bavail * st.f_frsize / 1e9, 2), "gesamt_gb": round(st.f_blocks * st.f_frsize / 1e9, 2),
+            "eintraege": eintraege}
+
+
+@app.post("/v1/hieltech_volume_info_start")
+async def _hieltech_volume_info_start(audio: UploadFile | None = File(default=None)):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    return _hieltech_job_start("lora_test", _hieltech_volume_info_sync)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "5000"))
