@@ -53,8 +53,18 @@ def modell(inst, dev):
     from huggingface_hub import hf_hub_download
     repo()
     from models.bs_roformer.bs_roformer import BSRoformer
-    cfg_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep_config.yaml")
-    ckpt_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep.ckpt")
+    # 30.10.: "Disk quota exceeded" auf dem Worker (jede Vorlage 78 MB im normalen Zwischenspeicher).
+    # -> eigener Speicherort auf dem Netz-Volume; ist der voll/nicht da: temporär laden und danach löschen.
+    cache = os.environ.get("HIELTECH_53_CACHE") or ("/runpod-volume/hf_mega53" if os.path.isdir("/runpod-volume") else None)
+    tmp = None
+    try:
+        cfg_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep_config.yaml", cache_dir=cache)
+        ckpt_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep.ckpt", cache_dir=cache)
+    except OSError:
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="mega53_", dir=os.environ.get("TMPDIR", "/tmp"))
+        cfg_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep_config.yaml", local_dir=tmp)
+        ckpt_p = hf_hub_download(HF_REPO, f"v1/bs_mega_53stem_{inst}_mvsep.ckpt", local_dir=tmp)
     cfg = lade_config(cfg_p)
     kw = dict(cfg["model"])
     for k in ("freqs_per_bands", "multi_stft_resolutions_window_sizes"):
@@ -68,6 +78,9 @@ def modell(inst, dev):
     sd = {k[7:] if k.startswith("module.") else k: v for k, v in sd.items()}
     m.load_state_dict(sd)
     chunk = int(cfg.get("inference", {}).get("chunk_size", cfg["audio"]["chunk_size"]))
+    if tmp:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
     return m.to(dev).eval(), chunk
 
 

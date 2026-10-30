@@ -92,6 +92,20 @@ def main():
             from percussion_zusammen import resonanz
             satz = resonanz(satz, SR)
             sf.write(os.path.join(out, f"{inst}.wav"), k.schutz(satz), SR, subtype="PCM_24")
+        elif art == "streicher_einzeln":
+            # Hörtest 30.10.: violin_NEU_sauber_dynamik = Stand – B-Klang (Karte/Vocoder), Ausklang bis zum Ende aus A,
+            # nur Töne dieses Instruments (Keys/Synth raus), Lautstärke-Verlauf wie im Original (±6 dB, 1,5 s glatt)
+            from streicher_einzeln import einzeln_sauber
+            from dynamik_wie_original import angleichen
+            k.EINST[inst] = MASKE["melodie"]
+            mg, anteil, _nr = k.maske_gate(ref, best, inst)
+            info["klingt_anteil"] = round(anteil, 3)
+            B = k.neu_aufbauen(mg, False)
+            fmin, fmax = r.get("ton", (180, 2200))
+            y = einzeln_sauber(B.astype(np.float64), best.astype(np.float64), ref.astype(np.float64), SR, fmin, fmax)
+            y, gmax = angleichen(y, ref.astype(np.float64), SR)
+            info["dynamik_max_db"] = round(gmax, 1)
+            sf.write(os.path.join(out, f"{inst}.wav"), y, SR, subtype="PCM_24")
         elif art in ("blaeser_satz", "streicher_satz"):
             # Hörtest 29.10.: 4_brass_NEU_hall gewählt – aus der UNMASKIERTEN Fassung (ganzer Ausklang)
             # 30.10. TEST: Streicher-Satz genauso (gehaltene Töne, Hall, Lücken füllen), Teile Geige/Bratsche/Cello nach Lage

@@ -19,6 +19,8 @@ Felder:
               gesang       – vorerst Karte; Gesangskette (Lead V2 ohne .pth) folgt
               perkussion_satz – Djembe/Percussion zusammen: entrauschen, Fremdes raus, Kick/Toms schlagweise raus
                              (an_schlagzeug/), Hi-Hat raus, zuletzt Fell-Resonanz 0,5 s (fertig, Hörtest 30.10.)
+              streicher_einzeln – Geige/Bratsche/Cello einzeln: B-Klang + Ausklang bis zum Ende + nur eigene Töne
+                             (Keys/Synth raus) + Lautstärke-Verlauf wie Original (fertig, Hörtest 30.10.)
               blaeser_satz – Bläser zusammen: entrauschen, Ausklang bis zum Ende, Lücken füllen, Raum-Hall (fertig, Hörtest 29.10.)
                              + Unterordner teile/ nach Stimmlage: hoch (Trompete) / mitte (Sax) / tief (Posaune) (Hörtest: B besser)
   ton       (fmin, fmax) Hz – nur für "melodie"/"bass": Tonbereich für die Tonhöhen-Erkennung
@@ -78,9 +80,9 @@ REZEPTE = {
     # 30.10. TEST: wie Bläser-Satz (entrauschen, Ausklang, Lücken füllen, Raum-Hall) + teile/ hoch Geige / mitte Bratsche / tief Cello
     "strings":       dict(familie="Streicher", spur="strings", text="string section, violins, violas and cellos", rezept="streicher_satz", status="test"),
     "bowed_strings": dict(familie="Streicher", spur="strings", text="bowed string section", rezept="streicher_satz", status="test"),
-    "violin":        dict(familie="Streicher", spur="strings", text="violin", rezept="melodie", ton=(190, 2100), status="test"),
-    "viola":         dict(familie="Streicher", spur="strings", text="viola", rezept="melodie", ton=(125, 1100), status="test"),
-    "cello":         dict(familie="Streicher", spur="strings", text="cello", rezept="melodie", ton=(60, 800), status="test"),
+    "violin":        dict(familie="Streicher", spur="strings", text="violin", rezept="streicher_einzeln", ton=(180, 2200), status="fertig"),
+    "viola":         dict(familie="Streicher", spur="strings", text="viola", rezept="streicher_einzeln", ton=(125, 1100), status="fertig"),
+    "cello":         dict(familie="Streicher", spur="strings", text="cello", rezept="streicher_einzeln", ton=(60, 800), status="fertig"),
     # ---------------- Percussion ----------------
     # Hörtest 30.10.: Stand = 9_percussion_ohne_hihat – entrauschen, Fremdes raus (Vorlage-Wegweiser),
     # Kick/Toms Schlag für Schlag raus (-> an_schlagzeug/), Hi-Hat raus (53er-hh + nach Klang). KEIN Isolieren danach.
@@ -100,7 +102,8 @@ REZEPTE = {
 MASKE = {
     "karte": (-45.0, -55.0, 0.15, 0.02),
     "gesang": (-45.0, -55.0, 0.25, 0.03),
-    "melodie": (-50.0, -60.0, 0.40, 0.05),     # Bläser/Streicher: Ausklang/Raum nicht abschneiden
+    "melodie": (-50.0, -60.0, 0.40, 0.05),
+    "streicher_einzeln": (-50.0, -60.0, 0.40, 0.05),     # Bläser/Streicher: Ausklang/Raum nicht abschneiden
     "perkussion": (-50.0, -62.0, 0.50, 0.04),  # Djembe/Congas: Bass-Ton klingt nach
 }
 
