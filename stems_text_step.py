@@ -19,6 +19,9 @@ import sys
 import numpy as np
 import soundfile as sf
 
+# Xet-Zwischenspeicher liegt sonst auf dem (vollen) Volume – vor dem ersten huggingface-Import abschalten
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3-turbo")   # 1,6 GB statt 3 GB, fast gleich genau
 CACHE = os.environ.get("HIELTECH_WHISPER_CACHE") or ("/runpod-volume/hf_whisper" if os.path.isdir("/runpod-volume") else None)
 SR16 = 16000
@@ -30,10 +33,11 @@ def lade16(p):
     return librosa.resample(a.mean(1), orig_sr=sr, target_sr=SR16)
 
 
-def _laden(cache, dt):
+def _laden(cache, dt, nur_lokal=False):
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-    m = AutoModelForSpeechSeq2Seq.from_pretrained(MODELL, torch_dtype=dt, low_cpu_mem_usage=True, cache_dir=cache)
-    p = AutoProcessor.from_pretrained(MODELL, cache_dir=cache)
+    m = AutoModelForSpeechSeq2Seq.from_pretrained(MODELL, torch_dtype=dt, low_cpu_mem_usage=True, cache_dir=cache,
+                                                  local_files_only=nur_lokal)
+    p = AutoProcessor.from_pretrained(MODELL, cache_dir=cache, local_files_only=nur_lokal)
     return m, p
 
 
@@ -43,13 +47,20 @@ def erkenner():
     from transformers import pipeline
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     dt = torch.float16 if dev == "cuda" else torch.float32
-    # 31.10.: "Disk quota exceeded" – das Netz-Volume ist voll. Dann ins Arbeitsverzeichnis des Workers laden
-    # (bei jedem Kaltstart neu, ~1,6 GB) statt abzubrechen.
-    try:
-        m, p = _laden(CACHE, dt)
-    except OSError as e:
-        print(f"[Stems-Text] Volume-Zwischenspeicher nicht nutzbar ({e}) – lade ins Arbeitsverzeichnis", file=sys.stderr, flush=True)
-        m, p = _laden(tempfile.mkdtemp(prefix="whisper_", dir=os.environ.get("TMPDIR", "/tmp")), dt)
+    # 31.10.: Volume voll ("Disk quota exceeded"). Whisper liegt aber schon fertig auf dem Volume
+    # (hf_cache/models--openai--whisper-large-v3-turbo) -> zuerst NUR LESEN, ohne etwas zu schreiben.
+    m = p = None
+    for cache in ("/runpod-volume/hf_cache", None, CACHE):
+        try:
+            m, p = _laden(cache, dt, nur_lokal=True)
+            print(f"[Stems-Text] Whisper aus vorhandenem Speicher: {cache}", file=sys.stderr, flush=True)
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    if m is None:
+        # sonst ins Arbeitsverzeichnis des Workers laden – auch den Xet-Zwischenspeicher dorthin (nicht aufs volle Volume)
+        tmp = tempfile.mkdtemp(prefix="whisper_", dir=os.environ.get("TMPDIR", "/tmp"))
+        m, p = _laden(tmp, dt)
     m = m.to(dev)
     return pipeline("automatic-speech-recognition", model=m, tokenizer=p.tokenizer, feature_extractor=p.feature_extractor,
                     torch_dtype=dt, device=dev, chunk_length_s=30, batch_size=8)
