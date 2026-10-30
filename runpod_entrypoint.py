@@ -3992,6 +3992,7 @@ def _hieltech_stems_neu_sync(src_bytes, filename, caption, instrumente, seeds, l
         out = os.path.join(work, "ergebnis")
         roh = os.path.join(out, "_getrennt")
         os.makedirs(roh, exist_ok=True)
+        hilfe_dir = os.path.join(work, "hilfe53")
 
         # 1) Vorlagen: 53er-Trennung (alle anderen Instrumente in EINEM Aufruf)
         refs = {}
@@ -4000,6 +4001,15 @@ def _hieltech_stems_neu_sync(src_bytes, filename, caption, instrumente, seeds, l
             args = [os.path.join(_HIELTECH_PROJECT_ROOT, "stems53_ref_step.py"), song]
             for i in andere:
                 args += [os.path.join(roh, f"{i}.wav"), i]
+            # Hilfs-Vorlagen (z. B. Percussion braucht kick/snare/hh/toms zum Sortieren) – nicht ausgeliefert
+            hilfe = []
+            for i in andere:
+                for h in getattr(rz, "HILFS_VORLAGEN", {}).get(rz.REZEPTE[i]["rezept"], ()):
+                    if h not in andere and h not in hilfe:
+                        hilfe.append(h)
+            os.makedirs(hilfe_dir, exist_ok=True)
+            for h in hilfe:
+                args += [os.path.join(hilfe_dir, f"{h}.wav"), h]
             ok, output = _hieltech_run_step(args, timeout=3600)
             for line in reversed(output.splitlines()):
                 if line.strip().startswith("{") and '"instrumente"' in line:
@@ -4080,7 +4090,7 @@ def _hieltech_stems_neu_sync(src_bytes, filename, caption, instrumente, seeds, l
             with open(cj, "w") as f:
                 json.dump(pf, f)
             ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_neu_step.py"), i, refs[i], cj,
-                                             os.path.join(out, r0["familie"])], timeout=1800)
+                                             os.path.join(out, r0["familie"]), hilfe_dir, roh], timeout=1800)
             for line in reversed(output.splitlines()):
                 if line.strip().startswith("{") and '"instrument"' in line:
                     try:

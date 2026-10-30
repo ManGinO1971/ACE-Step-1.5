@@ -17,6 +17,8 @@ Felder:
               melodie      – einstimmig: Karte (B) UND Grundton+Obertöne neu (C) zum Vergleich (TEST)
               perkussion   – kurze Maske + Gate + Karte, Anschläge bleiben (TEST)
               gesang       – vorerst Karte; Gesangskette (Lead V2 ohne .pth) folgt
+              perkussion_satz – Djembe/Percussion zusammen: entrauschen, Fremdes raus, Kick/Toms schlagweise raus
+                             (an_schlagzeug/), Hi-Hat raus (fertig, Hörtest 30.10.)
               blaeser_satz – Bläser zusammen: entrauschen, Ausklang bis zum Ende, Lücken füllen, Raum-Hall (fertig, Hörtest 29.10.)
                              + Unterordner teile/ nach Stimmlage: hoch (Trompete) / mitte (Sax) / tief (Posaune) (Hörtest: B besser)
   ton       (fmin, fmax) Hz – nur für "melodie"/"bass": Tonbereich für die Tonhöhen-Erkennung
@@ -79,7 +81,9 @@ REZEPTE = {
     "viola":         dict(familie="Streicher", spur="strings", text="viola", rezept="melodie", ton=(125, 1100), status="test"),
     "cello":         dict(familie="Streicher", spur="strings", text="cello", rezept="melodie", ton=(60, 800), status="test"),
     # ---------------- Percussion ----------------
-    "percussion":   dict(familie="Percussion", spur="percussion", text="hand percussion, djembe, african drums", rezept="perkussion", status="test"),
+    # Hörtest 30.10.: Stand = 9_percussion_ohne_hihat – entrauschen, Fremdes raus (Vorlage-Wegweiser),
+    # Kick/Toms Schlag für Schlag raus (-> an_schlagzeug/), Hi-Hat raus (53er-hh + nach Klang). KEIN Isolieren danach.
+    "percussion":   dict(familie="Percussion", spur="percussion", text="hand percussion, djembe, african drums", rezept="perkussion_satz", status="fertig"),
     "congas":       dict(familie="Percussion", spur="percussion", text="congas and djembe hand drums", rezept="perkussion", status="test"),
     "tambourine":   dict(familie="Percussion", spur="percussion", text="tambourine", rezept="perkussion", status="test"),
     "triangle":     dict(familie="Percussion", spur="percussion", text="triangle", rezept="perkussion", status="test"),
@@ -98,6 +102,10 @@ MASKE = {
     "melodie": (-50.0, -60.0, 0.40, 0.05),     # Bläser/Streicher: Ausklang/Raum nicht abschneiden
     "perkussion": (-50.0, -62.0, 0.50, 0.04),  # Djembe/Congas: Bass-Ton klingt nach
 }
+
+
+# Zusätzliche 53er-Vorlagen, die ein Rezept braucht (werden mitgetrennt, aber nicht ausgeliefert)
+HILFS_VORLAGEN = {"perkussion_satz": ("congas", "percussion", "kick", "snare", "hh", "toms")}
 
 
 def rezept(name):

@@ -35,6 +35,7 @@ TONHAFT = {"bass", "karte", "melodie", "gesang"}
 
 def main():
     inst, ref_path, cand_json, out = sys.argv[1:5]
+    hilfe = sys.argv[5:]   # Ordner mit weiteren 53er-Vorlagen (für Percussion: congas, percussion, kick, snare, hh, toms)
     os.makedirs(out, exist_ok=True)
     r = rezept(inst)
     art = r["rezept"]
@@ -54,7 +55,41 @@ def main():
         if best is None:
             raise RuntimeError("keine neu erzeugte Fassung")
         sf.write(os.path.join(out, f"{inst}_A_roh.wav"), k.schutz(best), SR, subtype="PCM_24")
-        if art == "blaeser_satz":
+        if art == "perkussion_satz":
+            # Hörtest 30.10.: Stand = 9_percussion_ohne_hihat (Isolieren danach klang NICHT besser -> nicht drin)
+            def vorlage(name):
+                for d in hilfe + [os.path.dirname(ref_path)]:
+                    for ext in (".wav", ".flac"):
+                        q = os.path.join(d, name + ext)
+                        if os.path.isfile(q):
+                            return fit(load(q), n)
+                return None
+            from percussion_zusammen import verarbeite as perc_verarbeite
+            from perkussion_sortieren import sortieren
+            from hihat_raus import hihat_raus, hihat_raus_klang
+            cg, pc = vorlage("congas"), vorlage("percussion")
+            R_all = (cg if cg is not None else 0) + (pc if pc is not None else 0)
+            if not isinstance(R_all, np.ndarray):
+                R_all = ref
+            R_cong = cg if cg is not None else R_all
+            satz, _trom = perc_verarbeite(best.astype(np.float64), R_all.astype(np.float64), R_cong.astype(np.float64), SR, False)
+            satz = satz.astype(np.float32)
+            refs = {"congas": R_cong, "percussion": pc if pc is not None else R_all,
+                    "kick": vorlage("kick"), "toms": vorlage("toms"), "snare": vorlage("snare")}
+            if all(v is not None for v in refs.values()):
+                satz, spuren, liste = sortieren(satz, {k: v.astype(np.float32) for k, v in refs.items()})
+                info["schlagzeug_schlaege_raus"] = len(liste)
+                os.makedirs(os.path.join(out, "an_schlagzeug"), exist_ok=True)
+                for k_, v_ in spuren.items():
+                    sf.write(os.path.join(out, "an_schlagzeug", f"{k_}.wav"), v_, SR, subtype="PCM_24")
+            else:
+                info["sortieren_fehlt"] = [k_ for k_, v_ in refs.items() if v_ is None]
+            hh = vorlage("hh")
+            if hh is not None:
+                satz = hihat_raus(satz, SR, R_all.astype(np.float32), hh.astype(np.float32), 2.0)
+            satz = hihat_raus_klang(satz, SR)
+            sf.write(os.path.join(out, f"{inst}.wav"), k.schutz(satz), SR, subtype="PCM_24")
+        elif art == "blaeser_satz":
             # Hörtest 29.10.: 4_brass_NEU_hall gewählt – aus der UNMASKIERTEN Fassung (ganzer Ausklang)
             from blaeser_zusammen import verarbeite
             from blaeser_trennen import satz_und_teile
