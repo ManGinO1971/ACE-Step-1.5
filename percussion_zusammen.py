@@ -102,7 +102,7 @@ if __name__ == "__main__":
             sf.write(os.path.join(outdir, "teile", "klein_percussion.wav"), (satz - trom) / p, sr, subtype="PCM_24")
 
 
-RESONANZ_S = float(os.environ.get("HIELTECH_PERC_RESONANZ_S", "0.35"))
+RESONANZ_S = float(os.environ.get("HIELTECH_PERC_RESONANZ_S", "0.5"))   # Hörtest 30.10.: 0,5 s gewählt
 
 
 def resonanz(x, sr, t60=RESONANZ_S):
