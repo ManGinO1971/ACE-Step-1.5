@@ -22,7 +22,8 @@ import soundfile as sf
 # Xet-Zwischenspeicher liegt sonst auf dem (vollen) Volume – vor dem ersten huggingface-Import abschalten
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3-turbo")   # 1,6 GB statt 3 GB, fast gleich genau
+# 31.10. TEST: großes Modell (liegt schon fertig auf dem Volume, 3,1 GB) – Turbo hörte nur ~57 % der Wörter richtig
+MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3")
 CACHE = os.environ.get("HIELTECH_WHISPER_CACHE") or ("/runpod-volume/hf_whisper" if os.path.isdir("/runpod-volume") else None)
 SR16 = 16000
 
@@ -192,7 +193,7 @@ def mitschreiben(asr, y):
     for (a, b), r in zip(ph, res):
         txt = aufraeumen(r.get("text") or "")
         klein = txt.lower().strip(" .!?,")
-        if not txt or any(klein == f.strip(" .") or klein.startswith(f.strip(" .")) for f in ERFUNDEN):
+        if not txt or any(klein == f.strip(" .") or (len(f.strip(" .")) > 6 and f.strip(" .") in klein) for f in ERFUNDEN):
             continue
         if len(txt.split()) > 6 * (b - a) + 3:          # unmöglich viele Wörter -> Wiederholungsschleife
             continue
