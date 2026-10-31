@@ -85,29 +85,76 @@ def erkenner():
                     torch_dtype=dt, device=dev, chunk_length_s=30, batch_size=8)
 
 
+# Typische von Whisper "erfundene" Sätze (aus YouTube-Untertiteln gelernt) – nie Songtext
+ERFUNDEN = ("we'll be right back", "see you next time", "thanks for watching", "thank you for watching",
+            "subscribe", "like and subscribe", "please subscribe", "thank you.", "bye.", "you.")
+
+
+def phrasen(y, rahmen=0.05, abstand_db=30.0, luecke=0.6, min_s=0.4, max_s=12.0):
+    """31.10.: Gesangs-Phrasen nach Lautstärke finden (Pausen = neue Zeile). Lange Phrasen an der leisesten
+    Stelle teilen. Ergebnis: Liste (start_s, ende_s)."""
+    h = int(rahmen * SR16)
+    n = len(y) // h
+    if n < 2:
+        return []
+    e = 20 * np.log10(np.sqrt((y[:n * h].reshape(n, h) ** 2).mean(1)) + 1e-9)
+    e = np.convolve(e, np.ones(3) / 3, mode="same")
+    an = e > e.max() - abstand_db
+    stuecke, i = [], 0
+    while i < n:
+        if an[i]:
+            j = i
+            while j < n and an[j]:
+                j += 1
+            stuecke.append([i, j])
+            i = j
+        else:
+            i += 1
+    zus = []
+    for s in stuecke:                                   # kurze Pausen überbrücken
+        if zus and (s[0] - zus[-1][1]) * rahmen < luecke:
+            zus[-1][1] = s[1]
+        else:
+            zus.append(s)
+    fertig = []
+
+    def teilen(a, b):
+        if (b - a) * rahmen <= max_s:
+            fertig.append((a, b))
+            return
+        lo, hi = a + int(3 / rahmen), b - int(3 / rahmen)
+        m = lo + int(np.argmin(e[lo:hi])) if hi > lo else (a + b) // 2
+        teilen(a, m)
+        teilen(m, b)
+    for a, b in zus:
+        if (b - a) * rahmen >= min_s:
+            teilen(a, b)
+    return [(max(0.0, a * rahmen - 0.15), min(len(y) / SR16, b * rahmen + 0.15)) for a, b in fertig]
+
+
 def mitschreiben(asr, y):
     if len(y) < SR16 or float(np.abs(y).max()) < 1e-4:
         return []
     y = (y / max(float(np.abs(y).max()), 1e-6) * 0.9).astype(np.float32)
-    res = asr({"raw": y, "sampling_rate": SR16}, return_timestamps=True, generate_kwargs={"task": "transcribe"})
-    pegel_max = 20 * np.log10(np.sqrt(np.convolve(y ** 2, np.ones(SR16 // 2) / (SR16 // 2), mode="same")).max() + 1e-9)
+    # 31.10.: Erster Lauf gab ab Zeile 8 alles in EINEM Block (Zeitstempel verloren) + erfundene Sätze.
+    # Jetzt: jede Gesangs-Phrase EINZELN erkennen -> eine Zeile je Phrase, Stille wird gar nicht erst gehört.
+    ph = phrasen(y)
+    if not ph:
+        return []
+    eingaben = [{"raw": y[int(a * SR16):int(b * SR16)], "sampling_rate": SR16} for a, b in ph]
+    res = asr(eingaben, generate_kwargs={"task": "transcribe"})
     out, letzte = [], ""
-    for c in res.get("chunks", []):
-        t0, t1 = c.get("timestamp", (None, None))
-        txt = (c.get("text") or "").strip()
-        if not txt or t0 is None:
+    for (a, b), r in zip(ph, res):
+        txt = (r.get("text") or "").strip()
+        klein = txt.lower().strip(" .!?,")
+        if not txt or any(klein == f.strip(" .") or klein.startswith(f.strip(" .")) for f in ERFUNDEN):
             continue
-        t1 = t1 if t1 is not None else t0 + 2.0
-        seg = y[int(t0 * SR16):int(t1 * SR16)]
-        if len(seg) < SR16 // 10:
+        if len(txt.split()) > 6 * (b - a) + 3:          # unmöglich viele Wörter -> Wiederholungsschleife
             continue
-        pegel = 20 * np.log10(np.sqrt((seg ** 2).mean()) + 1e-9)
-        if pegel < pegel_max - 35:          # praktisch still -> erfundener Text
-            continue
-        if txt == letzte:                   # Whisper-Wiederholungsschleife
+        if txt == letzte:
             continue
         letzte = txt
-        out.append({"start": round(float(t0), 2), "end": round(float(t1), 2), "text": txt})
+        out.append({"start": round(a, 2), "end": round(b, 2), "text": txt})
     return out
 
 
