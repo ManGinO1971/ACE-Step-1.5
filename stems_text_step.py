@@ -22,8 +22,8 @@ import soundfile as sf
 # Xet-Zwischenspeicher liegt sonst auf dem (vollen) Volume – vor dem ersten huggingface-Import abschalten
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-# 31.10. TEST: großes Modell (liegt schon fertig auf dem Volume, 3,1 GB) – Turbo hörte nur ~57 % der Wörter richtig
-MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3")
+# 31.10. Test: großes Modell 58 % Wörter richtig in 230 s, Turbo 57 % in ~65-135 s -> Turbo bleibt (schneller, kaum schlechter)
+MODELL = os.environ.get("HIELTECH_WHISPER_MODELL", "openai/whisper-large-v3-turbo")
 CACHE = os.environ.get("HIELTECH_WHISPER_CACHE") or ("/runpod-volume/hf_whisper" if os.path.isdir("/runpod-volume") else None)
 SR16 = 16000
 
