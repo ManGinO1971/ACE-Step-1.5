@@ -4283,11 +4283,12 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
     """31.10. (Nutzer: "genau 1:1 wie beim Musik-Generator, alle Nachjustierungen"):
        Lead       = Vocals V2 wie im Generator (attemptVocalsV2): Extract mit Tempo/Tonart/Länge des Songs,
                     2 Varianten, dann _hieltech_lead_v2_post_sync mit Melodie-Lock (Höhen), Melodie folgen (Tiefen),
-                    Text-Maske – unverändert dieselbe Funktion. Danach Lautheit wie Original-Lead.
+                    Text-Maske – unverändert dieselbe Funktion. Lautheit danach auf dem Server wie im Generator.
        Background = Background-Chor wie im Generator (attemptBackingChor): _hieltech_backing_chor_sync unverändert –
                     Mischung 8 -> Hall/Rauschen raus -> Seed-VC (Oktav-Sperre, Stabil, Ton-Halt 0.3, Lage je Stimme)
                     -> Gate -> RMVPE -> f0_halt_vib (Mann 0.3/1.0, Frau 1 0.3/1.4 Vibrato) -> Vocoder C mit
-                    Melodie folgen. 1 Mann + 2 Frauen, Humanizer wie Schalter. Danach Lautheit wie Original-Background."""
+                    Melodie folgen. 1 Mann + 2 Frauen, Humanizer wie Schalter. Lautheit auf dem Server (−6 dB) wie im Generator.
+       Einziger Unterschied zum Generator: kein .pth (RVC) – die Stems-App hat keins."""
     import importlib
     sys.path.insert(0, _HIELTECH_PROJECT_ROOT)
     sc = importlib.import_module("stems_schrift")
@@ -4316,15 +4317,8 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
             tt["bpm"], tt["bpm_quelle"] = int(fest_bpm), "vorgegeben"
         if fest_key and re.match(r"^[A-G][#b]? (major|minor)$", fest_key.strip()):
             tt["key_scale"], tt["tonart_quelle"] = fest_key.strip(), "vorgegeben"
-        seed = int(fest_seed) if str(fest_seed).strip().isdigit() else 318694975
-        bericht["takt_tonart"] = dict(tt, seed=seed)
-
-        def lautheit(neu, original, label, versatz=0.0):
-            aus = os.path.join(work, f"laut_{label}.wav")
-            ok_l, log_l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_lautheit.py"), neu, original, aus, str(versatz)], timeout=600)
-            info = _hieltech_last_json_line(log_l) or {}
-            bericht.setdefault("lautheit", {})[label] = info
-            return aus if ok_l and os.path.isfile(aus) else neu
+        seed = int(fest_seed) if str(fest_seed).strip().isdigit() else None
+        bericht["takt_tonart"] = dict(tt, seed=seed if seed is not None else "zufällig")
 
         def ablegen(pfad, datei):
             conv, fext = _hieltech_wav_to_flac_file(pfad)
@@ -4346,12 +4340,13 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                 bericht["zeiten"]["trennung"] = round(time.time() - t1, 1)
                 src = os.path.join(work, "src_lead.wav")
                 shutil.copyfile(hp["song"], src)
-                vl = "ar" if (sprache == "ary" and re.search(r"[\u0600-\u06FF]", lyrics or "")) else "unknown"
                 payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": "vocals", "src_audio_path": src,
                            "prompt": _hieltech_stems_lead_prompt(caption), "lyrics": lead_txt, "batch_size": 2,
-                           "seed": seed, "use_random_seed": False, "inference_steps": 50, "guidance_scale": 7.0,
-                           "thinking": False, "use_cot_caption": False, "use_cot_language": False, "vocal_language": vl,
+                           "inference_steps": 50, "guidance_scale": 7.0,
+                           "thinking": False, "use_cot_caption": False, "use_cot_language": False, "vocal_language": "unknown",
                            "allow_lm_batch": False, "constrained_decoding": False, "audio_format": "flac"}
+                if seed is not None:
+                    payload["seed"], payload["use_random_seed"] = seed, False
                 if tt.get("dauer"):
                     payload["audio_duration"] = tt["dauer"]
                 if tt.get("bpm"):
@@ -4359,12 +4354,13 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                 if tt.get("key_scale"):
                     payload["key_scale"] = tt["key_scale"]
                 varianten = [_hieltech_handoff_store(p_, "flac")[0] for p_ in _hieltech_release_and_wait_all(payload)]
+                braucht_umschrift = bool(re.search(r"[\u0600-\u06FF]|[A-Za-z][2356789]|[2356789][A-Za-z]", lead_txt))
                 post = _hieltech_lead_v2_post_sync(None, "", "", hp["lead"], hp["backing"], "", json.dumps(varianten),
-                                                   sc.fuer_abgleich(lead_txt))
+                                                   sc.fuer_abgleich(lead_txt) if braucht_umschrift else lead_txt)
                 if not post.get("ok"):
                     raise RuntimeError(str(post.get("message") or post.get("error")))
                 fertig = os.path.join(_HIELTECH_HANDOFF_DIR, f"{post['result_token']}.{post.get('audio_ext', 'flac')}")
-                ablegen(lautheit(fertig, hp["lead"], "lead"), "Gesang/lead-vocal")
+                ablegen(fertig, "Gesang/lead-vocal")
                 scores = (post.get("pick") or {}).get("scores") or []
                 for v in scores:
                     v.pop("segments", None)
@@ -4377,17 +4373,13 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
         if "backing" in teile:
             t1 = time.time()
             try:
-                chor = _hieltech_backing_chor_sync(src_bytes, filename, tt.get("key_scale") or "", "", humanize)
+                chor = _hieltech_backing_chor_sync(src_bytes, filename, tt.get("key_scale") if tt.get("tonart_quelle") else "", "", humanize)
                 if not chor.get("ok"):
                     raise RuntimeError(str(chor.get("message") or chor.get("error")) + " " + str(chor.get("log") or "")[-300:])
                 bericht["backing"] = {"schritte": chor.get("steps_applied"), "warnungen": chor.get("warnings"), "tonart": chor.get("tonart")}
-                # Original-Background als Lautheits-Gegenstück (Karaoke-Trennung aus Schritt 1, sonst ohne Angleichung)
-                bref = os.path.join(work, "prep", "backing_ref.wav")
                 namen = {"mann": "1_mann", "frau2": "2_frau", "frau1": "3_frau"}
                 for v in chor.get("voices") or []:
                     pfad = os.path.join(_HIELTECH_HANDOFF_DIR, f"{v['result_token']}.{v.get('audio_ext', 'flac')}")
-                    if os.path.isfile(bref):
-                        pfad = lautheit(pfad, bref, f"backing_{v['slot']}")
                     ablegen(pfad, f"Gesang/background/backing_{namen.get(v.get('role'), str(v['slot']))}")
             except Exception as e:  # noqa: BLE001
                 bericht["warnungen"].append(f"Background: {e}"[:500])
