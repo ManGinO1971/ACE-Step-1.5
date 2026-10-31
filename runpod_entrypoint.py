@@ -4279,7 +4279,7 @@ def _hieltech_release_and_wait_all(payload, timeout_s=1800):
     raise RuntimeError("Erzeugung dauert zu lange")
 
 
-def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile, humanize="0", fest_seed="", fest_bpm="", fest_key=""):
+def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile, humanize="0", fest_seed="", fest_bpm="", fest_key="", zwischen="0"):
     """31.10. (Nutzer: "genau 1:1 wie beim Musik-Generator, alle Nachjustierungen"):
        Lead       = Vocals V2 wie im Generator (attemptVocalsV2): Extract mit Tempo/Tonart/Länge des Songs,
                     2 Varianten, dann _hieltech_lead_v2_post_sync mit Melodie-Lock (Höhen), Melodie folgen (Tiefen),
@@ -4366,6 +4366,45 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                 fertig = os.path.join(_HIELTECH_HANDOFF_DIR, f"{post['result_token']}.{post.get('audio_ext', 'flac')}")
                 ablegen(lautheit(fertig, hp["lead"], "lead"), "Gesang/lead-vocal")
                 scores = (post.get("pick") or {}).get("scores") or []
+                if str(zwischen) == "1":
+                    # 31.10. Feinjustierung OHNE GPU (wie 21.10. beim Generator): Zwischenstufen mitliefern –
+                    # dieselben Schritte wie _hieltech_lead_v2_post_sync bis VOR den Vocoder, nichts verändert.
+                    try:
+                        zw = os.path.join(work, "zwischen")
+                        os.makedirs(zw, exist_ok=True)
+                        wahl = (post.get("pick") or {}).get("chosen")
+                        wahl = wahl if isinstance(wahl, int) and 0 <= wahl < len(varianten) else 0
+                        roh = os.path.join(zw, "variante.wav")
+                        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", varianten[wahl], roh], timeout=300)
+                        for i_, v_ in enumerate(varianten):
+                            ablegen(v_, f"Zwischen/variante_{i_ + 1}_roh")
+                        cur = roh
+                        masked = os.path.join(zw, "masked.wav")
+                        args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), cur, os.path.realpath(hp["lead"]), masked,
+                                os.path.realpath(hp["backing"])]
+                        segs = next((sc_.get("segments") for sc_ in scores if sc_.get("variant") == wahl), None)
+                        if segs:
+                            kf = os.path.join(zw, "lead_lines.json")
+                            with open(kf, "w", encoding="utf-8") as f:
+                                json.dump(segs, f)
+                            args.append(kf)
+                        ok_m, _l = _hieltech_run_step(args, timeout=600)
+                        cur = masked if ok_m and os.path.isfile(masked) else cur
+                        gated = os.path.join(zw, "gated.wav")
+                        ok_g, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", cur, "--output", gated], timeout=300)
+                        cur = gated if ok_g and os.path.isfile(gated) else cur
+                        ablegen(cur, "Zwischen/vor_vocoder")
+                        ablegen(hp["lead"], "Zwischen/lead_original")
+                        for quelle, name in ((cur, "f0_neu"), (os.path.realpath(hp["lead"]), "f0_lead_original")):
+                            fz = os.path.join(zw, f"{name}.npy")
+                            ok_f, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), quelle, fz],
+                                                          timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+                            if ok_f and os.path.isfile(fz):
+                                hz, tz = _hieltech_handoff_store(fz, "npy")
+                                results.append({"datei": f"Zwischen/{name}.npy", "result_token": tz, "size_bytes": os.path.getsize(hz)})
+                        bericht["zwischen"] = {"gewaehlt": wahl + 1, "maske": bool(ok_m), "gate": bool(ok_g)}
+                    except Exception as e:  # noqa: BLE001
+                        bericht["warnungen"].append(f"Zwischenstufen: {e}"[:300])
                 for v in scores:
                     v.pop("segments", None)
                 bericht["lead"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings"), "auswahl": scores}
@@ -4405,14 +4444,15 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
 async def _hieltech_stems_gesang_start(audio: UploadFile, lyrics: str = Form(default=""), caption: str = Form(default=""),
                                        sprache: str = Form(default="auto"), teile: str = Form(default="lead,backing"),
                                        humanize: str = Form(default="0"), seed: str = Form(default=""),
-                                       bpm: str = Form(default=""), key_scale: str = Form(default="")):
+                                       bpm: str = Form(default=""), key_scale: str = Form(default=""),
+                                       zwischen: str = Form(default="0")):
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_gesang_sync, src_bytes, audio.filename, lyrics[:8000],
                                caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40], (humanize or "0")[:5],
-                               (seed or "")[:12], (bpm or "")[:4], (key_scale or "")[:12])
+                               (seed or "")[:12], (bpm or "")[:4], (key_scale or "")[:12], (zwischen or "0")[:2])
 
 
 # HIELTECH (31. Okt 2026): Belegung des Netz-Volumes anzeigen (nur LESEN, löscht nichts) – "Disk quota exceeded".
