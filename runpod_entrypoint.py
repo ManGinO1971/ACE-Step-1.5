@@ -4180,7 +4180,7 @@ async def _hieltech_stems53_start(audio: UploadFile, instrumente: str = Form(def
 # HIELTECH Stems (30. Okt 2026): Songtext automatisch mitschreiben – Song -> Gesang trennen (wie Lead V2:
 # lead_v2_prepare_step.py) -> Whisper large-v3 auf Lead- und Background-Spur -> Text mit ( … ) für Background.
 # Der Text wird in der App angezeigt und kann korrigiert werden, danach "Gesang neu erzeugen".
-def _hieltech_stems_text_sync(src_bytes, filename):
+def _hieltech_stems_text_sync(src_bytes, filename, sprache="auto"):
     work = tempfile.mkdtemp(prefix="hieltech_stems_text_")
     try:
         ext = os.path.splitext(filename or "")[1].lower()
@@ -4195,24 +4195,214 @@ def _hieltech_stems_text_sync(src_bytes, filename):
         if not os.path.isfile(lead):
             return {"ok": False, "error": "trennung_fehlgeschlagen", "message": log[-800:]}
         js = os.path.join(work, "text.json")
-        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_text_step.py"), lead, back, js], timeout=1800)
+        sprache = sprache if sprache in ("auto", "jam", "ary", "ary_latin") else "auto"
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_text_step.py"), lead, back, js, sprache], timeout=1800)
         if not os.path.isfile(js):
             return {"ok": False, "error": "mitschreiben_fehlgeschlagen", "message": log[-800:]}
         with open(js, encoding="utf-8") as f:
             res = json.load(f)
         return {"ok": True, "lyrics": res.get("lyrics", ""), "lead": res.get("lead", []), "backing": res.get("backing", []),
-                "modell": res.get("modell")}
+                "modell": res.get("modell"), "sprache": res.get("sprache"), "auswahl": res.get("auswahl")}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 @app.post("/v1/hieltech_stems_text_start")
-async def _hieltech_stems_text_start(audio: UploadFile):
+async def _hieltech_stems_text_start(audio: UploadFile, sprache: str = Form(default="auto")):
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
     src_bytes = await audio.read()
-    return _hieltech_job_start("lora_test", _hieltech_stems_text_sync, src_bytes, audio.filename)
+    return _hieltech_job_start("lora_test", _hieltech_stems_text_sync, src_bytes, audio.filename, (sprache or "auto")[:20])
+
+
+# ===================================================================================================
+# HIELTECH Stems – GESANG NEU (31. Okt 2026): Lead V2 + Background V2 aus dem Musik-Generator, OHNE .pth,
+# mit dem vom Nutzer BESTÄTIGTEN Songtext (eingefügt oder automatisch erkannt + korrigiert).
+#   1. lead_v2_prepare_step.py: Gesang trennen -> Song ohne Background, Lead-/Background-Vorlage
+#   2. Lead: Extract (Base-Modell, Spur vocals, 2 Varianten) aus dem Song ohne Background, nur Lead-Text
+#      -> _hieltech_lead_v2_post_sync (beste Variante, Zeitmaske, Gate, RMVPE, Vocoder C, Melodie-Lock)
+#   3. Background: saubere Vorlage (_hieltech_backing_v2_clean_sync) -> Extract (Spur vocals, wie Test 5)
+#      -> _hieltech_backing_v2_post_sync, EINE Stimme in Originallage (kein Transponieren)
+# Sprache/Schrift: gesungen wird der Text GENAU wie geschrieben (Patois, Arabizi, arabische Schrift …).
+# Nur für den Text-Abgleich (Variantenwahl, Zeitmaske) wird er in A–Z umgeschrieben (stems_schrift.py).
+# ===================================================================================================
+_HIELTECH_LEAD_SUFFIX = ("a cappella vocals only, solo {G}lead vocal, no backing vocals, no harmonies, no instruments, no music, "
+                         "dry close-mic studio vocal recording, clear strong voice, full chest voice, clean studio vocal")
+
+
+def _hieltech_stems_lead_prompt(caption):
+    p = str(caption or "")
+    female = bool(re.search(r"female lead vocalist|woman singing|female vocalist|female singer", p, re.I))
+    male = not female and bool(re.search(r"male lead vocalist|man singing|male vocalist|male singer", p, re.I))
+    drop = re.compile(r"(backing|background|harmon|choir|call and response|answering|echo|reverb|spacious|drum|bass(?!o)|guitar|skank|organ|"
+                      r"riddim|shaker|horn|piano|keys|synth|band|console|tube|mix|one-drop|rimshot|percussion|bpm|key of|\bminor\b|\bmajor\b|solo vocalist only)", re.I)
+    other = re.compile(r"(\bmale\b|\bman\b|baritone)", re.I) if female else (re.compile(r"(female|woman|soprano)", re.I) if male else None)
+    kept = []
+    for x in (y.strip() for y in p.split(",")):
+        if x and not drop.search(x) and not (other and other.search(x)) and x not in kept:
+            kept.append(x)
+    suffix = _HIELTECH_LEAD_SUFFIX.replace("{G}", "female " if female else ("male " if male else ""))
+    return f"{', '.join(kept)}, {suffix}" if kept else suffix
+
+
+def _hieltech_stems_backing_prompt(caption):
+    p = str(caption or "")
+    mixed = bool(re.search(r"mixed male and female (background|backing|harmon)", p, re.I))
+    female = not mixed and bool(re.search(r"female[^,]*(background|backing|harmon)", p, re.I))
+    male = not mixed and not female and bool(re.search(r"\bmale[^,]*(background|backing|harmon)", p, re.I))
+    stimme = re.compile(r"\b(male|female|man|woman|men|women|boy|girl|vocal|vocals|voice|voices|singer|singing|choir|harmon|backing|background|duet|rap)", re.I)
+    drop = re.compile(r"(drum|bass(?!o)|guitar|skank|organ|riddim|shaker|horn|piano|keys|synth|band|console|tube|mix|one-drop|rimshot|percussion|"
+                      r"bpm|key of|\bminor\b|\bmajor\b|echo|reverb|spacious|baritone|tenor|soprano|alto)", re.I)
+    kept = []
+    for x in (y.strip() for y in p.split(",")):
+        if x and not stimme.search(x) and not drop.search(x) and x not in kept:
+            kept.append(x)
+    singer = "female vocalist, woman singing" if (mixed or female) else ("male vocalist, man singing" if male else "vocalist")
+    suffix = (f"{singer}, soft clear backing singer voice, a cappella vocals only, solo vocal, no instruments, no music, "
+              "dry close-mic studio vocal recording, clear pronunciation, clean studio vocal")
+    return f"{', '.join(kept)}, {suffix}" if kept else suffix
+
+
+def _hieltech_release_and_wait_all(payload, timeout_s=1800):
+    """Wie _hieltech_release_and_wait, aber ALLE Varianten (batch_size > 1) – Liste von Dateipfaden."""
+    import urllib.parse
+    st, body = _hieltech_lora_local("POST", "/release_task", payload)
+    data, err = _hieltech_lora_data(body)
+    tid = (data or {}).get("task_id")
+    if not tid:
+        raise RuntimeError(f"release_task: HTTP {st} {err or body}")
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        time.sleep(3)
+        st, body = _hieltech_lora_local("POST", "/query_result", {"task_id_list": [tid]})
+        items = (body or {}).get("data") or []
+        it = items[0] if items else {}
+        if it.get("status") == 1:
+            res = json.loads(it.get("result") or "[]")
+            res = res if isinstance(res, list) else [res]
+            pfade = []
+            for r in res:
+                q = urllib.parse.urlparse((r or {}).get("file") or "")
+                path = urllib.parse.parse_qs(q.query).get("path", [""])[0]
+                if path and os.path.isfile(path):
+                    pfade.append(path)
+            if not pfade:
+                raise RuntimeError("keine Audiodatei im Ergebnis")
+            dit = (res[0] or {}).get("dit_model")
+            if dit and dit != "acestep-v15-base":
+                raise RuntimeError(f"Base-Modell nicht aktiv (lief mit {dit})")
+            return pfade
+        if it.get("status") == 2:
+            raise RuntimeError(f"Erzeugung fehlgeschlagen: {str(it.get('result') or '')[:300]}")
+    raise RuntimeError("Erzeugung dauert zu lange")
+
+
+def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile):
+    import importlib
+    sys.path.insert(0, _HIELTECH_PROJECT_ROOT)
+    sc = importlib.import_module("stems_schrift")
+    work = tempfile.mkdtemp(prefix="hieltech_stems_gesang_")
+    t_ges = time.time()
+    results, bericht = [], {"zeiten": {}, "warnungen": []}
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".mp3"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        teile = {x.strip() for x in (teile or "lead,backing").split(",") if x.strip()} or {"lead", "backing"}
+        lead_txt = sc.lead_text(lyrics)
+        back_txt = sc.backing_text(lyrics)
+        bericht["zeilen"] = {"lead": len([z for z in lead_txt.splitlines() if z.strip() and not z.startswith("[")]),
+                             "backing": len([z for z in back_txt.splitlines() if z.strip() and not z.startswith("[")])}
+        if not lead_txt and not back_txt:
+            return {"ok": False, "error": "kein_text", "message": "Kein Songtext – bitte einfügen oder erkennen lassen und bestätigen."}
+        vl = "ar" if (sprache == "ary" and re.search(r"[\u0600-\u06FF]", lyrics or "")) else "unknown"
+
+        # 1) Vorbereitung (Trennung) – genau wie Vocals V2
+        t1 = time.time()
+        prep = os.path.join(work, "prep")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_prepare_step.py"), song, prep], timeout=2400)
+        bericht["zeiten"]["trennung"] = round(time.time() - t1, 1)
+        hp = {}
+        for key, name in (("song", "song_ohne_background.wav"), ("lead", "lead_ref.wav"), ("backing", "backing_ref.wav")):
+            q = os.path.join(prep, name)
+            if not os.path.isfile(q):
+                return {"ok": False, "error": "trennung_fehlgeschlagen", "message": f"{name} fehlt: " + (log or "")[-600:]}
+            hp[key], _t = _hieltech_handoff_store(q, "wav")
+
+        def neu_singen(label, quelle, prompt, text, spur="vocals"):
+            src = os.path.join(work, f"src_{label}.wav")
+            shutil.copyfile(quelle, src)
+            payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": spur, "src_audio_path": src,
+                       "prompt": prompt, "lyrics": text, "batch_size": 2, "seed": 318694975, "use_random_seed": False,
+                       "inference_steps": 50, "guidance_scale": 7.0, "thinking": False, "use_cot_caption": False,
+                       "use_cot_language": False, "vocal_language": vl, "allow_lm_batch": False,
+                       "constrained_decoding": False, "audio_format": "flac"}
+            pfade = _hieltech_release_and_wait_all(payload)
+            return [_hieltech_handoff_store(p_, "flac")[0] for p_ in pfade]
+
+        # 2) Lead
+        if "lead" in teile and lead_txt:
+            t1 = time.time()
+            try:
+                varianten = neu_singen("lead", hp["song"], _hieltech_stems_lead_prompt(caption), lead_txt)
+                post = _hieltech_lead_v2_post_sync(None, "", "", hp["lead"], hp["backing"], "", json.dumps(varianten),
+                                                   sc.fuer_abgleich(lead_txt))
+                if post.get("ok"):
+                    results.append({"datei": "Gesang/lead-vocal.flac", "result_token": post["result_token"], "size_bytes": post["size_bytes"]})
+                    bericht["lead"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings"),
+                                       "auswahl": (post.get("pick") or {}).get("scores")}
+                    for v in (post.get("pick") or {}).get("scores") or []:
+                        v.pop("segments", None)
+                else:
+                    bericht["warnungen"].append("Lead: " + str(post.get("message") or post.get("error")))
+            except Exception as e:  # noqa: BLE001
+                bericht["warnungen"].append(f"Lead: {e}"[:400])
+            bericht["zeiten"]["lead"] = round(time.time() - t1, 1)
+
+        # 3) Background (eine Stimme, Originallage)
+        if "backing" in teile and back_txt:
+            t1 = time.time()
+            try:
+                clean = _hieltech_backing_v2_clean_sync(hp["lead"], hp["backing"], hp["song"], sc.fuer_abgleich(lyrics))
+                if not clean.get("ok"):
+                    raise RuntimeError(clean.get("message") or clean.get("error"))
+                bericht["background_vorlage"] = clean.get("report")
+                varianten = neu_singen("backing", clean["source_path"], _hieltech_stems_backing_prompt(caption), back_txt)
+                post = _hieltech_backing_v2_post_sync(json.dumps(varianten), sc.fuer_abgleich(back_txt), clean["clean_backing_path"],
+                                                      hp["lead"], json.dumps([{"slot": 1, "model": "", "gender": "male"}]))
+                if post.get("ok") and post.get("voices"):
+                    v = post["voices"][0]
+                    results.append({"datei": "Gesang/back-vocal.flac", "result_token": v["result_token"], "size_bytes": v["size_bytes"]})
+                    bericht["backing"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings")}
+                else:
+                    bericht["warnungen"].append("Background: " + str(post.get("message") or post.get("error")))
+            except Exception as e:  # noqa: BLE001
+                bericht["warnungen"].append(f"Background: {e}"[:400])
+            bericht["zeiten"]["backing"] = round(time.time() - t1, 1)
+        elif "backing" in teile:
+            bericht["warnungen"].append("Background übersprungen: kein (…)/{…}-Text im Songtext")
+
+        bericht["gesamt_sekunden"] = round(time.time() - t_ges, 1)
+        if not results:
+            return {"ok": False, "error": "gesang_fehlgeschlagen", "message": " / ".join(bericht["warnungen"])[:1500], "bericht": bericht}
+        return {"ok": True, "bericht": bericht, "results": results}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_gesang_start")
+async def _hieltech_stems_gesang_start(audio: UploadFile, lyrics: str = Form(default=""), caption: str = Form(default=""),
+                                       sprache: str = Form(default="auto"), teile: str = Form(default="lead,backing")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_gesang_sync, src_bytes, audio.filename, lyrics[:8000],
+                               caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40])
 
 
 # HIELTECH (31. Okt 2026): Belegung des Netz-Volumes anzeigen (nur LESEN, löscht nichts) – "Disk quota exceeded".

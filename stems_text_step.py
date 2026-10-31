@@ -9,7 +9,7 @@ keinen – deshalb hört ein Spracherkennungs-Modell (Whisper large-v3-turbo, MI
 Der Text wird in der App ANGEZEIGT und kann korrigiert werden, bevor neu gesungen wird (Wunsch 30.10.).
 Stellen, an denen die Spur praktisch still ist, werden verworfen (Whisper "erfindet" dort sonst Wörter).
 
-Aufruf: python stems_text_step.py <lead_ref.wav> <backing_ref.wav> <ausgabe.json>
+Aufruf: python stems_text_step.py <lead_ref.wav> <backing_ref.wav> <ausgabe.json> [auto|jam|ary|ary_latin]
 Ausgabe-JSON: {"ok", "lyrics": "<Text mit (…)>", "lead": [{start,end,text}], "backing": [...], "sprache": ...}
 """
 import json
@@ -92,6 +92,16 @@ ERFUNDEN = ("we'll be right back", "see you next time", "thanks for watching", "
 
 
 SPRACHE = None   # wird in main() einmal für den ganzen Song bestimmt
+HINWEIS = ""     # Wortschatz-Hinweis für Whisper (Patois / Darija), siehe main()
+
+# 31.10. (Wunsch: Patois und Darija/Arabizi unterstützen): Whisper bekommt vorab typische Wörter
+# "vorgelesen" – dann schreibt es diese Wörter eher in der richtigen Schreibweise ("inna", "pon", "dem").
+# Es ist nur ein Hinweis: Whisper schreibt trotzdem, was es hört, erfindet dadurch nichts dazu.
+HINWEISE = {
+    "jam": "Jamaican Patois reggae lyrics: mi, yuh, wi, dem, inna, pon, nah, fi, weh, seh, deh, likkle, nuh, "
+           "cyaan, gwaan, bredren, sistren, Jah, Babylon, Zion, I and I, irie, ya so, mek, tek, sinting, unu.",
+    "ary": "كلمات أغنية بالدارجة: واش، بزاف، دابا، غادي، ديال، مزيان، كيفاش، علاش، بغيت، راني، شحال، فين، هادشي، والو، خويا، الحب.",
+}
 
 
 def aufraeumen(t):
@@ -188,6 +198,11 @@ def mitschreiben(asr, y):
     gk = {"task": "transcribe"}
     if SPRACHE:
         gk["language"] = SPRACHE
+    if HINWEIS:
+        try:
+            gk["prompt_ids"] = asr.tokenizer.get_prompt_ids(HINWEIS, return_tensors="pt").to(asr.device)
+        except Exception as e:  # noqa: BLE001
+            print(f"[Stems-Text] Wortschatz-Hinweis nicht nutzbar ({e})", file=sys.stderr, flush=True)
     res = None
     # 31.10.: großes Modell + ACE-Step (17 GB) auf 24-GB-Karte -> "CUDA out of memory" bei 8 gleichzeitig.
     # Jetzt 2 gleichzeitig, bei Speichermangel 1 nach der anderen.
@@ -199,6 +214,12 @@ def mitschreiben(asr, y):
             break
         except Exception as e:  # noqa: BLE001
             if "out of memory" not in str(e).lower():
+                if "prompt_ids" in gk:          # Hinweis macht Probleme -> ohne Hinweis nochmal
+                    print(f"[Stems-Text] mit Wortschatz-Hinweis fehlgeschlagen ({str(e)[:200]}) – ohne", file=sys.stderr, flush=True)
+                    gk.pop("prompt_ids")
+                    frisch = [{"raw": st.copy(), "sampling_rate": SR16} for st in stuecke]
+                    res = list(asr(frisch, generate_kwargs=gk, batch_size=1))
+                    break
                 raise
             import torch
             torch.cuda.empty_cache()
@@ -207,7 +228,10 @@ def mitschreiben(asr, y):
         raise RuntimeError("GPU-Speicher reicht nicht für Whisper")
     out, letzte = [], ""
     for (a, b), r in zip(ph, res):
-        txt = aufraeumen(r.get("text") or "")
+        txt = (r.get("text") or "").strip()
+        if HINWEIS and txt.startswith(HINWEIS[:25]):    # manche Versionen geben den Hinweis mit aus
+            txt = txt[len(HINWEIS):]
+        txt = aufraeumen(txt)
         klein = txt.lower().strip(" .!?,")
         if not txt or any(klein == f.strip(" .") or (len(f.strip(" .")) > 6 and f.strip(" .") in klein) for f in ERFUNDEN):
             continue
@@ -242,12 +266,15 @@ def zusammensetzen(lead, backing):
 
 def main():
     lead_p, back_p, out_p = sys.argv[1:4]
-    global SPRACHE
-    global MODELL
+    # Sprache des Gesangs (App-Auswahl): auto | jam (Patois) | ary (Darija, arabische Schrift) | ary_latin (Darija, Arabizi)
+    wahl = (sys.argv[4] if len(sys.argv) > 4 else "auto").strip().lower()
+    global SPRACHE, MODELL, HINWEIS
+    HINWEIS = HINWEISE.get(wahl.replace("_latin", ""), "")
+    fest = {"jam": "en", "ary": "ar", "ary_latin": "ar"}.get(wahl)
     asr = erkenner()
     y_lead = lade16(lead_p)
     try:
-        SPRACHE = sprache_bestimmen(asr, y_lead)
+        SPRACHE = fest or sprache_bestimmen(asr, y_lead)
         lead = mitschreiben(asr, y_lead)
     except Exception as e:  # noqa: BLE001
         if "Speicher" not in str(e) and "out of memory" not in str(e).lower() or MODELL.endswith("turbo"):
@@ -258,10 +285,14 @@ def main():
         MODELL = "openai/whisper-large-v3-turbo"          # kleiner, passt immer
         print("[Stems-Text] großes Modell passt nicht in den GPU-Speicher – Turbo", file=sys.stderr, flush=True)
         asr = erkenner()
-        SPRACHE = sprache_bestimmen(asr, y_lead)
+        SPRACHE = fest or sprache_bestimmen(asr, y_lead)
         lead = mitschreiben(asr, y_lead)
     backing = mitschreiben(asr, lade16(back_p)) if os.path.isfile(back_p) else []
-    bericht = {"ok": True, "modell": MODELL, "sprache": SPRACHE, "lyrics": zusammensetzen(lead, backing), "lead": lead, "backing": backing}
+    if wahl == "ary_latin":                  # Darija in Arabizi: Whisper schreibt arabisch -> umschreiben (Entwurf)
+        from stems_schrift import arabizi
+        for z in lead + backing:
+            z["text"] = arabizi(z["text"])
+    bericht = {"ok": True, "modell": MODELL, "sprache": SPRACHE, "auswahl": wahl, "lyrics": zusammensetzen(lead, backing), "lead": lead, "backing": backing}
     with open(out_p, "w", encoding="utf-8") as f:
         json.dump(bericht, f, ensure_ascii=False, indent=1)
     print(json.dumps({"ok": True, "zeilen_lead": len(lead), "stellen_backing": len(backing)}, ensure_ascii=False))
