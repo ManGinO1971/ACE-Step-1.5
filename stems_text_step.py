@@ -58,9 +58,28 @@ def erkenner():
         except Exception:  # noqa: BLE001
             continue
     if m is None:
-        # sonst ins Arbeitsverzeichnis des Workers laden – auch den Xet-Zwischenspeicher dorthin (nicht aufs volle Volume)
-        tmp = tempfile.mkdtemp(prefix="whisper_", dir=os.environ.get("TMPDIR", "/tmp"))
-        m, p = _laden(tmp, dt)
+        # 31.10.: Whisper auf dem Volume war unvollständig (Abbruch beim vollen Volume). Volume jetzt 80 GB ->
+        # zuerst AUFS VOLUME laden (bleibt dort, nächstes Mal sofort da). Der Worker-Speicher (/tmp) ist zu
+        # klein ("Disk quota exceeded" auch dort) – nur noch letzter Versuch.
+        fehler = []
+        for ziel in [c for c in (CACHE, "/runpod-volume/hf_cache") if c] + ["tmp"]:
+            try:
+                if ziel == "tmp":
+                    ziel = tempfile.mkdtemp(prefix="whisper_", dir=os.environ.get("TMPDIR", "/tmp"))
+                os.makedirs(ziel, exist_ok=True)
+                m, p = _laden(ziel, dt)
+                print(f"[Stems-Text] Whisper geladen nach: {ziel}", file=sys.stderr, flush=True)
+                break
+            except Exception as e:  # noqa: BLE001
+                frei = ""
+                try:
+                    st = os.statvfs(ziel)
+                    frei = f" (frei {st.f_bavail * st.f_frsize / 1e9:.1f} GB)"
+                except Exception:  # noqa: BLE001
+                    pass
+                fehler.append(f"{ziel}{frei}: {type(e).__name__}: {str(e)[-160:]}")
+        if m is None:
+            raise RuntimeError("Whisper nicht ladbar – " + " | ".join(fehler))
     m = m.to(dev)
     return pipeline("automatic-speech-recognition", model=m, tokenizer=p.tokenizer, feature_extractor=p.feature_extractor,
                     torch_dtype=dt, device=dev, chunk_length_s=30, batch_size=8)
