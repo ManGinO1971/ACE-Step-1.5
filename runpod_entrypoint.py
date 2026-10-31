@@ -4222,8 +4222,7 @@ async def _hieltech_stems_text_start(audio: UploadFile, sprache: str = Form(defa
 #   1. lead_v2_prepare_step.py: Gesang trennen -> Song ohne Background, Lead-/Background-Vorlage
 #   2. Lead: Extract (Base-Modell, Spur vocals, 2 Varianten) aus dem Song ohne Background, nur Lead-Text
 #      -> _hieltech_lead_v2_post_sync (beste Variante, Zeitmaske, Gate, RMVPE, Vocoder C, Melodie-Lock)
-#   3. Background: saubere Vorlage (_hieltech_backing_v2_clean_sync) -> Extract (Spur vocals, wie Test 5)
-#      -> _hieltech_backing_v2_post_sync, EINE Stimme in Originallage (kein Transponieren)
+#   3. Background: Background-Chor wie im Generator (_hieltech_backing_chor_sync, 1 Mann + 2 Frauen)
 # Sprache/Schrift: gesungen wird der Text GENAU wie geschrieben (Patois, Arabizi, arabische Schrift …).
 # Nur für den Text-Abgleich (Variantenwahl, Zeitmaske) wird er in A–Z umgeschrieben (stems_schrift.py).
 # ===================================================================================================
@@ -4243,24 +4242,6 @@ def _hieltech_stems_lead_prompt(caption):
         if x and not drop.search(x) and not (other and other.search(x)) and x not in kept:
             kept.append(x)
     suffix = _HIELTECH_LEAD_SUFFIX.replace("{G}", "female " if female else ("male " if male else ""))
-    return f"{', '.join(kept)}, {suffix}" if kept else suffix
-
-
-def _hieltech_stems_backing_prompt(caption):
-    p = str(caption or "")
-    mixed = bool(re.search(r"mixed male and female (background|backing|harmon)", p, re.I))
-    female = not mixed and bool(re.search(r"female[^,]*(background|backing|harmon)", p, re.I))
-    male = not mixed and not female and bool(re.search(r"\bmale[^,]*(background|backing|harmon)", p, re.I))
-    stimme = re.compile(r"\b(male|female|man|woman|men|women|boy|girl|vocal|vocals|voice|voices|singer|singing|choir|harmon|backing|background|duet|rap)", re.I)
-    drop = re.compile(r"(drum|bass(?!o)|guitar|skank|organ|riddim|shaker|horn|piano|keys|synth|band|console|tube|mix|one-drop|rimshot|percussion|"
-                      r"bpm|key of|\bminor\b|\bmajor\b|echo|reverb|spacious|baritone|tenor|soprano|alto)", re.I)
-    kept = []
-    for x in (y.strip() for y in p.split(",")):
-        if x and not stimme.search(x) and not drop.search(x) and x not in kept:
-            kept.append(x)
-    singer = "female vocalist, woman singing" if (mixed or female) else ("male vocalist, man singing" if male else "vocalist")
-    suffix = (f"{singer}, soft clear backing singer voice, a cappella vocals only, solo vocal, no instruments, no music, "
-              "dry close-mic studio vocal recording, clear pronunciation, clean studio vocal")
     return f"{', '.join(kept)}, {suffix}" if kept else suffix
 
 
@@ -4298,7 +4279,15 @@ def _hieltech_release_and_wait_all(payload, timeout_s=1800):
     raise RuntimeError("Erzeugung dauert zu lange")
 
 
-def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile):
+def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile, humanize="0"):
+    """31.10. (Nutzer: "genau 1:1 wie beim Musik-Generator, alle Nachjustierungen"):
+       Lead       = Vocals V2 wie im Generator (attemptVocalsV2): Extract mit Tempo/Tonart/Länge des Songs,
+                    2 Varianten, dann _hieltech_lead_v2_post_sync mit Melodie-Lock (Höhen), Melodie folgen (Tiefen),
+                    Text-Maske – unverändert dieselbe Funktion. Danach Lautheit wie Original-Lead.
+       Background = Background-Chor wie im Generator (attemptBackingChor): _hieltech_backing_chor_sync unverändert –
+                    Mischung 8 -> Hall/Rauschen raus -> Seed-VC (Oktav-Sperre, Stabil, Ton-Halt 0.3, Lage je Stimme)
+                    -> Gate -> RMVPE -> f0_halt_vib (Mann 0.3/1.0, Frau 1 0.3/1.4 Vibrato) -> Vocoder C mit
+                    Melodie folgen. 1 Mann + 2 Frauen, Humanizer wie Schalter. Danach Lautheit wie Original-Background."""
     import importlib
     sys.path.insert(0, _HIELTECH_PROJECT_ROOT)
     sc = importlib.import_module("stems_schrift")
@@ -4314,77 +4303,89 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
             f.write(src_bytes)
         teile = {x.strip() for x in (teile or "lead,backing").split(",") if x.strip()} or {"lead", "backing"}
         lead_txt = sc.lead_text(lyrics)
-        back_txt = sc.backing_text(lyrics)
         bericht["zeilen"] = {"lead": len([z for z in lead_txt.splitlines() if z.strip() and not z.startswith("[")]),
-                             "backing": len([z for z in back_txt.splitlines() if z.strip() and not z.startswith("[")])}
-        if not lead_txt and not back_txt:
-            return {"ok": False, "error": "kein_text", "message": "Kein Songtext – bitte einfügen oder erkennen lassen und bestätigen."}
-        vl = "ar" if (sprache == "ary" and re.search(r"[\u0600-\u06FF]", lyrics or "")) else "unknown"
+                             "backing": len([z for z in sc.backing_text(lyrics).splitlines() if z.strip() and not z.startswith("[")])}
+        if "lead" in teile and not lead_txt:
+            return {"ok": False, "error": "kein_text", "message": "Kein Lead-Text – bitte einfügen oder erkennen lassen und bestätigen."}
 
-        # 1) Vorbereitung (Trennung) – genau wie Vocals V2
-        t1 = time.time()
-        prep = os.path.join(work, "prep")
-        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_prepare_step.py"), song, prep], timeout=2400)
-        bericht["zeiten"]["trennung"] = round(time.time() - t1, 1)
-        hp = {}
-        for key, name in (("song", "song_ohne_background.wav"), ("lead", "lead_ref.wav"), ("backing", "backing_ref.wav")):
-            q = os.path.join(prep, name)
-            if not os.path.isfile(q):
-                return {"ok": False, "error": "trennung_fehlgeschlagen", "message": f"{name} fehlt: " + (log or "")[-600:]}
-            hp[key], _t = _hieltech_handoff_store(q, "wav")
+        # 0) Tempo / Tonart / Länge (im Generator bekannt, hier geschätzt)
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_takt_tonart.py"), song], timeout=600)
+        tt = _hieltech_last_json_line(log) or {}
+        bericht["takt_tonart"] = tt
 
-        def neu_singen(label, quelle, prompt, text, spur="vocals"):
-            src = os.path.join(work, f"src_{label}.wav")
-            shutil.copyfile(quelle, src)
-            payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": spur, "src_audio_path": src,
-                       "prompt": prompt, "lyrics": text, "batch_size": 2, "seed": 318694975, "use_random_seed": False,
-                       "inference_steps": 50, "guidance_scale": 7.0, "thinking": False, "use_cot_caption": False,
-                       "use_cot_language": False, "vocal_language": vl, "allow_lm_batch": False,
-                       "constrained_decoding": False, "audio_format": "flac"}
-            pfade = _hieltech_release_and_wait_all(payload)
-            return [_hieltech_handoff_store(p_, "flac")[0] for p_ in pfade]
+        def lautheit(neu, original, label, versatz=0.0):
+            aus = os.path.join(work, f"laut_{label}.wav")
+            ok_l, log_l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_lautheit.py"), neu, original, aus, str(versatz)], timeout=600)
+            info = _hieltech_last_json_line(log_l) or {}
+            bericht.setdefault("lautheit", {})[label] = info
+            return aus if ok_l and os.path.isfile(aus) else neu
 
-        # 2) Lead
-        if "lead" in teile and lead_txt:
+        def ablegen(pfad, datei):
+            conv, fext = _hieltech_wav_to_flac_file(pfad)
+            hp_, token = _hieltech_handoff_store(conv, fext)
+            results.append({"datei": f"{datei}.{fext}", "result_token": token, "size_bytes": os.path.getsize(hp_)})
+
+        # 1) Lead – Vocals V2
+        if "lead" in teile:
             t1 = time.time()
             try:
-                varianten = neu_singen("lead", hp["song"], _hieltech_stems_lead_prompt(caption), lead_txt)
+                prep = os.path.join(work, "prep")
+                ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "lead_v2_prepare_step.py"), song, prep], timeout=2400)
+                hp = {}
+                for key, name in (("song", "song_ohne_background.wav"), ("lead", "lead_ref.wav"), ("backing", "backing_ref.wav")):
+                    q = os.path.join(prep, name)
+                    if not os.path.isfile(q):
+                        raise RuntimeError(f"Trennung: {name} fehlt: " + (log or "")[-400:])
+                    hp[key], _t = _hieltech_handoff_store(q, "wav")
+                bericht["zeiten"]["trennung"] = round(time.time() - t1, 1)
+                src = os.path.join(work, "src_lead.wav")
+                shutil.copyfile(hp["song"], src)
+                vl = "ar" if (sprache == "ary" and re.search(r"[\u0600-\u06FF]", lyrics or "")) else "unknown"
+                payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": "vocals", "src_audio_path": src,
+                           "prompt": _hieltech_stems_lead_prompt(caption), "lyrics": lead_txt, "batch_size": 2,
+                           "seed": 318694975, "use_random_seed": False, "inference_steps": 50, "guidance_scale": 7.0,
+                           "thinking": False, "use_cot_caption": False, "use_cot_language": False, "vocal_language": vl,
+                           "allow_lm_batch": False, "constrained_decoding": False, "audio_format": "flac"}
+                if tt.get("dauer"):
+                    payload["audio_duration"] = tt["dauer"]
+                if tt.get("bpm"):
+                    payload["bpm"] = tt["bpm"]
+                if tt.get("key_scale"):
+                    payload["key_scale"] = tt["key_scale"]
+                varianten = [_hieltech_handoff_store(p_, "flac")[0] for p_ in _hieltech_release_and_wait_all(payload)]
                 post = _hieltech_lead_v2_post_sync(None, "", "", hp["lead"], hp["backing"], "", json.dumps(varianten),
                                                    sc.fuer_abgleich(lead_txt))
-                if post.get("ok"):
-                    results.append({"datei": "Gesang/lead-vocal.flac", "result_token": post["result_token"], "size_bytes": post["size_bytes"]})
-                    bericht["lead"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings"),
-                                       "auswahl": (post.get("pick") or {}).get("scores")}
-                    for v in (post.get("pick") or {}).get("scores") or []:
-                        v.pop("segments", None)
-                else:
-                    bericht["warnungen"].append("Lead: " + str(post.get("message") or post.get("error")))
+                if not post.get("ok"):
+                    raise RuntimeError(str(post.get("message") or post.get("error")))
+                fertig = os.path.join(_HIELTECH_HANDOFF_DIR, f"{post['result_token']}.{post.get('audio_ext', 'flac')}")
+                ablegen(lautheit(fertig, hp["lead"], "lead"), "Gesang/lead-vocal")
+                scores = (post.get("pick") or {}).get("scores") or []
+                for v in scores:
+                    v.pop("segments", None)
+                bericht["lead"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings"), "auswahl": scores}
             except Exception as e:  # noqa: BLE001
-                bericht["warnungen"].append(f"Lead: {e}"[:400])
+                bericht["warnungen"].append(f"Lead: {e}"[:500])
             bericht["zeiten"]["lead"] = round(time.time() - t1, 1)
 
-        # 3) Background (eine Stimme, Originallage)
-        if "backing" in teile and back_txt:
+        # 2) Background – Background-Chor (1 Mann + 2 Frauen, wie im Generator)
+        if "backing" in teile:
             t1 = time.time()
             try:
-                clean = _hieltech_backing_v2_clean_sync(hp["lead"], hp["backing"], hp["song"], sc.fuer_abgleich(lyrics))
-                if not clean.get("ok"):
-                    raise RuntimeError(clean.get("message") or clean.get("error"))
-                bericht["background_vorlage"] = clean.get("report")
-                varianten = neu_singen("backing", clean["source_path"], _hieltech_stems_backing_prompt(caption), back_txt)
-                post = _hieltech_backing_v2_post_sync(json.dumps(varianten), sc.fuer_abgleich(back_txt), clean["clean_backing_path"],
-                                                      hp["lead"], json.dumps([{"slot": 1, "model": "", "gender": "male"}]))
-                if post.get("ok") and post.get("voices"):
-                    v = post["voices"][0]
-                    results.append({"datei": "Gesang/back-vocal.flac", "result_token": v["result_token"], "size_bytes": v["size_bytes"]})
-                    bericht["backing"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings")}
-                else:
-                    bericht["warnungen"].append("Background: " + str(post.get("message") or post.get("error")))
+                chor = _hieltech_backing_chor_sync(src_bytes, filename, tt.get("key_scale") or "", "", humanize)
+                if not chor.get("ok"):
+                    raise RuntimeError(str(chor.get("message") or chor.get("error")) + " " + str(chor.get("log") or "")[-300:])
+                bericht["backing"] = {"schritte": chor.get("steps_applied"), "warnungen": chor.get("warnings"), "tonart": chor.get("tonart")}
+                # Original-Background als Lautheits-Gegenstück (Karaoke-Trennung aus Schritt 1, sonst ohne Angleichung)
+                bref = os.path.join(work, "prep", "backing_ref.wav")
+                namen = {"mann": "1_mann", "frau2": "2_frau", "frau1": "3_frau"}
+                for v in chor.get("voices") or []:
+                    pfad = os.path.join(_HIELTECH_HANDOFF_DIR, f"{v['result_token']}.{v.get('audio_ext', 'flac')}")
+                    if os.path.isfile(bref):
+                        pfad = lautheit(pfad, bref, f"backing_{v['slot']}")
+                    ablegen(pfad, f"Gesang/background/backing_{namen.get(v.get('role'), str(v['slot']))}")
             except Exception as e:  # noqa: BLE001
-                bericht["warnungen"].append(f"Background: {e}"[:400])
+                bericht["warnungen"].append(f"Background: {e}"[:500])
             bericht["zeiten"]["backing"] = round(time.time() - t1, 1)
-        elif "backing" in teile:
-            bericht["warnungen"].append("Background übersprungen: kein (…)/{…}-Text im Songtext")
 
         bericht["gesamt_sekunden"] = round(time.time() - t_ges, 1)
         if not results:
@@ -4396,13 +4397,14 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
 
 @app.post("/v1/hieltech_stems_gesang_start")
 async def _hieltech_stems_gesang_start(audio: UploadFile, lyrics: str = Form(default=""), caption: str = Form(default=""),
-                                       sprache: str = Form(default="auto"), teile: str = Form(default="lead,backing")):
+                                       sprache: str = Form(default="auto"), teile: str = Form(default="lead,backing"),
+                                       humanize: str = Form(default="0")):
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_gesang_sync, src_bytes, audio.filename, lyrics[:8000],
-                               caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40])
+                               caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40], (humanize or "0")[:5])
 
 
 # HIELTECH (31. Okt 2026): Belegung des Netz-Volumes anzeigen (nur LESEN, löscht nichts) – "Disk quota exceeded".
