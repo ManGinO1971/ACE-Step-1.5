@@ -4279,7 +4279,7 @@ def _hieltech_release_and_wait_all(payload, timeout_s=1800):
     raise RuntimeError("Erzeugung dauert zu lange")
 
 
-def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile, humanize="0"):
+def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, teile, humanize="0", fest_seed="", fest_bpm="", fest_key=""):
     """31.10. (Nutzer: "genau 1:1 wie beim Musik-Generator, alle Nachjustierungen"):
        Lead       = Vocals V2 wie im Generator (attemptVocalsV2): Extract mit Tempo/Tonart/Länge des Songs,
                     2 Varianten, dann _hieltech_lead_v2_post_sync mit Melodie-Lock (Höhen), Melodie folgen (Tiefen),
@@ -4311,7 +4311,13 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
         # 0) Tempo / Tonart / Länge (im Generator bekannt, hier geschätzt)
         ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_takt_tonart.py"), song], timeout=600)
         tt = _hieltech_last_json_line(log) or {}
-        bericht["takt_tonart"] = tt
+        # Test 1:1 gegen den Musik-Generator: dort sind Seed/Tempo/Tonart des Songs bekannt -> optional fest vorgeben
+        if str(fest_bpm).strip().isdigit():
+            tt["bpm"], tt["bpm_quelle"] = int(fest_bpm), "vorgegeben"
+        if fest_key and re.match(r"^[A-G][#b]? (major|minor)$", fest_key.strip()):
+            tt["key_scale"], tt["tonart_quelle"] = fest_key.strip(), "vorgegeben"
+        seed = int(fest_seed) if str(fest_seed).strip().isdigit() else 318694975
+        bericht["takt_tonart"] = dict(tt, seed=seed)
 
         def lautheit(neu, original, label, versatz=0.0):
             aus = os.path.join(work, f"laut_{label}.wav")
@@ -4343,7 +4349,7 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                 vl = "ar" if (sprache == "ary" and re.search(r"[\u0600-\u06FF]", lyrics or "")) else "unknown"
                 payload = {"task_type": "extract", "model": "acestep-v15-base", "track_name": "vocals", "src_audio_path": src,
                            "prompt": _hieltech_stems_lead_prompt(caption), "lyrics": lead_txt, "batch_size": 2,
-                           "seed": 318694975, "use_random_seed": False, "inference_steps": 50, "guidance_scale": 7.0,
+                           "seed": seed, "use_random_seed": False, "inference_steps": 50, "guidance_scale": 7.0,
                            "thinking": False, "use_cot_caption": False, "use_cot_language": False, "vocal_language": vl,
                            "allow_lm_batch": False, "constrained_decoding": False, "audio_format": "flac"}
                 if tt.get("dauer"):
@@ -4398,13 +4404,15 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
 @app.post("/v1/hieltech_stems_gesang_start")
 async def _hieltech_stems_gesang_start(audio: UploadFile, lyrics: str = Form(default=""), caption: str = Form(default=""),
                                        sprache: str = Form(default="auto"), teile: str = Form(default="lead,backing"),
-                                       humanize: str = Form(default="0")):
+                                       humanize: str = Form(default="0"), seed: str = Form(default=""),
+                                       bpm: str = Form(default=""), key_scale: str = Form(default="")):
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_gesang_sync, src_bytes, audio.filename, lyrics[:8000],
-                               caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40], (humanize or "0")[:5])
+                               caption[:500], (sprache or "auto")[:20], (teile or "lead,backing")[:40], (humanize or "0")[:5],
+                               (seed or "")[:12], (bpm or "")[:4], (key_scale or "")[:12])
 
 
 # HIELTECH (31. Okt 2026): Belegung des Netz-Volumes anzeigen (nur LESEN, löscht nichts) – "Disk quota exceeded".
