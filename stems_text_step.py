@@ -184,7 +184,7 @@ def mitschreiben(asr, y):
     ph = phrasen(y)
     if not ph:
         return []
-    eingaben = [{"raw": y[int(a * SR16):int(b * SR16)], "sampling_rate": SR16} for a, b in ph]
+    stuecke = [y[int(a * SR16):int(b * SR16)].copy() for a, b in ph]
     gk = {"task": "transcribe"}
     if SPRACHE:
         gk["language"] = SPRACHE
@@ -193,7 +193,9 @@ def mitschreiben(asr, y):
     # Jetzt 2 gleichzeitig, bei Speichermangel 1 nach der anderen.
     for bs in (2, 1):
         try:
-            res = list(asr(eingaben, generate_kwargs=gk, batch_size=bs))
+            # Pipeline nimmt "raw" aus den Einträgen heraus -> für jeden Versuch frische Einträge
+            frisch = [{"raw": st.copy(), "sampling_rate": SR16} for st in stuecke]
+            res = list(asr(frisch, generate_kwargs=gk, batch_size=bs))
             break
         except Exception as e:  # noqa: BLE001
             if "out of memory" not in str(e).lower():
