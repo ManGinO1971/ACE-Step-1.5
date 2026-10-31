@@ -90,7 +90,49 @@ ERFUNDEN = ("we'll be right back", "see you next time", "thanks for watching", "
             "subscribe", "like and subscribe", "please subscribe", "thank you.", "bye.", "you.")
 
 
-def phrasen(y, rahmen=0.05, abstand_db=30.0, luecke=0.6, min_s=0.4, max_s=12.0):
+SPRACHE = None   # wird in main() einmal für den ganzen Song bestimmt
+
+
+def aufraeumen(t):
+    """'Ooooooo…' -> 'Ooh', gleiche Wörter >3x hintereinander -> 2x."""
+    import re
+    t = re.sub(r"([A-Za-z])\1{3,}", lambda m: m.group(1) * 2 + ("h" if m.group(1).lower() == "o" else ""), t.strip())
+    w = t.split()
+    out = []
+    for x in w:
+        if len(out) >= 2 and out[-1].lower().strip(",.") == x.lower().strip(",.") == out[-2].lower().strip(",."):
+            continue
+        out.append(x)
+    return " ".join(out)
+
+
+def sprache_bestimmen(asr, y):
+    """31.10.: Sprache EINMAL aus den lautesten 30 s des Lead-Gesangs bestimmen und für alle Zeilen festhalten
+    (sonst springt Whisper bei kurzen Stellen in fremde Sprachen, z. B. Isländisch). Patois -> Englisch."""
+    erzwungen = os.environ.get("HIELTECH_WHISPER_SPRACHE")
+    if erzwungen:
+        return erzwungen
+    try:
+        import torch
+        n = 30 * SR16
+        if len(y) > n:
+            e = np.convolve(y ** 2, np.ones(SR16), mode="valid")[::SR16]
+            k = int(np.argmax(np.convolve(e, np.ones(30), mode="valid")))
+            y = y[k * SR16:k * SR16 + n]
+        f = asr.feature_extractor(y, sampling_rate=SR16, return_tensors="pt").input_features
+        f = f.to(asr.model.device, dtype=asr.model.dtype)
+        with torch.inference_mode():
+            ids = asr.model.detect_language(f)
+        tok = asr.tokenizer.decode(ids.reshape(-1)[:1])
+        code = tok.strip("<|>") or None
+        print(f"[Stems-Text] Sprache: {code}", file=sys.stderr, flush=True)
+        return code
+    except Exception as e:  # noqa: BLE001
+        print(f"[Stems-Text] Sprache nicht bestimmt ({e}) – automatisch je Zeile", file=sys.stderr, flush=True)
+        return None
+
+
+def phrasen(y, rahmen=0.05, abstand_db=30.0, luecke=0.35, min_s=0.4, max_s=7.0):
     """31.10.: Gesangs-Phrasen nach Lautstärke finden (Pausen = neue Zeile). Lange Phrasen an der leisesten
     Stelle teilen. Ergebnis: Liste (start_s, ende_s)."""
     h = int(rahmen * SR16)
@@ -122,7 +164,7 @@ def phrasen(y, rahmen=0.05, abstand_db=30.0, luecke=0.6, min_s=0.4, max_s=12.0):
         if (b - a) * rahmen <= max_s:
             fertig.append((a, b))
             return
-        lo, hi = a + int(3 / rahmen), b - int(3 / rahmen)
+        lo, hi = a + int(2 / rahmen), b - int(2 / rahmen)
         m = lo + int(np.argmin(e[lo:hi])) if hi > lo else (a + b) // 2
         teilen(a, m)
         teilen(m, b)
@@ -142,10 +184,13 @@ def mitschreiben(asr, y):
     if not ph:
         return []
     eingaben = [{"raw": y[int(a * SR16):int(b * SR16)], "sampling_rate": SR16} for a, b in ph]
-    res = asr(eingaben, generate_kwargs={"task": "transcribe"})
+    gk = {"task": "transcribe"}
+    if SPRACHE:
+        gk["language"] = SPRACHE
+    res = asr(eingaben, generate_kwargs=gk)
     out, letzte = [], ""
     for (a, b), r in zip(ph, res):
-        txt = (r.get("text") or "").strip()
+        txt = aufraeumen(r.get("text") or "")
         klein = txt.lower().strip(" .!?,")
         if not txt or any(klein == f.strip(" .") or klein.startswith(f.strip(" .")) for f in ERFUNDEN):
             continue
@@ -180,10 +225,13 @@ def zusammensetzen(lead, backing):
 
 def main():
     lead_p, back_p, out_p = sys.argv[1:4]
+    global SPRACHE
     asr = erkenner()
-    lead = mitschreiben(asr, lade16(lead_p))
+    y_lead = lade16(lead_p)
+    SPRACHE = sprache_bestimmen(asr, y_lead)
+    lead = mitschreiben(asr, y_lead)
     backing = mitschreiben(asr, lade16(back_p)) if os.path.isfile(back_p) else []
-    bericht = {"ok": True, "modell": MODELL, "lyrics": zusammensetzen(lead, backing), "lead": lead, "backing": backing}
+    bericht = {"ok": True, "modell": MODELL, "sprache": SPRACHE, "lyrics": zusammensetzen(lead, backing), "lead": lead, "backing": backing}
     with open(out_p, "w", encoding="utf-8") as f:
         json.dump(bericht, f, ensure_ascii=False, indent=1)
     print(json.dumps({"ok": True, "zeilen_lead": len(lead), "stellen_backing": len(backing)}, ensure_ascii=False))
