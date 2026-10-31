@@ -83,7 +83,7 @@ def erkenner():
             raise RuntimeError("Whisper nicht ladbar – " + " | ".join(fehler))
     m = m.to(dev)
     return pipeline("automatic-speech-recognition", model=m, tokenizer=p.tokenizer, feature_extractor=p.feature_extractor,
-                    torch_dtype=dt, device=dev, chunk_length_s=30, batch_size=8)
+                    torch_dtype=dt, device=dev, chunk_length_s=30)
 
 
 # Typische von Whisper "erfundene" Sätze (aus YouTube-Untertiteln gelernt) – nie Songtext
@@ -188,7 +188,21 @@ def mitschreiben(asr, y):
     gk = {"task": "transcribe"}
     if SPRACHE:
         gk["language"] = SPRACHE
-    res = asr(eingaben, generate_kwargs=gk)
+    res = None
+    # 31.10.: großes Modell + ACE-Step (17 GB) auf 24-GB-Karte -> "CUDA out of memory" bei 8 gleichzeitig.
+    # Jetzt 2 gleichzeitig, bei Speichermangel 1 nach der anderen.
+    for bs in (2, 1):
+        try:
+            res = list(asr(eingaben, generate_kwargs=gk, batch_size=bs))
+            break
+        except Exception as e:  # noqa: BLE001
+            if "out of memory" not in str(e).lower():
+                raise
+            import torch
+            torch.cuda.empty_cache()
+            print(f"[Stems-Text] zu wenig GPU-Speicher bei {bs} gleichzeitig – weniger", file=sys.stderr, flush=True)
+    if res is None:
+        raise RuntimeError("GPU-Speicher reicht nicht für Whisper")
     out, letzte = [], ""
     for (a, b), r in zip(ph, res):
         txt = aufraeumen(r.get("text") or "")
@@ -227,10 +241,23 @@ def zusammensetzen(lead, backing):
 def main():
     lead_p, back_p, out_p = sys.argv[1:4]
     global SPRACHE
+    global MODELL
     asr = erkenner()
     y_lead = lade16(lead_p)
-    SPRACHE = sprache_bestimmen(asr, y_lead)
-    lead = mitschreiben(asr, y_lead)
+    try:
+        SPRACHE = sprache_bestimmen(asr, y_lead)
+        lead = mitschreiben(asr, y_lead)
+    except Exception as e:  # noqa: BLE001
+        if "Speicher" not in str(e) and "out of memory" not in str(e).lower() or MODELL.endswith("turbo"):
+            raise
+        import torch
+        del asr
+        torch.cuda.empty_cache()
+        MODELL = "openai/whisper-large-v3-turbo"          # kleiner, passt immer
+        print("[Stems-Text] großes Modell passt nicht in den GPU-Speicher – Turbo", file=sys.stderr, flush=True)
+        asr = erkenner()
+        SPRACHE = sprache_bestimmen(asr, y_lead)
+        lead = mitschreiben(asr, y_lead)
     backing = mitschreiben(asr, lade16(back_p)) if os.path.isfile(back_p) else []
     bericht = {"ok": True, "modell": MODELL, "sprache": SPRACHE, "lyrics": zusammensetzen(lead, backing), "lead": lead, "backing": backing}
     with open(out_p, "w", encoding="utf-8") as f:
