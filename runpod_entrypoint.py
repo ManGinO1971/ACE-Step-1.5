@@ -4364,47 +4364,66 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                 if not post.get("ok"):
                     raise RuntimeError(str(post.get("message") or post.get("error")))
                 fertig = os.path.join(_HIELTECH_HANDOFF_DIR, f"{post['result_token']}.{post.get('audio_ext', 'flac')}")
-                ablegen(lautheit(fertig, hp["lead"], "lead"), "Gesang/lead-vocal")
                 scores = (post.get("pick") or {}).get("scores") or []
-                if str(zwischen) == "1":
-                    # 31.10. Feinjustierung OHNE GPU (wie 21.10. beim Generator): Zwischenstufen mitliefern –
-                    # dieselben Schritte wie _hieltech_lead_v2_post_sync bis VOR den Vocoder, nichts verändert.
-                    try:
-                        zw = os.path.join(work, "zwischen")
-                        os.makedirs(zw, exist_ok=True)
-                        wahl = (post.get("pick") or {}).get("chosen")
-                        wahl = wahl if isinstance(wahl, int) and 0 <= wahl < len(varianten) else 0
-                        roh = os.path.join(zw, "variante.wav")
-                        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", varianten[wahl], roh], timeout=300)
-                        for i_, v_ in enumerate(varianten):
-                            ablegen(v_, f"Zwischen/variante_{i_ + 1}_roh")
-                        cur = roh
-                        masked = os.path.join(zw, "masked.wav")
-                        args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), cur, os.path.realpath(hp["lead"]), masked,
-                                os.path.realpath(hp["backing"])]
-                        segs = next((sc_.get("segments") for sc_ in scores if sc_.get("variant") == wahl), None)
-                        if segs:
-                            kf = os.path.join(zw, "lead_lines.json")
-                            with open(kf, "w", encoding="utf-8") as f:
-                                json.dump(segs, f)
-                            args.append(kf)
-                        ok_m, _l = _hieltech_run_step(args, timeout=600)
-                        cur = masked if ok_m and os.path.isfile(masked) else cur
-                        gated = os.path.join(zw, "gated.wav")
-                        ok_g, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", cur, "--output", gated], timeout=300)
-                        cur = gated if ok_g and os.path.isfile(gated) else cur
-                        ablegen(cur, "Zwischen/vor_vocoder")
-                        ablegen(hp["lead"], "Zwischen/lead_original")
-                        for quelle, name in ((cur, "f0_neu"), (os.path.realpath(hp["lead"]), "f0_lead_original")):
-                            fz = os.path.join(zw, f"{name}.npy")
-                            ok_f, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), quelle, fz],
-                                                          timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
-                            if ok_f and os.path.isfile(fz):
-                                hz, tz = _hieltech_handoff_store(fz, "npy")
-                                results.append({"datei": f"Zwischen/{name}.npy", "result_token": tz, "size_bytes": os.path.getsize(hz)})
-                        bericht["zwischen"] = {"gewaehlt": wahl + 1, "maske": bool(ok_m), "gate": bool(ok_g)}
-                    except Exception as e:  # noqa: BLE001
-                        bericht["warnungen"].append(f"Zwischenstufen: {e}"[:300])
+                # 1. Nov 2026: Lead-Feinkette "Lead E-H1" (per Hörtest Schritt für Schritt freigegeben, stems_lead_fein.py):
+                # dieselben Schritte wie _hieltech_lead_v2_post_sync bis VOR den Vocoder (beste Variante, Zeitmaske +
+                # Text-Maske, Gate), dann eigene Melodielinie + Vocoder C + Kamm weich + Ende-/Pausen-Gate + Entrauschen
+                # + kleiner Hall für die Wortenden. Zurück auf Vocals V2: Umgebungsvariable HIELTECH_STEMS_LEAD_FEIN=0.
+                zw = os.path.join(work, "zwischen")
+                os.makedirs(zw, exist_ok=True)
+                zw_ok = False
+                try:
+                    wahl = (post.get("pick") or {}).get("chosen")
+                    wahl = wahl if isinstance(wahl, int) and 0 <= wahl < len(varianten) else 0
+                    roh = os.path.join(zw, "variante.wav")
+                    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", varianten[wahl], roh], timeout=300)
+                    cur = roh
+                    masked = os.path.join(zw, "masked.wav")
+                    args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), cur, os.path.realpath(hp["lead"]), masked,
+                            os.path.realpath(hp["backing"])]
+                    segs = next((sc_.get("segments") for sc_ in scores if sc_.get("variant") == wahl), None)
+                    if segs:
+                        kf = os.path.join(zw, "lead_lines.json")
+                        with open(kf, "w", encoding="utf-8") as f:
+                            json.dump(segs, f)
+                        args.append(kf)
+                    ok_m, _l = _hieltech_run_step(args, timeout=600)
+                    cur = masked if ok_m and os.path.isfile(masked) else cur
+                    gated = os.path.join(zw, "gated.wav")
+                    ok_g, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", cur, "--output", gated], timeout=300)
+                    cur = gated if ok_g and os.path.isfile(gated) else cur
+                    f0_pfade = {}
+                    for quelle, name in ((cur, "f0_neu"), (os.path.realpath(hp["lead"]), "f0_lead_original")):
+                        fz = os.path.join(zw, f"{name}.npy")
+                        ok_f, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "f0_rmvpe_lead_step.py"), quelle, fz],
+                                                      timeout=600, python_path=_HIELTECH_RVC_VENV_PYTHON)
+                        if ok_f and os.path.isfile(fz):
+                            f0_pfade[name] = fz
+                    bericht["zwischen"] = {"gewaehlt": wahl + 1, "maske": bool(ok_m), "gate": bool(ok_g)}
+                    zw_ok = len(f0_pfade) == 2
+                except Exception as e:  # noqa: BLE001
+                    bericht["warnungen"].append(f"Zwischenstufen: {e}"[:300])
+                if zw_ok and os.environ.get("HIELTECH_STEMS_LEAD_FEIN", "1") != "0":
+                    t_f = time.time()
+                    fein_out = os.path.join(zw, "lead_fein.wav")
+                    ok_l, log_l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_lead_fein.py"), cur,
+                                                      f0_pfade["f0_neu"], f0_pfade["f0_lead_original"], fein_out], timeout=3600)
+                    rep_l = _hieltech_last_json_line(log_l) or {}
+                    if ok_l and os.path.isfile(fein_out):
+                        fertig = fein_out
+                        bericht["lead_fein"] = rep_l
+                    else:
+                        bericht["warnungen"].append("Lead-Feinkette fehlgeschlagen, Vocals-V2-Fassung geliefert: " + (log_l or "")[-400:])
+                    bericht["zeiten"]["lead_fein"] = round(time.time() - t_f, 1)
+                ablegen(lautheit(fertig, hp["lead"], "lead"), "Gesang/lead-vocal")
+                if str(zwischen) == "1" and zw_ok:
+                    for i_, v_ in enumerate(varianten):
+                        ablegen(v_, f"Zwischen/variante_{i_ + 1}_roh")
+                    ablegen(cur, "Zwischen/vor_vocoder")
+                    ablegen(hp["lead"], "Zwischen/lead_original")
+                    for name, fz in f0_pfade.items():
+                        hz_, tz = _hieltech_handoff_store(fz, "npy")
+                        results.append({"datei": f"Zwischen/{name}.npy", "result_token": tz, "size_bytes": os.path.getsize(hz_)})
                 for v in scores:
                     v.pop("segments", None)
                 bericht["lead"] = {"schritte": post.get("steps_applied"), "warnungen": post.get("warnings"), "auswahl": scores}
@@ -4482,6 +4501,43 @@ def _hieltech_volume_info_sync():
     st = os.statvfs(basis)
     return {"ok": True, "frei_gb": round(st.f_bavail * st.f_frsize / 1e9, 2), "gesamt_gb": round(st.f_blocks * st.f_frsize / 1e9, 2),
             "eintraege": eintraege}
+
+
+# HIELTECH Stems (31. Okt 2026, nur Terminal-Test): EINE fertige Gesangsspur nur mit .pth umwandeln –
+# genau der Schritt 4 von Vocals V2 (rvc_convert_step.py, Transposition 0, rmvpe, Index wie Lead), sonst nichts.
+def _hieltech_rvc_nur_sync(src_bytes, filename, voice_model):
+    voice_model = (voice_model or "").strip()
+    if not _HIELTECH_VOICE_MODEL_RE.match(voice_model):
+        return {"ok": False, "error": "modellname_ungueltig"}
+    work = tempfile.mkdtemp(prefix="hieltech_rvc_nur_")
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".flac"
+        src = os.path.join(work, "in" + ext)
+        with open(src, "wb") as f:
+            f.write(src_bytes)
+        wav = os.path.join(work, "in.wav")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, wav], timeout=300)
+        out = os.path.join(work, "rvc.wav")
+        ok, log = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "rvc_convert_step.py"), wav, out, voice_model, "0", "rmvpe"],
+                                     python_path=_HIELTECH_RVC_VENV_PYTHON)
+        if not (ok and os.path.isfile(out)):
+            return {"ok": False, "error": "rvc_fehlgeschlagen", "message": (log or "")[-800:]}
+        conv, fext = _hieltech_wav_to_flac_file(out)
+        hp, token = _hieltech_handoff_store(conv, fext)
+        return {"ok": True, "results": [{"datei": f"rvc.{fext}", "result_token": token, "size_bytes": os.path.getsize(hp)}]}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_rvc_nur_start")
+async def _hieltech_rvc_nur_start(audio: UploadFile, voice_model: str = Form(default="")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_rvc_nur_sync, src_bytes, audio.filename, voice_model[:130])
 
 
 @app.post("/v1/hieltech_volume_info_start")
