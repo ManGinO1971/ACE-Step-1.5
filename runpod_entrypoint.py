@@ -4421,6 +4421,10 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                         ablegen(v_, f"Zwischen/variante_{i_ + 1}_roh")
                     ablegen(cur, "Zwischen/vor_vocoder")
                     ablegen(hp["lead"], "Zwischen/lead_original")
+                    # 1. Nov: für die Ursachen-Suche "Background singt beim Neu-Singen mit" – Quelle des Neu-Singens
+                    # (Song ohne Background) und die getrennte Original-Background-Spur
+                    ablegen(hp["song"], "Zwischen/quelle_song_ohne_background")
+                    ablegen(hp["backing"], "Zwischen/backing_original")
                     for name, fz in f0_pfade.items():
                         hz_, tz = _hieltech_handoff_store(fz, "npy")
                         results.append({"datei": f"Zwischen/{name}.npy", "result_token": tz, "size_bytes": os.path.getsize(hz_)})
