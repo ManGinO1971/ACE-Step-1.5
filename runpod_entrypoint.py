@@ -4177,6 +4177,50 @@ async def _hieltech_stems53_start(audio: UploadFile, instrumente: str = Form(def
     return _hieltech_job_start("lora_test", _hieltech_stems53_sync, src_bytes, audio.filename, instrumente[:500])
 
 
+# HIELTECH Stems (11. Nov 2026): Trennen für die Mac-App mit Schalter "GPU" – gleiche Modelle wie auf dem Mac
+# (audio-separator: BS-Roformer-SW, Gesang-/Karaoke-Modelle, MDX23C-DrumSep; Demucs; 53-Instrumente-Modell).
+# Rückgabe: je Spur eine FLAC (verlustfrei), die Mac-App rechnet damit weiter.
+def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag):
+    work = tempfile.mkdtemp(prefix="hieltech_stems_trennen_")
+    results = []
+    try:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+            ext = ".wav"
+        song = os.path.join(work, "song" + ext)
+        with open(song, "wb") as f:
+            f.write(src_bytes)
+        try:
+            json.loads(auftrag or "{}")
+        except ValueError:
+            return {"ok": False, "error": "auftrag_ungueltig"}
+        aus = os.path.join(work, "aus")
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_trennen_gpu.py"), song, aus, auftrag],
+                                        timeout=3600)
+        info = _hieltech_last_json_line(output) or {}
+        if not info.get("ok"):
+            return {"ok": False, "error": info.get("error") or "trennen_fehlgeschlagen",
+                    "message": info.get("message") or output[-800:]}
+        for name, p in (info.get("spuren") or {}).items():
+            if os.path.isfile(p):
+                conv, fext = _hieltech_wav_to_flac_file(p)
+                hp, token = _hieltech_handoff_store(conv, fext)
+                results.append({"datei": f"{name}.{fext}", "spur": name, "result_token": token, "size_bytes": os.path.getsize(hp)})
+        return {"ok": bool(results), "results": results, "sekunden": info.get("sekunden"), "geraet": info.get("geraet"),
+                "message": "" if results else "keine Spuren"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_trennen_start")
+async def _hieltech_stems_trennen_start(audio: UploadFile, auftrag: str = Form(default="{}")):
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    src_bytes = await audio.read()
+    return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, src_bytes, audio.filename, auftrag[:2000])
+
+
 # HIELTECH Stems (30. Okt 2026): Songtext automatisch mitschreiben – Song -> Gesang trennen (wie Lead V2:
 # lead_v2_prepare_step.py) -> Whisper large-v3 auf Lead- und Background-Spur -> Text mit ( … ) für Background.
 # Der Text wird in der App angezeigt und kann korrigiert werden, danach "Gesang neu erzeugen".
