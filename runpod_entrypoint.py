@@ -4267,18 +4267,24 @@ async def _hieltech_stems_song_chunk(chunk: UploadFile, sha: str = Form(...), ex
             os.makedirs(d, exist_ok=True)
         ziel = os.path.join(d, "song" + ext)
         teil = ziel + ".part"
-        fd = os.open(teil, os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if offset == 0 else 0), 0o644)
+        if os.path.isfile(ziel):                 # liegt schon vollständig da (z. B. eine verspätet zugestellte Anfrage)
+            return {"ok": True, "received": total_size, "complete": True}
+        # Kein Abschneiden bei offset 0: kommt eine Anfrage doppelt oder verspätet an (Wiederholung nach Wartezeit beim
+        # Kaltstart), schreibt sie nur dieselben Bytes an dieselbe Stelle – die Datei bleibt heil.
+        complete = offset + len(data) == total_size
+        fd = os.open(teil, os.O_WRONLY | os.O_CREAT, 0o644)
         try:
             os.lseek(fd, offset, os.SEEK_SET)
             view = memoryview(data)
             while view:
                 n = os.write(fd, view)
                 view = view[n:]
+            if complete:
+                os.ftruncate(fd, total_size)     # Rest eines älteren, größeren Versuchs entfernen
             os.fsync(fd)
         finally:
             os.close(fd)
         received = os.path.getsize(teil)
-        complete = offset + len(data) == total_size
         if complete:
             if received != total_size:
                 return {"ok": False, "error": "size_mismatch", "message": f"{received} von {total_size} Bytes"}
@@ -4288,6 +4294,8 @@ async def _hieltech_stems_song_chunk(chunk: UploadFile, sha: str = Form(...), ex
                     for block in iter(lambda: f.read(1 << 20), b""):
                         h.update(block)
                 if h.hexdigest() != pruef:
+                    if os.path.isfile(ziel):
+                        return {"ok": True, "received": total_size, "complete": True}
                     os.remove(teil)
                     return {"ok": False, "error": "pruefsumme_falsch", "message": "Datei kam beschädigt an"}
             os.replace(teil, ziel)
