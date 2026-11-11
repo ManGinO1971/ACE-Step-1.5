@@ -1,0 +1,1 @@
+Hier legt die App beim ersten Lauf die Modell-Gewichte ab (mn40_as_ext_mAP_487.pt, 274 MB, von GitHub).

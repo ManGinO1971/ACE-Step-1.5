@@ -6,6 +6,7 @@ damit das Ergebnis gleich bleibt – nur schneller. Das Neu-Einspielen mit den e
 
 Aufruf: python stems_trennen_gpu.py <song> <ausgabeordner> '<auftrag-json>'
 Aufträge:
+  {"art": "erkennen"}                                                   Instrumenten-Erkennung (6 Spuren + Hör-Modell)
   {"art": "sep", "modell": "BS-Roformer-SW.ckpt"}                       audio-separator, alle Spuren
   {"art": "sep", "modell": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
    "dann": {"tag": "vocals", "modell": "UVR-BVE-4B_SN-44100-1.pth", "praefix": "k_"}}   zweite Stufe auf einer Spur
@@ -57,6 +58,7 @@ def main():
     os.makedirs(aus, exist_ok=True)
     t0 = time.time()
     spuren = {}
+    extra = {}
     art = auftrag.get("art")
     if art == "sep":
         modell = auftrag.get("modell", "")
@@ -98,7 +100,7 @@ def main():
                 shutil.move(os.path.join(d, f), ziel)
                 spuren[os.path.splitext(f)[0]] = ziel
     elif art == "s53":
-        namen = [i for i in auftrag.get("instrumente") or [] if re.match(r"^[a-z_-]{2,20}$", i)][:12]
+        namen = [i for i in auftrag.get("instrumente") or [] if re.match(r"^[a-z_-]{2,20}$", i)][:53]
         if not namen:
             raise ValueError("keine Instrumente")
         args = [sys.executable, os.path.join(HERE, "stems53_ref_step.py"), song]
@@ -111,11 +113,40 @@ def main():
                 spuren[i] = p
         if not spuren:
             raise RuntimeError("53er-Modell: " + (r.stderr or r.stdout or "")[-500:])
+    elif art == "erkennen":
+        # Instrumenten-Erkennung komplett auf der GPU: 6 Spuren (htdemucs_6s) + Hör-Modell (EfficientAT) je Spur
+        roh = os.path.join(aus, "_demucs")
+        r = subprocess.run([sys.executable, "-m", "demucs", "--name", "htdemucs_6s", "--out", roh, "-d", geraet(), song],
+                           capture_output=True, text=True, timeout=3600)
+        d = os.path.join(roh, "htdemucs_6s", os.path.splitext(os.path.basename(song))[0])
+        args = [sys.executable, os.path.join(HERE, "hieltech_erkennung", "detect_instruments_eat.py"), song,
+                os.path.join(aus, "erkennung.json"), "--hoerproben", os.path.join(aus, "_hp")]
+        if os.path.isdir(d):
+            args += ["--spuren-ordner", d]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
+        ej = os.path.join(aus, "erkennung.json")
+        if not os.path.isfile(ej):
+            raise RuntimeError("Erkennung: " + (r.stderr or r.stdout or "")[-500:])
+        erkennung = json.load(open(ej, encoding="utf-8"))
+        for e in erkennung:
+            hp = e.pop("hoerprobe", None)
+            if hp and os.path.isfile(hp):
+                name = "hp_" + re.sub(r"[^a-z0-9_-]", "", e["instrument"])
+                ziel = os.path.join(aus, f"{name}.wav")
+                shutil.move(hp, ziel)
+                spuren[name] = ziel
+                e["hoerprobe_spur"] = name
+        extra["erkennung"] = erkennung
+        extra["mit_spuren"] = os.path.isdir(d)
+        for x in ("_hp", "erkennung.json"):
+            p = os.path.join(aus, x)
+            shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else (os.path.isfile(p) and os.remove(p))
     else:
         raise ValueError(f"unbekannte Art: {art}")
     for d in ("_roh1", "_roh2", "_demucs"):
         shutil.rmtree(os.path.join(aus, d), ignore_errors=True)
-    print(json.dumps({"ok": True, "spuren": spuren, "sekunden": round(time.time() - t0, 1), "geraet": geraet()}), flush=True)
+    print(json.dumps({"ok": True, "spuren": spuren, "extra": extra, "sekunden": round(time.time() - t0, 1), "geraet": geraet()},
+                     ensure_ascii=False), flush=True)
     return 0
 
 

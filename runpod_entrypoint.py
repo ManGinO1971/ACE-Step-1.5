@@ -4206,8 +4206,9 @@ def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag):
                 conv, fext = _hieltech_wav_to_flac_file(p)
                 hp, token = _hieltech_handoff_store(conv, fext)
                 results.append({"datei": f"{name}.{fext}", "spur": name, "result_token": token, "size_bytes": os.path.getsize(hp)})
-        return {"ok": bool(results), "results": results, "sekunden": info.get("sekunden"), "geraet": info.get("geraet"),
-                "message": "" if results else "keine Spuren"}
+        extra = info.get("extra") or {}
+        return {"ok": bool(results or extra), "results": results, "extra": extra, "sekunden": info.get("sekunden"),
+                "geraet": info.get("geraet"), "message": "" if (results or extra) else "keine Spuren"}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
