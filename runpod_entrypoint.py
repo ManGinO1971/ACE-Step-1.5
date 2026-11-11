@@ -4379,15 +4379,45 @@ def _hieltech_stems_gesang_sync(src_bytes, filename, lyrics, caption, sprache, t
                     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", varianten[wahl], roh], timeout=300)
                     cur = roh
                     masked = os.path.join(zw, "masked.wav")
-                    args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), cur, os.path.realpath(hp["lead"]), masked,
-                            os.path.realpath(hp["backing"])]
-                    segs = next((sc_.get("segments") for sc_ in scores if sc_.get("variant") == wahl), None)
-                    if segs:
-                        kf = os.path.join(zw, "lead_lines.json")
-                        with open(kf, "w", encoding="utf-8") as f:
-                            json.dump(segs, f)
-                        args.append(kf)
-                    ok_m, _l = _hieltech_run_step(args, timeout=600)
+                    ok_m = False
+                    # 11. Nov 2026: Lead-Maske für JEDEN Song (stems_lead_maske.py): Soll aus dem Original-Gesang,
+                    # Text-/Chor-Masken nur wenn zuverlässig, je Phrase die singende Variante, Abdeckung im Bericht.
+                    # Zurück auf die alte Maske: Umgebungsvariable HIELTECH_STEMS_LEAD_MASKE=alt.
+                    if os.environ.get("HIELTECH_STEMS_LEAD_MASKE", "neu") != "alt":
+                        try:
+                            tf = os.path.join(zw, "lyrics.txt")
+                            with open(tf, "w", encoding="utf-8") as f:
+                                f.write(lyrics or "")
+                            sf_ = os.path.join(zw, "segmente.json")
+                            with open(sf_, "w", encoding="utf-8") as f:
+                                json.dump({str(sc_.get("variant")): sc_.get("segments") or [] for sc_ in scores}, f)
+                            var_wav = []
+                            for i_, v_ in enumerate(varianten):
+                                vw = os.path.join(zw, f"variante_{i_}.wav")
+                                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", v_, vw], timeout=300)
+                                var_wav.append(vw if os.path.isfile(vw) else v_)
+                            ok_m, log_m = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_lead_maske.py"), masked,
+                                                              os.path.realpath(hp["lead"]), os.path.realpath(hp["backing"]), tf, sf_]
+                                                             + var_wav, timeout=900)
+                            info_m = _hieltech_last_json_line(log_m) or {}
+                            ok_m = bool(ok_m and info_m.get("ok") and os.path.isfile(masked))
+                            bericht["lead_maske"] = info_m
+                            if info_m.get("warnungen"):
+                                bericht["warnungen"].extend(f"Lead: {w}" for w in info_m["warnungen"])
+                        except Exception as e:  # noqa: BLE001
+                            bericht["warnungen"].append(f"Neue Lead-Maske fehlgeschlagen, alte Maske benutzt: {e}"[:300])
+                            ok_m = False
+                    if not ok_m:
+                        args = [os.path.join(_HIELTECH_PROJECT_ROOT, "lead_mask_step.py"), cur, os.path.realpath(hp["lead"]), masked,
+                                os.path.realpath(hp["backing"])]
+                        segs = next((sc_.get("segments") for sc_ in scores if sc_.get("variant") == wahl), None)
+                        if segs:
+                            kf = os.path.join(zw, "lead_lines.json")
+                            with open(kf, "w", encoding="utf-8") as f:
+                                json.dump(segs, f)
+                            args.append(kf)
+                        ok_m, _l = _hieltech_run_step(args, timeout=600)
+                        bericht.setdefault("lead_maske", {})["alt"] = True
                     cur = masked if ok_m and os.path.isfile(masked) else cur
                     gated = os.path.join(zw, "gated.wav")
                     ok_g, _l = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "gate_vocal_stem.py"), "--input", cur, "--output", gated], timeout=300)
