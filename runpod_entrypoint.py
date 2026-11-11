@@ -56,6 +56,7 @@ import tempfile
 import threading
 import time
 import uuid
+import hashlib
 import faulthandler
 
 # Bei einem harten Absturz (exit code 139) den Python-Stand aller Threads ins Log schreiben (27. Okt 2026)
@@ -4180,30 +4181,159 @@ async def _hieltech_stems53_start(audio: UploadFile, instrumente: str = Form(def
 # HIELTECH Stems (11. Nov 2026): Trennen für die Mac-App mit Schalter "GPU" – gleiche Modelle wie auf dem Mac
 # (audio-separator: BS-Roformer-SW, Gesang-/Karaoke-Modelle, MDX23C-DrumSep; Demucs; 53-Instrumente-Modell).
 # Rückgabe: je Spur eine FLAC (verlustfrei), die Mac-App rechnet damit weiter.
-def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag):
+# ---- Song-Ablage für die Stems-App (11. Nov 2026): der Song wird EINMAL in Stücken hochgeladen (verlustfrei, beliebig
+# lang) und liegt danach unter seiner Prüfsumme auf dem Volume. Alle weiteren Aufträge schicken nur noch die Prüfsumme;
+# fertige Ergebnisse liegen daneben (erg/) und kommen beim nächsten Mal sofort. Nur dieser eigene Ordner wird aufgeräumt.
+_HIELTECH_STEMS_SONGS_DIR = ("/runpod-volume/hieltech_stems_songs" if os.path.isdir("/runpod-volume")
+                             else os.path.join(tempfile.gettempdir(), "hieltech_stems_songs"))
+_HIELTECH_STEMS_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_HIELTECH_STEMS_SONG_MAX = 700 * 1024 * 1024
+_HIELTECH_STEMS_SONGS_TAGE = 3
+_HIELTECH_STEMS_SONGS_MAX_GB = 8
+
+
+def _hieltech_stems_song_pfad(sha):
+    """Pfad des abgelegten Songs oder None."""
+    if not _HIELTECH_STEMS_SHA_RE.match(sha or ""):
+        return None
+    d = os.path.join(_HIELTECH_STEMS_SONGS_DIR, sha)
+    try:
+        for f in os.listdir(d):
+            if f.startswith("song.") and not f.endswith(".part"):
+                return os.path.join(d, f)
+    except OSError:
+        pass
+    return None
+
+
+def _hieltech_stems_songs_aufraeumen():
+    """Löscht NUR eigene Song-Ordner (Name = Prüfsumme) in der Song-Ablage: älter als 3 Tage oder – ältester zuerst –
+    wenn die Ablage größer als 8 GB wird. Nichts anderes auf dem Volume wird angefasst."""
+    try:
+        eintraege = []
+        for n in os.listdir(_HIELTECH_STEMS_SONGS_DIR):
+            d = os.path.join(_HIELTECH_STEMS_SONGS_DIR, n)
+            if not _HIELTECH_STEMS_SHA_RE.match(n) or not os.path.isdir(d) or os.path.islink(d):
+                continue
+            groesse, juengste = 0, os.path.getmtime(d)
+            for w, _, fs in os.walk(d):
+                for f in fs:
+                    try:
+                        st = os.stat(os.path.join(w, f))
+                        groesse += st.st_size
+                        juengste = max(juengste, st.st_mtime)
+                    except OSError:
+                        pass
+            eintraege.append((juengste, groesse, d))
+        eintraege.sort()
+        gesamt = sum(e[1] for e in eintraege)
+        jetzt = time.time()
+        for juengste, groesse, d in eintraege:
+            zu_alt = jetzt - juengste > _HIELTECH_STEMS_SONGS_TAGE * 86400
+            zu_voll = gesamt > _HIELTECH_STEMS_SONGS_MAX_GB * 1024 ** 3 and jetzt - juengste > 3600
+            if zu_alt or zu_voll:
+                shutil.rmtree(d, ignore_errors=True)
+                gesamt -= groesse
+    except OSError:
+        pass
+
+
+@app.get("/v1/hieltech_stems_song_da")
+async def _hieltech_stems_song_da(sha: str = ""):
+    """Liegt der Song schon auf der GPU? (Dient der App auch zum Vorwärmen: der Aufruf weckt einen Worker.)"""
+    p = await asyncio.to_thread(_hieltech_stems_song_pfad, sha)
+    return {"ok": True, "da": bool(p)}
+
+
+@app.post("/v1/hieltech_stems_song_chunk")
+async def _hieltech_stems_song_chunk(chunk: UploadFile, sha: str = Form(...), ext: str = Form(default=".flac"),
+                                     offset: int = Form(...), total_size: int = Form(...), pruef: str = Form(default="")):
+    """Song in Stücken hochladen (je < 30 MB – RunPods Load-Balancer verwirft größere Anfragen). sha = Kennung des
+    Songs (Prüfsumme der Datei auf dem Mac), pruef = SHA-1 der hochgeladenen Datei (wird am Ende geprüft).
+    Antwort: {"ok", "received", "complete"}"""
+    if not _HIELTECH_STEMS_SHA_RE.match(sha or "") or not re.match(r"^\.[a-z0-9]{1,5}$", ext or ""):
+        return {"ok": False, "error": "invalid_name"}
+    if total_size <= 0 or total_size > _HIELTECH_STEMS_SONG_MAX or offset < 0 or offset >= total_size:
+        return {"ok": False, "error": "invalid_range"}
+    data = await chunk.read()
+    if not data or offset + len(data) > total_size:
+        return {"ok": False, "error": "invalid_chunk"}
+
+    def _write():
+        d = os.path.join(_HIELTECH_STEMS_SONGS_DIR, sha)
+        os.makedirs(d, exist_ok=True)
+        if offset == 0:
+            _hieltech_stems_songs_aufraeumen()
+            os.makedirs(d, exist_ok=True)
+        ziel = os.path.join(d, "song" + ext)
+        teil = ziel + ".part"
+        fd = os.open(teil, os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if offset == 0 else 0), 0o644)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        received = os.path.getsize(teil)
+        complete = offset + len(data) == total_size
+        if complete:
+            if received != total_size:
+                return {"ok": False, "error": "size_mismatch", "message": f"{received} von {total_size} Bytes"}
+            if pruef:
+                h = hashlib.sha1()
+                with open(teil, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
+                if h.hexdigest() != pruef:
+                    os.remove(teil)
+                    return {"ok": False, "error": "pruefsumme_falsch", "message": "Datei kam beschädigt an"}
+            os.replace(teil, ziel)
+        return {"ok": True, "received": received, "complete": complete}
+
+    try:
+        return await asyncio.to_thread(_write)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "write_failed", "message": str(e)[:300]}
+
+
+def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag, song_sha=""):
     work = tempfile.mkdtemp(prefix="hieltech_stems_trennen_")
     results = []
     try:
-        ext = os.path.splitext(filename or "")[1].lower()
-        if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
-            ext = ".wav"
-        song = os.path.join(work, "song" + ext)
-        with open(song, "wb") as f:
-            f.write(src_bytes)
         try:
             json.loads(auftrag or "{}")
         except ValueError:
             return {"ok": False, "error": "auftrag_ungueltig"}
+        zusatz = []
+        if song_sha:
+            song = _hieltech_stems_song_pfad(song_sha)
+            if not song:
+                return {"ok": False, "error": "song_fehlt"}
+            try:
+                os.utime(os.path.dirname(song), None)
+            except OSError:
+                pass
+            zusatz = ["--cache", os.path.join(os.path.dirname(song), "erg")]
+        else:
+            ext = os.path.splitext(filename or "")[1].lower()
+            if not re.match(r"^\.[a-z0-9]{1,5}$", ext):
+                ext = ".wav"
+            song = os.path.join(work, "song" + ext)
+            with open(song, "wb") as f:
+                f.write(src_bytes)
         aus = os.path.join(work, "aus")
-        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_trennen_gpu.py"), song, aus, auftrag],
-                                        timeout=3600)
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_trennen_gpu.py"), song, aus, auftrag]
+                                        + zusatz, timeout=3600)
         info = _hieltech_last_json_line(output) or {}
         if not info.get("ok"):
             return {"ok": False, "error": info.get("error") or "trennen_fehlgeschlagen",
                     "message": info.get("message") or output[-800:]}
         for name, p in (info.get("spuren") or {}).items():
             if os.path.isfile(p):
-                conv, fext = _hieltech_wav_to_flac_file(p)
+                conv, fext = (p, "flac") if p.lower().endswith(".flac") else _hieltech_wav_to_flac_file(p)
                 hp, token = _hieltech_handoff_store(conv, fext)
                 results.append({"datei": f"{name}.{fext}", "spur": name, "result_token": token, "size_bytes": os.path.getsize(hp)})
         extra = info.get("extra") or {}
@@ -4214,10 +4344,19 @@ def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag):
 
 
 @app.post("/v1/hieltech_stems_trennen_start")
-async def _hieltech_stems_trennen_start(audio: UploadFile, auftrag: str = Form(default="{}")):
+async def _hieltech_stems_trennen_start(audio: UploadFile | None = File(default=None), auftrag: str = Form(default="{}"),
+                                        song_sha: str = Form(default="")):
+    """Entweder audio (alte Art, ganzer Song in der Anfrage) oder song_sha (Song liegt schon in der Song-Ablage)."""
+    if song_sha:
+        if not await asyncio.to_thread(_hieltech_stems_song_pfad, song_sha):
+            return {"ok": False, "error": "song_fehlt"}
+    elif audio is None:
+        return {"ok": False, "error": "kein_song"}
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
+    if song_sha:
+        return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, b"", "", auftrag[:4000], song_sha)
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, src_bytes, audio.filename, auftrag[:2000])
 
