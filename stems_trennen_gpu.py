@@ -168,9 +168,23 @@ def rechnen(song, aus, auftrag, cache=None):
     elif art == "erkennen":
         # Instrumenten-Erkennung komplett auf der GPU: 6 Spuren (htdemucs_6s) + Hör-Modell (EfficientAT) je Spur
         roh = os.path.join(aus, "_demucs")
-        r = subprocess.run([sys.executable, "-m", "demucs", "--name", "htdemucs_6s", "--out", roh, "-d", geraet(), song],
-                           capture_output=True, text=True, timeout=3600)
-        d = os.path.join(roh, "htdemucs_6s", os.path.splitext(os.path.basename(song))[0])
+        zeiten = {}
+        d = None
+        fertig = aus_speicher(cache, schluessel({"art": "demucs", "modell": "htdemucs_6s"}))
+        if fertig:                                   # 6 Spuren liegen schon im Speicher -> nicht noch einmal trennen
+            d = os.path.join(aus, "_sechs")
+            os.makedirs(d, exist_ok=True)
+            import soundfile as sf
+            for n, p in fertig[0].items():
+                y, sr = sf.read(p, always_2d=True)
+                sf.write(os.path.join(d, f"{n}.wav"), y, sr, subtype="PCM_16")
+        else:
+            tt = time.time()
+            r = subprocess.run([sys.executable, "-m", "demucs", "--name", "htdemucs_6s", "--out", roh, "-d", geraet(), song],
+                               capture_output=True, text=True, timeout=3600)
+            d = os.path.join(roh, "htdemucs_6s", os.path.splitext(os.path.basename(song))[0])
+            zeiten["trennen_6_spuren"] = round(time.time() - tt, 1)
+        tt = time.time()
         args = [sys.executable, os.path.join(HERE, "hieltech_erkennung", "detect_instruments_eat.py"), song,
                 os.path.join(aus, "erkennung.json"), "--hoerproben", os.path.join(aus, "_hp")]
         if os.path.isdir(d):
@@ -180,6 +194,14 @@ def rechnen(song, aus, auftrag, cache=None):
         if not os.path.isfile(ej):
             raise RuntimeError("Erkennung: " + (r.stderr or r.stdout or "")[-500:])
         erkennung = json.load(open(ej, encoding="utf-8"))
+        zeiten["erkennen"] = round(time.time() - tt, 1)
+        for z in (r.stdout or "").splitlines():
+            if z.startswith("ZEITEN "):
+                try:
+                    zeiten["hoer_modell"] = json.loads(z[7:])
+                except ValueError:
+                    pass
+        extra["zeiten"] = zeiten
         for e in erkennung:
             hp = e.pop("hoerprobe", None)
             if hp and os.path.isfile(hp):
@@ -190,14 +212,14 @@ def rechnen(song, aus, auftrag, cache=None):
                 e["hoerprobe_spur"] = name
         extra["erkennung"] = erkennung
         extra["mit_spuren"] = os.path.isdir(d)
-        if cache and os.path.isdir(d):
+        if cache and os.path.isdir(d) and not fertig:
             try:
                 sechs = {os.path.splitext(f)[0]: os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".wav")}
                 if sechs:
                     in_speicher(cache, schluessel({"art": "demucs", "modell": "htdemucs_6s"}), sechs, {})
             except Exception:  # noqa: BLE001 – nur ein Nebenergebnis
                 pass
-        for x in ("_hp", "erkennung.json"):
+        for x in ("_hp", "_sechs", "erkennung.json"):
             p = os.path.join(aus, x)
             shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else (os.path.isfile(p) and os.remove(p))
     else:

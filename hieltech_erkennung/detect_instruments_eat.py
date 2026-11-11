@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 HELTECH Stems – Instrumenten-Erkennung v2 (Stand 5. Nov 2026), ersetzt die CLAP-Erkennung.
-GPU-Fassung für RunPod (11. Nov 2026): gleiche Logik wie auf dem Mac, rechnet auf der GPU; Gewichte auf dem Netz-Speicher.
+Eine Fassung für Mac und RunPod (11. Nov 2026): gleiche Logik überall. Das Hör-Modell rechnet auf der schnellsten
+vorhandenen Recheneinheit (NVIDIA-GPU auf RunPod, Apple-GPU „MPS“ auf dem Mac, sonst CPU). Die Vorarbeit je Spur
+(Ton-Teil/Schlag-Teil herausrechnen) läuft für alle Spuren gleichzeitig auf mehreren Prozessor-Kernen.
 
 Hör-Modell: EfficientAT mn40_as_ext (MobileNet, trainiert auf AudioSet: >2 Mio. echte Aufnahmen,
 527 Klangklassen, mAP 0,487; MIT-Lizenz). Gewichte (274 MB) werden beim ersten Lauf von GitHub geladen.
@@ -101,29 +103,61 @@ def modell():
         m.eval()
         mel = AugmentMelSTFT(n_mels=128, sr=SR, win_length=800, hopsize=320)
         mel.eval()
-        import torch
         global GERAET
-        GERAET = "cuda" if torch.cuda.is_available() else "cpu"
+        GERAET = geraet_waehlen(m, mel)
         m, mel = m.to(GERAET), mel.to(GERAET)
     finally:
         os.chdir(cwd)
     return m, mel
 
 
+def geraet_waehlen(m, mel):
+    """Schnellste Recheneinheit, die das Hör-Modell wirklich rechnen kann: cuda, sonst mps (Apple), sonst cpu.
+    HIELTECH_EAT_GERAET=cpu erzwingt die CPU."""
+    import torch
+    wunsch = (os.environ.get("HIELTECH_EAT_GERAET") or "").strip().lower()
+    if wunsch == "cpu":
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    try:
+        if torch.backends.mps.is_available():
+            x = torch.zeros(2, int(FENSTER * SR)).to("mps")          # kleine Probe: geht das Modell auf der Apple-GPU?
+            with torch.no_grad():
+                p, _ = m.to("mps")(mel.to("mps")(x).unsqueeze(1))
+            if bool(torch.isfinite(p.float()).all().cpu()):
+                return "mps"
+    except Exception:  # noqa: BLE001 – dann eben CPU
+        pass
+    m.to("cpu"), mel.to("cpu")
+    return "cpu"
+
+
 def zeitleiste(m, mel, y):
     import torch
+    global GERAET
     w, h = int(FENSTER * SR), int(SCHRITT * SR)
     starts = list(range(0, max(1, len(y) - w + 1), h))
     out = []
-    for i in range(0, len(starts), 16):
+    n = 16 if (GERAET or "cpu") == "cpu" else 64
+    for i in range(0, len(starts), n):
         batch = []
-        for s in starts[i:i + 16]:
+        for s in starts[i:i + n]:
             seg = y[s:s + w]
             batch.append(np.pad(seg, (0, w - len(seg))) if len(seg) < w else seg)
-        x = torch.from_numpy(np.stack(batch)).float().to(GERAET or "cpu")
-        with torch.no_grad():
-            p, _ = m(mel(x).unsqueeze(1))
-            out.append(torch.sigmoid(p.float()).cpu().numpy())
+        x = torch.from_numpy(np.stack(batch)).float()
+        try:
+            with torch.no_grad():
+                p, _ = m(mel(x.to(GERAET or "cpu")).unsqueeze(1))
+                out.append(torch.sigmoid(p.float()).cpu().numpy())
+        except Exception:  # noqa: BLE001 – Apple-GPU kann etwas nicht: auf der CPU weiter
+            if (GERAET or "cpu") != "mps":
+                raise
+            GERAET = "cpu"
+            m.to("cpu"), mel.to("cpu")
+            with torch.no_grad():
+                p, _ = m(mel(x).unsqueeze(1))
+                out.append(torch.sigmoid(p.float()).numpy())
     return np.array(starts) / SR, np.concatenate(out)
 
 
@@ -151,7 +185,9 @@ SPUR_ERLAUBT = {
 }
 
 
-def analyse(pfad, m, mel, lab, ansichten=("voll", "ton", "schlag")):
+def teile_rechnen(pfad, ansichten=("voll", "ton", "schlag")):
+    """Vorarbeit für eine Datei (nur Prozessor, kein Modell): ganz, Ton-Teil, Schlag-Teil. Läuft für mehrere Spuren
+    gleichzeitig in eigenen Prozessen."""
     import librosa
     y, _ = librosa.load(pfad, sr=SR, mono=True)
     teile = {"voll": y}
@@ -159,10 +195,16 @@ def analyse(pfad, m, mel, lab, ansichten=("voll", "ton", "schlag")):
         S = librosa.stft(y, n_fft=2048, hop_length=512)
         if "ton" in ansichten:
             H, _ = librosa.decompose.hpss(S, margin=(1.0, 3.0))
-            teile["ton"] = librosa.istft(H, hop_length=512, length=len(y))
+            teile["ton"] = librosa.istft(H, hop_length=512, length=len(y)).astype(np.float32)
         if "schlag" in ansichten:
             _, P = librosa.decompose.hpss(S, margin=(3.0, 1.0))
-            teile["schlag"] = librosa.istft(P, hop_length=512, length=len(y))
+            teile["schlag"] = librosa.istft(P, hop_length=512, length=len(y)).astype(np.float32)
+    return teile
+
+
+def analyse(pfad, m, mel, lab, ansichten=("voll", "ton", "schlag"), teile=None):
+    if teile is None:
+        teile = teile_rechnen(pfad, ansichten)
     V = {}
     for name in ansichten:
         t, Pr = zeitleiste(m, mel, teile[name])
@@ -241,10 +283,30 @@ def hoerproben_schneiden(res, ordner, quelle_fuer):
         r["hoerprobe"] = f
 
 
+def _ansichten(spur):
+    return ("voll", "schlag") if spur == "drums" else ("voll", "ton")
+
+
 def erkennen(pfad, hoerproben=None, spuren=None):
+    import time
+    t0 = time.time()
+    vorarbeit, pool = {}, None
+    if spuren and len(spuren) > 1:
+        # Vorarbeit aller Spuren gleichzeitig starten (eigene Prozesse) – währenddessen lädt hier das Hör-Modell
+        try:
+            import multiprocessing as mp
+            from concurrent.futures import ProcessPoolExecutor
+            kerne = max(1, min(len(spuren), (os.cpu_count() or 2) - 1, 6))
+            if kerne > 1:
+                pool = ProcessPoolExecutor(max_workers=kerne, mp_context=mp.get_context("spawn"))
+                vorarbeit = {spur: pool.submit(teile_rechnen, sp, _ansichten(spur)) for spur, sp in spuren.items()}
+        except Exception:  # noqa: BLE001 – dann nacheinander wie bisher
+            vorarbeit, pool = {}, None
     melde("… lade Hör-Modell (beim ersten Mal 274 MB Download)")
     m, mel = modell()
+    melde(f"… Hör-Modell rechnet auf: {GERAET}")
     lab = ek.labels(EAT_DIR)
+    t_modell = time.time() - t0
     if not spuren:
         melde("… höre die Datei (ganz, Ton-Teil, Schlag-Teil)")
         t, K = analyse(pfad, m, mel, lab)
@@ -256,16 +318,27 @@ def erkennen(pfad, hoerproben=None, spuren=None):
     for spur, sp in spuren.items():
         erlaubt = SPUR_ERLAUBT.get(spur, set(ALLE_53))
         melde(f"… höre Spur „{spur}“")
-        t, K = analyse(sp, m, mel, lab, ("voll", "schlag") if spur == "drums" else ("voll", "ton"))
+        teile = None
+        if spur in vorarbeit:
+            try:
+                teile = vorarbeit[spur].result(timeout=1800)
+            except Exception:  # noqa: BLE001 – diese Spur dann hier rechnen
+                teile = None
+        t, K = analyse(sp, m, mel, lab, _ansichten(spur), teile)
         for k, r in entscheiden(t, K, erlaubt).items():
             r["spur"] = spur
             r["spur_datei"] = sp
             alt = gesamt.get(k)
             if alt is None or (r["detected"], r["margin"]) > (alt["detected"], alt["margin"]):
                 gesamt[k] = r
+    if pool is not None:
+        pool.shutdown(wait=False)
     res = aufraeumen(gesamt)
+    t_hoeren = time.time() - t0 - t_modell
     if hoerproben:
         hoerproben_schneiden(res, hoerproben, lambda r: r.get("spur_datei", pfad))
+    print("ZEITEN " + json.dumps({"modell_laden": round(t_modell, 1), "hoeren": round(t_hoeren, 1),
+                                  "gesamt": round(time.time() - t0, 1), "geraet": GERAET}), flush=True)
     for r in res:
         r.pop("spur_datei", None)
     return res
