@@ -4307,7 +4307,7 @@ async def _hieltech_stems_song_chunk(chunk: UploadFile, sha: str = Form(...), ex
         return {"ok": False, "error": "write_failed", "message": str(e)[:300]}
 
 
-def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag, song_sha=""):
+def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag, song_sha="", nur_speichern=False):
     work = tempfile.mkdtemp(prefix="hieltech_stems_trennen_")
     results = []
     try:
@@ -4339,6 +4339,9 @@ def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag, song_sha=""):
         if not info.get("ok"):
             return {"ok": False, "error": info.get("error") or "trennen_fehlgeschlagen",
                     "message": info.get("message") or output[-800:]}
+        if nur_speichern and song_sha:           # Vorbereiten: Ergebnis liegt im Speicher des Songs, nichts übertragen
+            return {"ok": True, "results": [], "extra": {"gespeichert": sorted(info.get("spuren") or {})},
+                    "sekunden": info.get("sekunden"), "geraet": info.get("geraet")}
         for name, p in (info.get("spuren") or {}).items():
             if os.path.isfile(p):
                 conv, fext = (p, "flac") if p.lower().endswith(".flac") else _hieltech_wav_to_flac_file(p)
@@ -4404,6 +4407,12 @@ _HIELTECH_REPARIEREN_MODULE = {
                 "schalter": {"--song": "datei", "--klang": 1, "--nicht-mithoeren": 0, "--midi-bpm": 1,
                              "--spuren-ordner": "ordner"}},
 }
+# Fertige Spuren statt eigener Trennung (12. Nov 2026): diese Module brauchen die 6 Spuren des Songs. Der Server holt sie
+# aus dem Ergebnis-Speicher des Songs (oder rechnet sie EINMAL dorthin) und übergibt sie als --spuren-ordner – jedes
+# weitere Modul für denselben Song trennt dann nicht noch einmal. Gleiches Trenn-Modell wie im Modul selbst.
+_HIELTECH_SECHS = {"art": "sep", "modell": "BS-Roformer-SW.ckpt"}
+for _name in ("gitarre", "orgel", "picking", "lead"):
+    _HIELTECH_REPARIEREN_MODULE[_name]["spuren"] = _HIELTECH_SECHS
 for _m in _HIELTECH_REPARIEREN_MODULE.values():
     for _paket, _env in (_m.get("klang_env") or {}).items():
         os.environ.setdefault(_env, os.path.join(_HIELTECH_STEMS_KLANG_DIR, _paket))
@@ -4536,6 +4545,87 @@ async def _hieltech_stems_klang_chunk(chunk: UploadFile, paket: str = Form(...),
         return {"ok": False, "error": "write_failed", "message": str(e)[:300]}
 
 
+def _hieltech_stems_erg_eintrag(song_pfad, auftrag, spur=""):
+    """{spur: flac-pfad} eines fertigen Auftrags aus dem Ergebnis-Speicher dieses Songs – oder None."""
+    try:
+        from stems_trennen_gpu import schluessel as _schluessel
+        erg = os.path.join(os.path.dirname(song_pfad), "erg")
+        key = f"s53_{spur}" if auftrag.get("art") == "s53" and spur else _schluessel(auftrag)
+        d = os.path.join(erg, key)
+        with open(os.path.join(d, "fertig.json"), encoding="utf-8") as f:
+            info = json.load(f)
+        spuren = {n: os.path.join(d, fn) for n, fn in info["spuren"].items()}
+        if spuren and all(os.path.isfile(p) for p in spuren.values()):
+            os.utime(d, None)
+            return spuren
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _hieltech_stems_spuren_ordner(song_pfad, auftrag, work):
+    """Stellt die Spuren eines Auftrags als WAV-Ordner bereit: aus dem Ergebnis-Speicher – oder einmal gerechnet und
+    dort abgelegt. Rückgabe (ordner oder None, Sekunden fürs Trennen; 0 = kam aus dem Speicher)."""
+    t0 = time.time()
+    spuren = _hieltech_stems_erg_eintrag(song_pfad, auftrag)
+    gerechnet = 0.0
+    if not spuren:
+        _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, "stems_trennen_gpu.py"), song_pfad,
+                            os.path.join(work, "trenn_aus"), json.dumps(auftrag),
+                            "--cache", os.path.join(os.path.dirname(song_pfad), "erg")], timeout=3600)
+        spuren = _hieltech_stems_erg_eintrag(song_pfad, auftrag)
+        gerechnet = round(time.time() - t0, 1)
+    if not spuren:
+        return None, gerechnet
+    ordner = os.path.join(work, "spuren")
+    os.makedirs(ordner, exist_ok=True)
+    for n, p in spuren.items():
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", p, "-c:a", "pcm_s24le",
+                            os.path.join(ordner, f"{n}.wav")], capture_output=True, timeout=600)
+        if r.returncode != 0:
+            return None, gerechnet
+    return ordner, gerechnet
+
+
+@app.post("/v1/hieltech_stems_song_aus_spur")
+async def _hieltech_stems_song_aus_spur(sha: str = Form(...), song_sha: str = Form(...), auftrag: str = Form(...),
+                                        spur: str = Form(...)):
+    """Eine Spur, die schon im Ergebnis-Speicher eines Songs liegt, ohne erneutes Hochladen als Eingabe bereitstellen
+    (z. B. die Bass-Spur fürs Bass-Reparieren). sha = Kennung, unter der die App die Spur kennt."""
+    if not _HIELTECH_STEMS_SHA_RE.match(sha or "") or not re.match(r"^[A-Za-z0-9_\-]{1,40}$", spur or ""):
+        return {"ok": False, "error": "invalid_name"}
+
+    def _mach():
+        if _hieltech_stems_song_pfad(sha):
+            return {"ok": True, "da": True}
+        song = _hieltech_stems_song_pfad(song_sha)
+        if not song:
+            return {"ok": True, "da": False}
+        try:
+            a = json.loads(auftrag)
+        except ValueError:
+            return {"ok": False, "error": "auftrag_ungueltig"}
+        spuren = _hieltech_stems_erg_eintrag(song, a, spur) or {}
+        quelle = spuren.get(spur)
+        if not quelle:
+            return {"ok": True, "da": False}
+        d = os.path.join(_HIELTECH_STEMS_SONGS_DIR, sha)
+        os.makedirs(d, exist_ok=True)
+        ziel = os.path.join(d, "song.flac")
+        tmp = ziel + f".tmp{os.getpid()}"
+        try:
+            os.link(quelle, tmp)                 # gleiche Datei, kein zweiter Platzverbrauch
+        except OSError:
+            shutil.copyfile(quelle, tmp)
+        os.replace(tmp, ziel)
+        return {"ok": True, "da": True}
+
+    try:
+        return await asyncio.to_thread(_mach)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "write_failed", "message": str(e)[:300]}
+
+
 def _hieltech_stems_reparieren_args(modul, argumente):
     """Prüft die Aufruf-Argumente gegen die erlaubten Schalter des Moduls. Rückgabe Liste oder None.
     Datei-/Ordner-Werte bleiben als @datei:<sha> / @ordner:<sha> stehen und werden erst im Auftrag aufgelöst."""
@@ -4624,9 +4714,18 @@ def _hieltech_stems_reparieren_sync(song_sha, modul, args):
         if fehler:
             return {"ok": False, "error": fehler}
         aus = os.path.join(work, "aus")
-        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_REPARIEREN_DIR, m["skript"]), song, aus] + args
+        zeiten = {}
+        if m.get("spuren") and "--spuren-ordner" not in args:
+            ordner, zeiten["trennen"] = _hieltech_stems_spuren_ordner(song, m["spuren"], work)
+            zeiten["spuren_aus_speicher"] = bool(ordner) and not zeiten["trennen"]
+            if ordner:
+                args = args + ["--spuren-ordner", ordner]
+        t_modul = time.time()
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_REPARIEREN_DIR, "_lauf.py"),
+                                         os.path.join(_HIELTECH_REPARIEREN_DIR, m["skript"]), song, aus] + args
                                         + (["--modelle", _HIELTECH_STEMS_UVR_DIR] if m.get("modelle") else []),
                                         timeout=7200)
+        zeiten["modul"] = round(time.time() - t_modul, 1)
         info = _hieltech_last_json_line(output) or {}
         if not info.get("ok"):
             return {"ok": False, "error": "reparieren_fehlgeschlagen",
@@ -4656,7 +4755,7 @@ def _hieltech_stems_reparieren_sync(song_sha, modul, args):
             eintrag.update({"result_token": token, "size_bytes": os.path.getsize(hp)})
             results.append(eintrag)
         return {"ok": bool(results), "results": results, "aus_ordner": aus, "ausgabe": output[-6000:],
-                "sekunden": round(time.time() - t0, 1), "geraet": "cuda" if os.path.isdir("/runpod-volume") else "test",
+                "zeiten": zeiten, "sekunden": round(time.time() - t0, 1), "geraet": "cuda" if os.path.isdir("/runpod-volume") else "test",
                 "message": "" if results else "keine Dateien"}
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -4695,7 +4794,7 @@ async def _hieltech_stems_reparieren_start(song_sha: str = Form(...), modul: str
 
 @app.post("/v1/hieltech_stems_trennen_start")
 async def _hieltech_stems_trennen_start(audio: UploadFile | None = File(default=None), auftrag: str = Form(default="{}"),
-                                        song_sha: str = Form(default="")):
+                                        song_sha: str = Form(default=""), nur_speichern: str = Form(default="")):
     """Entweder audio (alte Art, ganzer Song in der Anfrage) oder song_sha (Song liegt schon in der Song-Ablage)."""
     if song_sha:
         if not await asyncio.to_thread(_hieltech_stems_song_pfad, song_sha):
@@ -4706,7 +4805,8 @@ async def _hieltech_stems_trennen_start(audio: UploadFile | None = File(default=
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}
     if song_sha:
-        return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, b"", "", auftrag[:4000], song_sha)
+        return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, b"", "", auftrag[:4000], song_sha,
+                                   nur_speichern.strip() in ("1", "true", "ja"))
     src_bytes = await audio.read()
     return _hieltech_job_start("lora_test", _hieltech_stems_trennen_sync, src_bytes, audio.filename, auftrag[:2000])
 
