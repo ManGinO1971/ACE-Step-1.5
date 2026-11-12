@@ -47,6 +47,42 @@ def tag_von(datei):
     return re.sub(r"[^a-z0-9]+", "_", tags[-1].lower()).strip("_") if tags else os.path.splitext(os.path.basename(datei))[0].lower()
 
 
+def alle_spuren_sichern(sep_obj, eingabe, roh, dateien):
+    """Manche Fassungen von audio-separator speichern bei Modellen mit mehr als zwei Spuren (z. B. DrumSep: Kick, Snare,
+    Toms, Hi-Hat, Ride, Crash) nur die ersten zwei. Das Modell liefert intern aber alle – dann werden sie hier direkt
+    abgeholt und gespeichert (auf RunPod so erprobt in stems_drums_step.py). Rückgabe: Liste aller Dateien."""
+    import numpy as np
+    import soundfile as sf
+    try:
+        mi = sep_obj.model_instance
+        cfg = getattr(mi, "model_data_cfgdict", None)
+        namen = [str(n) for n in cfg.training.instruments]
+    except Exception:  # noqa: BLE001 – Modell ohne Spuren-Liste (z. B. VR-/Demucs-Modelle): nichts zu tun
+        return dateien
+    da = " ".join(os.path.basename(f).lower() for f in dateien)
+    if len(namen) <= 2 or all(f"({n.lower()})" in da for n in namen):
+        return dateien
+    mi.audio_file_path = eingabe
+    mi.audio_file_base = os.path.splitext(os.path.basename(eingabe))[0]
+    quellen = mi.demix(mix=mi.prepare_mix(eingabe))
+    if not isinstance(quellen, dict):
+        return dateien
+    sr = int(getattr(mi, "sample_rate", 44100) or 44100)
+    neu = []
+    for n in namen:
+        if n not in quellen:
+            continue
+        y = np.asarray(quellen[n], dtype=np.float32)
+        y = y.T if y.ndim == 2 and y.shape[0] == 2 else y
+        spitze = float(np.max(np.abs(y))) if y.size else 0.0
+        if spitze > 0.9:                                   # wie audio-separator: nur zu laute Spuren absenken
+            y = y * (0.9 / spitze)
+        p = os.path.join(roh, f"{mi.audio_file_base}_({n})_direkt.wav")
+        sf.write(p, y, sr, subtype="PCM_24")
+        neu.append(p)
+    return neu or dateien
+
+
 def sep(eingabe, modell, roh):
     from audio_separator.separator import Separator
     import logging
@@ -54,7 +90,8 @@ def sep(eingabe, modell, roh):
     os.makedirs(roh, exist_ok=True)
     s = Separator(output_dir=roh, model_file_dir=UVR_DIR, output_format="WAV", log_level=logging.WARNING)
     s.load_model(model_filename=modell)
-    return [f if os.path.isabs(f) else os.path.join(roh, f) for f in s.separate(eingabe)]
+    dateien = [f if os.path.isabs(f) else os.path.join(roh, f) for f in s.separate(eingabe)]
+    return alle_spuren_sichern(s, eingabe, roh, dateien)
 
 
 def als_flac(wav, ziel):
@@ -68,8 +105,13 @@ def als_flac(wav, ziel):
     return ziel
 
 
+SPEICHER_FASSUNG = "2"      # erhöhen, wenn alte Einträge im Ergebnis-Speicher nicht mehr gelten sollen
+                            # (2: Mehrspur-Modelle wie DrumSep liefern jetzt alle Spuren statt nur zwei)
+
+
 def schluessel(auftrag):
-    return hashlib.sha1(json.dumps(auftrag, sort_keys=True).encode()).hexdigest()[:16]
+    fassung = SPEICHER_FASSUNG if auftrag.get("art") == "sep" else ""
+    return hashlib.sha1((json.dumps(auftrag, sort_keys=True) + fassung).encode()).hexdigest()[:16]
 
 
 def aus_speicher(cache, key):
