@@ -4361,16 +4361,89 @@ _HIELTECH_STEMS_UVR_DIR = ("/runpod-volume/hieltech_uvr_models" if os.path.isdir
                            else os.path.join(_HIELTECH_PROJECT_ROOT, "uvr_models"))
 _HIELTECH_STEMS_KLANG_NAME_RE = re.compile(r"^[a-z0-9_]{2,30}$")
 _HIELTECH_STEMS_KLANG_MAX = 3 * 1024 ** 3
-_HIELTECH_STEMS_ARG_WERT_RE = re.compile(r"^[A-Za-z0-9_.,+\-]{1,40}$")
-# modul -> Skript, Klang-Paket, Umgebungsvariable für den Klang-Ordner, erlaubte Schalter (0 = ohne Wert, 1 = mit Wert)
+_HIELTECH_STEMS_ARG_WERT_RE = re.compile(r"^[A-Za-z0-9_.,:+\-]{1,40}$")
+_HIELTECH_STEMS_ARG_DATEI_RE = re.compile(r"^@(datei|ordner):([0-9a-f]{40})$")
+_HIELTECH_REPARIEREN_DIR = os.path.join(_HIELTECH_PROJECT_ROOT, "hieltech_reparieren")
+# Eigene Python-Umgebung nur für die Noten-Erkennung (Basic Pitch), siehe Dockerfile.runpod
+os.environ.setdefault("HIELTECH_MIDI_PYTHON", "/opt/hieltech_noten_venv/bin/python")
+# modul -> Skript (unter hieltech_reparieren/), Klang-Pakete, erlaubte Schalter.
+#   Schalter-Arten: 0 = ohne Wert, 1 = einfacher Wert, "datei"/"ordner" = vorher hochgeladene Datei bzw. gepackter
+#   Ordner (@datei:<sha> / @ordner:<sha>), "json" = JSON-Text.
+#   klang_env: Paket liegt direkt im Ordner dieser Umgebungsvariable (Schlagzeug); sonst wird jeder Eintrag des
+#   Pakets als Verknüpfung in den gleichnamigen Code-Ordner gelegt (z. B. bass_neu/samples).
 _HIELTECH_REPARIEREN_MODULE = {
-    "drums": {"skript": os.path.join("hieltech_reparieren", "drum_neu", "drums_neu_step.py"),
-              "klang": "drums", "klang_env": "HIELTECH_DRUM_SAMPLES",
+    "drums": {"skript": os.path.join("drum_neu", "drums_neu_step.py"), "klang": ["drums"], "modelle": True,
+              "klang_env": {"drums": "HIELTECH_DRUM_SAMPLES"},
               "schalter": {"--fremd-trommel": 0, "--timing-korrigieren": 0, "--hh-ref": 1, "--nur": 1,
                            "--rimshot-note": 1, "--midi-bpm": 1}},
+    "bass": {"skript": os.path.join("bass_neu", "bass_neu_step.py"), "klang": ["bass_neu"], "modelle": False,
+             "schalter": {"--klang-wie-original": 0, "--midi-bpm": 1, "--schlagzeug": "datei",
+                          "--timing-fenster-ms": 1, "--timing-korrigieren": 0}},
+    "gitarre": {"skript": os.path.join("gitarre_neu", "gitarre_neu_step.py"), "klang": ["gitarre_neu"], "modelle": True,
+                "schalter": {"--timing-korrigieren": 0, "--midi-bpm": 1, "--lautstaerke-db": 1,
+                             "--spuren-ordner": "ordner", "--muster": 1}},
+    "piano": {"skript": os.path.join("piano_neu", "piano_neu_step.py"), "klang": ["piano_neu"], "modelle": True,
+              "schalter": {"--klang": 1, "--ganzer-song": 0, "--timing-korrigieren": 0, "--midi-bpm": 1,
+                           "--spuren-ordner": "ordner", "--lautstaerke-db": 1}},
+    "orgel": {"skript": os.path.join("orgel_neu", "orgel_neu_step.py"), "klang": ["piano_neu"], "modelle": True,
+              "schalter": {"--klang": 1, "--ohne-swing": 0, "--leslie": 1, "--ohne-zusatztoene": 0, "--midi-bpm": 1,
+                           "--lautstaerke-db": 1, "--spuren-ordner": "ordner"}},
+    "picking": {"skript": os.path.join("picking_neu", "picking_neu_step.py"), "klang": ["picking_neu", "piano_neu"],
+                "modelle": True,
+                "schalter": {"--klang": 1, "--effekt": 1, "--timing": 1, "--midi-bpm": 1, "--lautstaerke-db": 1,
+                             "--spuren-ordner": "ordner", "--modus": 1}},
+    "perc": {"skript": os.path.join("perc_neu", "perc_neu_step.py"), "klang": ["perc_neu"], "modelle": False,
+             "schalter": {"--modus": 1, "--analyse": "ordner", "--zuordnung": "json", "--nur": 1, "--song": "datei",
+                          "--congas": "datei",
+                          "--trommel": 1, "--stimmung": 1, "--schelle": 1, "--shaker": 1, "--glocke": 1, "--holz": 1,
+                          "--klatschen": 1, "--midi-bpm": 1}},
+    "lead": {"skript": os.path.join("lead_neu", "lead_neu_step.py"), "klang": ["lead_neu", "piano_neu", "picking_neu"], "modelle": True,
+             "schalter": {"--klang": 1, "--effekt": 1, "--nur-gitarre": 0, "--midi-bpm": 1, "--spuren-ordner": "ordner"}},
+    "blaeser": {"skript": os.path.join("blaeser_neu", "blaeser_neu_step.py"), "klang": ["piano_neu", "lead_neu"],
+                "modelle": True,
+                "schalter": {"--song": "datei", "--klang": 1, "--nicht-mithoeren": 0, "--midi-bpm": 1,
+                             "--spuren-ordner": "ordner"}},
 }
 for _m in _HIELTECH_REPARIEREN_MODULE.values():
-    os.environ.setdefault(_m["klang_env"], os.path.join(_HIELTECH_STEMS_KLANG_DIR, _m["klang"]))
+    for _paket, _env in (_m.get("klang_env") or {}).items():
+        os.environ.setdefault(_env, os.path.join(_HIELTECH_STEMS_KLANG_DIR, _paket))
+
+
+def _hieltech_stems_klang_verknuepfen(modul):
+    """Legt die Klang-Pakete des Moduls als Verknüpfungen in die Code-Ordner (z. B. bass_neu/samples ->
+    Volume) und macht die Erkennung (Hör-Modell) für die Orgel erreichbar. Rückgabe '' oder Fehlertext."""
+    m = _HIELTECH_REPARIEREN_MODULE[modul]
+    try:
+        for paket in m["klang"]:
+            if paket in (m.get("klang_env") or {}):
+                continue
+            quelle = os.path.join(_HIELTECH_STEMS_KLANG_DIR, paket)
+            ziel_dir = os.path.join(_HIELTECH_REPARIEREN_DIR, paket)
+            os.makedirs(ziel_dir, exist_ok=True)
+            for e in os.listdir(quelle):
+                if e.startswith("."):
+                    continue
+                link, soll = os.path.join(ziel_dir, e), os.path.join(quelle, e)
+                if os.path.islink(link):
+                    if os.readlink(link) == soll:
+                        continue
+                    os.remove(link)
+                elif os.path.exists(link):
+                    continue                      # echte Datei/Ordner im Code hat Vorrang
+                os.symlink(soll, link)
+        for e in ("detect_instruments_eat.py", "hoermodell"):     # Orgel: Hör-Modell der Erkennung mitbenutzen
+            link, soll = os.path.join(_HIELTECH_REPARIEREN_DIR, e), os.path.join(_HIELTECH_PROJECT_ROOT, "hieltech_erkennung", e)
+            if not os.path.lexists(link) and os.path.exists(soll):
+                os.symlink(soll, link)
+        return ""
+    except OSError as e:
+        return f"Klänge verknüpfen fehlgeschlagen: {e}"
+
+
+@app.get("/v1/hieltech_stems_reparieren_module")
+async def _hieltech_stems_reparieren_module():
+    """Welche Reparatur-Module kennt dieser Build? (Die App fragt das, bevor sie etwas hochlädt.)"""
+    return {"ok": True, "module": {n: {"klang": m["klang"]} for n, m in _HIELTECH_REPARIEREN_MODULE.items()}}
 
 
 def _hieltech_stems_klang_pruef(paket):
@@ -4464,13 +4537,14 @@ async def _hieltech_stems_klang_chunk(chunk: UploadFile, paket: str = Form(...),
 
 
 def _hieltech_stems_reparieren_args(modul, argumente):
-    """Prüft die Aufruf-Argumente gegen die erlaubten Schalter des Moduls. Rückgabe Liste oder None."""
+    """Prüft die Aufruf-Argumente gegen die erlaubten Schalter des Moduls. Rückgabe Liste oder None.
+    Datei-/Ordner-Werte bleiben als @datei:<sha> / @ordner:<sha> stehen und werden erst im Auftrag aufgelöst."""
     erlaubt = _HIELTECH_REPARIEREN_MODULE[modul]["schalter"]
     try:
         roh = json.loads(argumente or "[]")
     except ValueError:
         return None
-    if not isinstance(roh, list) or len(roh) > 40:
+    if not isinstance(roh, list) or len(roh) > 60:
         return None
     out, i = [], 0
     while i < len(roh):
@@ -4478,13 +4552,57 @@ def _hieltech_stems_reparieren_args(modul, argumente):
         if not isinstance(a, str) or a not in erlaubt:
             return None
         out.append(a)
-        if erlaubt[a]:
-            if i + 1 >= len(roh) or not isinstance(roh[i + 1], str) or not _HIELTECH_STEMS_ARG_WERT_RE.match(roh[i + 1]):
+        art = erlaubt[a]
+        if art:
+            if i + 1 >= len(roh) or not isinstance(roh[i + 1], str):
                 return None
-            out.append(roh[i + 1])
+            w = roh[i + 1]
+            if art in ("datei", "ordner"):
+                t = _HIELTECH_STEMS_ARG_DATEI_RE.match(w)
+                if not t or t.group(1) != art:
+                    return None
+            elif art == "json":
+                try:
+                    json.loads(w)
+                except ValueError:
+                    return None
+                if len(w) > 6000:
+                    return None
+            elif not _HIELTECH_STEMS_ARG_WERT_RE.match(w):
+                return None
+            out.append(w)
             i += 1
         i += 1
     return out
+
+
+def _hieltech_stems_reparieren_aufloesen(args, work):
+    """Ersetzt @datei:<sha> durch den Pfad der hochgeladenen Datei und @ordner:<sha> durch einen entpackten Ordner.
+    Rückgabe (args, fehler)."""
+    import zipfile
+    out = []
+    for n, w in enumerate(args):
+        t = _HIELTECH_STEMS_ARG_DATEI_RE.match(w) if isinstance(w, str) else None
+        if not t:
+            out.append(w)
+            continue
+        p = _hieltech_stems_song_pfad(t.group(2))
+        if not p:
+            return None, "song_fehlt"
+        if t.group(1) == "datei":
+            out.append(p)
+            continue
+        ziel = os.path.join(work, f"ordner_{n}")
+        os.makedirs(ziel)
+        wurzel = os.path.realpath(ziel)
+        with zipfile.ZipFile(p) as z:
+            for i in z.infolist():
+                q = os.path.realpath(os.path.join(ziel, i.filename))
+                if not (q == wurzel or q.startswith(wurzel + os.sep)):
+                    return None, "unsicherer_pfad"
+            z.extractall(ziel)
+        out.append(ziel)
+    return out, ""
 
 
 def _hieltech_stems_reparieren_sync(song_sha, modul, args):
@@ -4499,18 +4617,30 @@ def _hieltech_stems_reparieren_sync(song_sha, modul, args):
         except OSError:
             pass
         m = _HIELTECH_REPARIEREN_MODULE[modul]
+        fehler = _hieltech_stems_klang_verknuepfen(modul)
+        if fehler:
+            return {"ok": False, "error": "klang_verknuepfen", "message": fehler}
+        args, fehler = _hieltech_stems_reparieren_aufloesen(args, work)
+        if fehler:
+            return {"ok": False, "error": fehler}
         aus = os.path.join(work, "aus")
-        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, m["skript"]), song, aus] + args
-                                        + ["--modelle", _HIELTECH_STEMS_UVR_DIR], timeout=3600)
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_REPARIEREN_DIR, m["skript"]), song, aus] + args
+                                        + (["--modelle", _HIELTECH_STEMS_UVR_DIR] if m.get("modelle") else []),
+                                        timeout=7200)
         info = _hieltech_last_json_line(output) or {}
         if not info.get("ok"):
             return {"ok": False, "error": "reparieren_fehlgeschlagen",
                     "message": str(info.get("fehler") or info.get("message") or output[-800:])[:800]}
         results = []
-        for name in sorted(os.listdir(aus)):
+        dateien = []                                 # alle Ergebnis-Dateien, auch in Unterordnern (z. B. Einzelspuren/)
+        for w, ds, fs in os.walk(aus):
+            ds[:] = sorted(d for d in ds if not d.startswith((".", "_"))
+                           and d not in ("spuren_roh", "teile", "teile_roh"))
+            for f in sorted(fs):
+                if not f.startswith((".", "_")):
+                    dateien.append(os.path.relpath(os.path.join(w, f), aus).replace(os.sep, "/"))
+        for name in dateien[:200]:
             p = os.path.join(aus, name)
-            if not os.path.isfile(p) or name.startswith((".", "_")):
-                continue
             eintrag = {"datei": name}
             if name.lower().endswith(".wav"):
                 try:
@@ -4539,15 +4669,24 @@ async def _hieltech_stems_reparieren_start(song_sha: str = Form(...), modul: str
     Ausgabe-Ordners (WAV als FLAC übertragen). Fehlt Song oder Klang-Paket, sagt die Antwort das sofort."""
     if modul not in _HIELTECH_REPARIEREN_MODULE:
         return {"ok": False, "error": "unbekanntes_modul"}
-    args = _hieltech_stems_reparieren_args(modul, argumente[:4000])
+    args = _hieltech_stems_reparieren_args(modul, argumente[:12000])
     if args is None:
         return {"ok": False, "error": "argumente_ungueltig"}
     if not await asyncio.to_thread(_hieltech_stems_song_pfad, song_sha):
         return {"ok": False, "error": "song_fehlt"}
-    paket = _HIELTECH_REPARIEREN_MODULE[modul]["klang"]
-    hat = await asyncio.to_thread(_hieltech_stems_klang_pruef, paket)
-    if not hat or (klang_pruef and hat != klang_pruef):
-        return {"ok": False, "error": "klang_fehlt", "paket": paket}
+    for w in args:                                   # zusätzlich hochgeladene Dateien/Ordner müssen da sein
+        t = _HIELTECH_STEMS_ARG_DATEI_RE.match(w)
+        if t and not await asyncio.to_thread(_hieltech_stems_song_pfad, t.group(2)):
+            return {"ok": False, "error": "song_fehlt", "sha": t.group(2)}
+    try:                                             # klang_pruef: {"paket": prüfsumme} (alt: eine Prüfsumme)
+        soll = json.loads(klang_pruef) if klang_pruef.strip().startswith("{") else {}
+    except ValueError:
+        soll = {}
+    for paket in _HIELTECH_REPARIEREN_MODULE[modul]["klang"]:
+        hat = await asyncio.to_thread(_hieltech_stems_klang_pruef, paket)
+        erwartet = soll.get(paket) or (klang_pruef if not soll and len(_HIELTECH_REPARIEREN_MODULE[modul]["klang"]) == 1 else "")
+        if not hat or (erwartet and hat != erwartet):
+            return {"ok": False, "error": "klang_fehlt", "paket": paket}
     laufend = _hieltech_lora_running_job()
     if laufend:
         return {"ok": True, "job_id": laufend, "already_running": True}

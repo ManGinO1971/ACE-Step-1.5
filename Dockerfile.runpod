@@ -73,6 +73,16 @@ RUN python3.10 -m venv /opt/acestep_rvc_venv \
 # DeepFilterNet) schon beim Build ins Image laden statt bei jedem frischen
 # Worker erneut aus dem Internet - siehe prefetch_vocals_models.py. Bricht
 # den Build nie ab (Skript endet immer mit Exit-Code 0, zusaetzlich "|| true").
+# NEU (12. Nov 2026, HELTECH Stems „Reparieren“ auf der GPU): eigene, getrennte Python-3.10-Umgebung NUR für die
+# Noten-Erkennung Basic Pitch (Piano, Orgel, Picking, Bläser). Getrennt, damit die Hauptumgebung unberührt bleibt.
+# Per Test bestätigt (12. Nov): basic-pitch 0.4.0 braucht unter Linux numpy<2 (tflite) und setuptools<81
+# (pkg_resources für resampy). Das "|| true" am Ende: schlägt hier etwas fehl, läuft der Build trotzdem durch –
+# dann rechnen nur diese Module weiter auf dem Mac, alles andere ist nicht betroffen.
+RUN ( python3.10 -m venv /opt/hieltech_noten_venv \
+      && /opt/hieltech_noten_venv/bin/pip install --no-cache-dir "pip==24.0" "setuptools<81" \
+      && /opt/hieltech_noten_venv/bin/pip install --no-cache-dir "numpy<2" "basic-pitch==0.4.0" onnxruntime \
+      && /opt/hieltech_noten_venv/bin/python -c "from basic_pitch.inference import predict; print('Basic Pitch bereit')" ) || true
+
 RUN /app/.venv/bin/python /app/prefetch_vocals_models.py || true
 
 # NEU (10. Okt 2026): RVC-Basismodelle (hubert_base.pt, rmvpe.pt) laedt
