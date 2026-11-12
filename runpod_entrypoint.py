@@ -4351,6 +4351,209 @@ def _hieltech_stems_trennen_sync(src_bytes, filename, auftrag, song_sha=""):
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ---- Stems reparieren auf der GPU (12. Nov 2026, Homepage-Fassung Phase 1) ---------------------------------------
+# Die Reparatur-Module der Mac-App laufen hier mit DEMSELBEN Code (Ordner hieltech_reparieren/). Die Klänge (Samples)
+# liegen als „Klang-Paket“ auf dem Volume: einmal in Stücken hochgeladen, per Prüfsumme erkannt. Aufgeräumt/ersetzt
+# wird nur der eigene Ordner hieltech_stems_klaenge.
+_HIELTECH_STEMS_KLANG_DIR = ("/runpod-volume/hieltech_stems_klaenge" if os.path.isdir("/runpod-volume")
+                             else os.path.join(tempfile.gettempdir(), "hieltech_stems_klaenge"))
+_HIELTECH_STEMS_UVR_DIR = ("/runpod-volume/hieltech_uvr_models" if os.path.isdir("/runpod-volume")
+                           else os.path.join(_HIELTECH_PROJECT_ROOT, "uvr_models"))
+_HIELTECH_STEMS_KLANG_NAME_RE = re.compile(r"^[a-z0-9_]{2,30}$")
+_HIELTECH_STEMS_KLANG_MAX = 3 * 1024 ** 3
+_HIELTECH_STEMS_ARG_WERT_RE = re.compile(r"^[A-Za-z0-9_.,+\-]{1,40}$")
+# modul -> Skript, Klang-Paket, Umgebungsvariable für den Klang-Ordner, erlaubte Schalter (0 = ohne Wert, 1 = mit Wert)
+_HIELTECH_REPARIEREN_MODULE = {
+    "drums": {"skript": os.path.join("hieltech_reparieren", "drum_neu", "drums_neu_step.py"),
+              "klang": "drums", "klang_env": "HIELTECH_DRUM_SAMPLES",
+              "schalter": {"--fremd-trommel": 0, "--timing-korrigieren": 0, "--hh-ref": 1, "--nur": 1,
+                           "--rimshot-note": 1, "--midi-bpm": 1}},
+}
+for _m in _HIELTECH_REPARIEREN_MODULE.values():
+    os.environ.setdefault(_m["klang_env"], os.path.join(_HIELTECH_STEMS_KLANG_DIR, _m["klang"]))
+
+
+def _hieltech_stems_klang_pruef(paket):
+    """Prüfsumme des vorhandenen Klang-Pakets oder ''."""
+    try:
+        with open(os.path.join(_HIELTECH_STEMS_KLANG_DIR, paket, ".pruef"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+@app.get("/v1/hieltech_stems_klang_da")
+async def _hieltech_stems_klang_da(paket: str = "", pruef: str = ""):
+    """Liegt das Klang-Paket (in genau dieser Fassung) schon auf dem Volume?"""
+    if not _HIELTECH_STEMS_KLANG_NAME_RE.match(paket or ""):
+        return {"ok": False, "error": "invalid_name"}
+    hat = await asyncio.to_thread(_hieltech_stems_klang_pruef, paket)
+    return {"ok": True, "da": bool(hat) and (not pruef or hat == pruef), "pruef": hat}
+
+
+@app.post("/v1/hieltech_stems_klang_chunk")
+async def _hieltech_stems_klang_chunk(chunk: UploadFile, paket: str = Form(...), offset: int = Form(...),
+                                      total_size: int = Form(...), pruef: str = Form(...)):
+    """Klang-Paket (ZIP) in Stücken hochladen; nach dem letzten Stück wird geprüft, sicher entpackt und das alte
+    Paket gleichen Namens ersetzt. Antwort: {"ok", "received", "complete"}"""
+    if not _HIELTECH_STEMS_KLANG_NAME_RE.match(paket or "") or not _HIELTECH_STEMS_SHA_RE.match(pruef or ""):
+        return {"ok": False, "error": "invalid_name"}
+    if total_size <= 0 or total_size > _HIELTECH_STEMS_KLANG_MAX or offset < 0 or offset >= total_size:
+        return {"ok": False, "error": "invalid_range"}
+    data = await chunk.read()
+    if not data or offset + len(data) > total_size:
+        return {"ok": False, "error": "invalid_chunk"}
+
+    def _write():
+        import zipfile
+        os.makedirs(_HIELTECH_STEMS_KLANG_DIR, exist_ok=True)
+        if _hieltech_stems_klang_pruef(paket) == pruef:
+            return {"ok": True, "received": total_size, "complete": True}
+        teil = os.path.join(_HIELTECH_STEMS_KLANG_DIR, f"{paket}.{pruef[:12]}.zip.part")
+        complete = offset + len(data) == total_size
+        fd = os.open(teil, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            view = memoryview(data)
+            while view:
+                n = os.write(fd, view)
+                view = view[n:]
+            if complete:
+                os.ftruncate(fd, total_size)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if not complete:
+            return {"ok": True, "received": os.path.getsize(teil), "complete": False}
+        h = hashlib.sha1()
+        with open(teil, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        if h.hexdigest() != pruef:
+            os.remove(teil)
+            return {"ok": False, "error": "pruefsumme_falsch", "message": "Klang-Paket kam beschädigt an"}
+        ziel = os.path.join(_HIELTECH_STEMS_KLANG_DIR, paket)
+        neu = ziel + ".neu"
+        shutil.rmtree(neu, ignore_errors=True)
+        os.makedirs(neu)
+        wurzel = os.path.realpath(neu)
+        with zipfile.ZipFile(teil) as z:
+            if sum(i.file_size for i in z.infolist()) > _HIELTECH_STEMS_KLANG_MAX:
+                return {"ok": False, "error": "zu_gross"}
+            for i in z.infolist():
+                p = os.path.realpath(os.path.join(neu, i.filename))
+                if not (p == wurzel or p.startswith(wurzel + os.sep)):
+                    shutil.rmtree(neu, ignore_errors=True)
+                    return {"ok": False, "error": "unsicherer_pfad"}
+            z.extractall(neu)
+        with open(os.path.join(neu, ".pruef"), "w", encoding="utf-8") as f:
+            f.write(pruef)
+        alt = ziel + ".alt"
+        shutil.rmtree(alt, ignore_errors=True)
+        if os.path.isdir(ziel):
+            os.replace(ziel, alt)
+        os.replace(neu, ziel)
+        shutil.rmtree(alt, ignore_errors=True)
+        os.remove(teil)
+        return {"ok": True, "received": total_size, "complete": True}
+
+    try:
+        return await asyncio.to_thread(_write)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": "write_failed", "message": str(e)[:300]}
+
+
+def _hieltech_stems_reparieren_args(modul, argumente):
+    """Prüft die Aufruf-Argumente gegen die erlaubten Schalter des Moduls. Rückgabe Liste oder None."""
+    erlaubt = _HIELTECH_REPARIEREN_MODULE[modul]["schalter"]
+    try:
+        roh = json.loads(argumente or "[]")
+    except ValueError:
+        return None
+    if not isinstance(roh, list) or len(roh) > 40:
+        return None
+    out, i = [], 0
+    while i < len(roh):
+        a = roh[i]
+        if not isinstance(a, str) or a not in erlaubt:
+            return None
+        out.append(a)
+        if erlaubt[a]:
+            if i + 1 >= len(roh) or not isinstance(roh[i + 1], str) or not _HIELTECH_STEMS_ARG_WERT_RE.match(roh[i + 1]):
+                return None
+            out.append(roh[i + 1])
+            i += 1
+        i += 1
+    return out
+
+
+def _hieltech_stems_reparieren_sync(song_sha, modul, args):
+    work = tempfile.mkdtemp(prefix="hieltech_stems_reparieren_")
+    t0 = time.time()
+    try:
+        song = _hieltech_stems_song_pfad(song_sha)
+        if not song:
+            return {"ok": False, "error": "song_fehlt"}
+        try:
+            os.utime(os.path.dirname(song), None)
+        except OSError:
+            pass
+        m = _HIELTECH_REPARIEREN_MODULE[modul]
+        aus = os.path.join(work, "aus")
+        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_PROJECT_ROOT, m["skript"]), song, aus] + args
+                                        + ["--modelle", _HIELTECH_STEMS_UVR_DIR], timeout=3600)
+        info = _hieltech_last_json_line(output) or {}
+        if not info.get("ok"):
+            return {"ok": False, "error": "reparieren_fehlgeschlagen",
+                    "message": str(info.get("fehler") or info.get("message") or output[-800:])[:800]}
+        results = []
+        for name in sorted(os.listdir(aus)):
+            p = os.path.join(aus, name)
+            if not os.path.isfile(p) or name.startswith((".", "_")):
+                continue
+            eintrag = {"datei": name}
+            if name.lower().endswith(".wav"):
+                try:
+                    import soundfile as _sf
+                    eintrag["wav_subtype"] = _sf.info(p).subtype
+                except Exception:  # noqa: BLE001
+                    eintrag["wav_subtype"] = "PCM_24"
+                conv, fext = _hieltech_wav_to_flac_file(p)
+                eintrag["transport"] = fext
+            else:
+                conv, fext = p, (os.path.splitext(name)[1].lstrip(".").lower() or "bin")
+            hp, token = _hieltech_handoff_store(conv, fext)
+            eintrag.update({"result_token": token, "size_bytes": os.path.getsize(hp)})
+            results.append(eintrag)
+        return {"ok": bool(results), "results": results, "aus_ordner": aus, "ausgabe": output[-6000:],
+                "sekunden": round(time.time() - t0, 1), "geraet": "cuda" if os.path.isdir("/runpod-volume") else "test",
+                "message": "" if results else "keine Dateien"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@app.post("/v1/hieltech_stems_reparieren_start")
+async def _hieltech_stems_reparieren_start(song_sha: str = Form(...), modul: str = Form(...),
+                                           argumente: str = Form(default="[]"), klang_pruef: str = Form(default="")):
+    """Ein Reparatur-Modul auf der GPU: Eingabe liegt in der Song-Ablage (song_sha), Ergebnis = alle Dateien des
+    Ausgabe-Ordners (WAV als FLAC übertragen). Fehlt Song oder Klang-Paket, sagt die Antwort das sofort."""
+    if modul not in _HIELTECH_REPARIEREN_MODULE:
+        return {"ok": False, "error": "unbekanntes_modul"}
+    args = _hieltech_stems_reparieren_args(modul, argumente[:4000])
+    if args is None:
+        return {"ok": False, "error": "argumente_ungueltig"}
+    if not await asyncio.to_thread(_hieltech_stems_song_pfad, song_sha):
+        return {"ok": False, "error": "song_fehlt"}
+    paket = _HIELTECH_REPARIEREN_MODULE[modul]["klang"]
+    hat = await asyncio.to_thread(_hieltech_stems_klang_pruef, paket)
+    if not hat or (klang_pruef and hat != klang_pruef):
+        return {"ok": False, "error": "klang_fehlt", "paket": paket}
+    laufend = _hieltech_lora_running_job()
+    if laufend:
+        return {"ok": True, "job_id": laufend, "already_running": True}
+    return _hieltech_job_start("lora_test", _hieltech_stems_reparieren_sync, song_sha, modul, args)
+
+
 @app.post("/v1/hieltech_stems_trennen_start")
 async def _hieltech_stems_trennen_start(audio: UploadFile | None = File(default=None), auftrag: str = Form(default="{}"),
                                         song_sha: str = Form(default="")):
