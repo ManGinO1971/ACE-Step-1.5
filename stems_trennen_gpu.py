@@ -111,6 +111,8 @@ SPEICHER_FASSUNG = "2"      # erhöhen, wenn alte Einträge im Ergebnis-Speicher
 
 def schluessel(auftrag):
     fassung = SPEICHER_FASSUNG if auftrag.get("art") == "sep" else ""
+    if auftrag.get("art") == "erkennen":
+        fassung = "regeln2"          # Erkennung mit Genre/Familien/Stufen (12. Nov 2026): alte Ergebnisse gelten nicht mehr
     return hashlib.sha1((json.dumps(auftrag, sort_keys=True) + fassung).encode()).hexdigest()[:16]
 
 
@@ -236,6 +238,11 @@ def rechnen(song, aus, auftrag, cache=None):
         if not os.path.isfile(ej):
             raise RuntimeError("Erkennung: " + (r.stderr or r.stdout or "")[-500:])
         erkennung = json.load(open(ej, encoding="utf-8"))
+        try:                                         # Zeitleisten + Genre: damit entscheidet die App bei anderer Genre-Wahl neu
+            rj = json.load(open(ej + ".roh.json", encoding="utf-8"))
+            extra["erkennung_roh"], extra["erkennung_info"] = rj.get("roh"), rj.get("info")
+        except (OSError, ValueError):
+            pass
         zeiten["erkennen"] = round(time.time() - tt, 1)
         for z in (r.stdout or "").splitlines():
             if z.startswith("ZEITEN "):
@@ -261,7 +268,7 @@ def rechnen(song, aus, auftrag, cache=None):
                     in_speicher(cache, schluessel({"art": "demucs", "modell": "htdemucs_6s"}), sechs, {})
             except Exception:  # noqa: BLE001 – nur ein Nebenergebnis
                 pass
-        for x in ("_hp", "_sechs", "erkennung.json"):
+        for x in ("_hp", "_sechs", "erkennung.json", "erkennung.json.roh.json"):
             p = os.path.join(aus, x)
             shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else (os.path.isfile(p) and os.remove(p))
     else:

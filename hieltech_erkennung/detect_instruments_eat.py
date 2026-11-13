@@ -13,15 +13,14 @@ Ablauf:
      (Trommeln/Anschläge) zerlegt (HPSS), damit kein Instrument ein anderes überdeckt.
   2. Alle drei Fassungen werden in 2-s-Fenstern (Schritt 1 s) abgehört -> Zeitleiste je Klasse.
   3. AudioSet-Klassen -> die 53 App-Instrumente (siehe erkennung_kern.ZUORDNUNG).
-  4. Korrekturen aus Hörproben des Nutzers (5. Nov 2026, „5 Other“, KI-Reggae-Song):
-     - Reggae-Orgel wird vom Modell oft „Akkordeon“ genannt  -> zählt als Orgel
-     - Synth-Leads werden oft „Violine“/„Mundharmonika“ genannt -> zählen als Synth, außer es ist
-       zusätzlich echter Streicher-Klang da bzw. die Mundharmonika ist sehr deutlich und lange
-  5. Entscheidung je Instrument:
-       erkannt  = deutlich (≥ 3 % der Zeit über 0,15 und Spitze ≥ 0,30) oder kurz, aber klar (Spitze ≥ 0,50)
-       möglich  = Spitze ≥ 0,25 und kurz über 0,15 (wird angezeigt, aber nicht vorausgewählt)
-     Synth braucht Spitze ≥ 0,40 (Bass/Schlagzeug klingen sonst schnell „synthetisch“).
+  4. Zusätzlich wird der ganze Song einmal abgehört: daraus kommt die Stilrichtung (Genre).
+  5. Entscheidung (12. Nov 2026, siehe hoermodell/erkennung_regeln.py – gilt für jeden Song gleich):
+     Spur-Wissen, Instrumenten-Familien (ein Name je Familie), eigene Zeit, gleiche Quelle, Genre (unübliche
+     Instrumente brauchen mehr Beweis), Doppelung Gitarre/Piano/Orgel, Schlagzeug-Teile.
+     Ergebnis je Instrument: stufe = sicher (vorausgewählt) / vielleicht (wählbar) / aus.
   6. Je Instrument: Zeitleiste (wann es spielt) und auf Wunsch eine 6-s-Hörprobe an der stärksten Stelle.
+  7. Neben dem Ergebnis wird <ergebnis>.roh.json geschrieben (Zeitleisten + Genre-Werte): damit entscheidet die App
+     nach einer anderen Genre-Wahl sofort neu, ohne noch einmal zu hören.
 
 Aufruf (wie die alte Erkennung, gleiche JSON-Felder + neue):
   python detect_instruments_eat.py <audio> <ergebnis.json> [--hoerproben ORDNER]
@@ -40,6 +39,7 @@ RES_DIR = os.environ.get("HIELTECH_EAT_RESOURCES") or ("/runpod-volume/hieltech_
 GERAET = None
 sys.path.insert(0, os.path.join(HIER, "hoermodell"))
 import erkennung_kern as ek  # noqa: E402
+import erkennung_regeln as er  # noqa: E402
 
 SR = 32000
 FENSTER, SCHRITT = 2.0, 1.0   # Fenster 2 s, alle 1 s
@@ -161,31 +161,7 @@ def zeitleiste(m, mel, y):
     return np.array(starts) / SR, np.concatenate(out)
 
 
-def abschnitte(t, s, schwelle=0.15, luecke=3.0, mindest=2.0):
-    an = t[s >= schwelle]
-    if len(an) == 0:
-        return []
-    seg = [[float(an[0]), float(an[0]) + FENSTER]]
-    for x in an[1:]:
-        if x - seg[-1][1] <= luecke:
-            seg[-1][1] = float(x) + FENSTER
-        else:
-            seg.append([float(x), float(x) + FENSTER])
-    return [[round(a, 1), round(b, 1)] for a, b in seg if b - a >= mindest]
-
-
-# Was in welche getrennte Spur gehört (Spur-Wissen wie ein Toningenieur): in der Bass-Spur zählt nur Bass usw.
-SPUR_ERLAUBT = {
-    "drums": PERKUSSIV | {"congas", "toms"},
-    "bass": {"bass", "double-bass", "synth"},
-    "vocals": {"vocal", "lead-vocal", "back-vocal"},
-    "guitar": {"guitar", "electric-guitar", "acoustic-guitar", "banjo", "dobro", "mandolin", "sitar", "ukulele", "harp"},
-    "piano": {"piano", "digital-piano", "keys", "harpsichord", "organ", "synth"},
-    "other": set(ALLE_53) - {"bass", "double-bass", "drums", "kick", "snare", "hh", "vocal", "lead-vocal", "back-vocal"},
-}
-
-
-def teile_rechnen(pfad, ansichten=("voll", "ton", "schlag")):
+def teile_rechnen(pfad, ansichten=("voll", "ton", "schlag"), merkmale=False):
     """Vorarbeit für eine Datei (nur Prozessor, kein Modell): ganz, Ton-Teil, Schlag-Teil. Läuft für mehrere Spuren
     gleichzeitig in eigenen Prozessen."""
     import librosa
@@ -199,69 +175,77 @@ def teile_rechnen(pfad, ansichten=("voll", "ton", "schlag")):
         if "schlag" in ansichten:
             _, P = librosa.decompose.hpss(S, margin=(3.0, 1.0))
             teile["schlag"] = librosa.istft(P, hop_length=512, length=len(y)).astype(np.float32)
+    if merkmale:
+        # Pegel und Anschlags-Kurve (50 Werte je Sekunde) – für die Prüfung „gleiche Anschläge, viel leiser = Abdruck“
+        teile["_pegel_db"] = float(20 * np.log10(max(1e-7, float(np.sqrt(np.mean(y.astype(np.float64) ** 2))))))
+        try:
+            teile["_anschlag"] = librosa.onset.onset_strength(y=y, sr=SR, hop_length=640).astype(np.float32)
+        except Exception:  # noqa: BLE001
+            teile["_anschlag"] = None
     return teile
 
 
+def anschlag_gleich(a, b, versatz=3):
+    """Wie ähnlich sind die Anschläge zweier Spuren (0…1)? Bester Wert bei bis zu ±60 ms Versatz."""
+    if a is None or b is None:
+        return 0.0
+    n = min(len(a), len(b))
+    if n < 200:
+        return 0.0
+    a, b = a[:n] - a[:n].mean(), b[:n] - b[:n].mean()
+    na, nb = float(np.sqrt((a * a).sum())), float(np.sqrt((b * b).sum()))
+    if na < 1e-6 or nb < 1e-6:
+        return 0.0
+    best = 0.0
+    for v in range(-versatz, versatz + 1):
+        x, y = (a[v:], b[:n - v]) if v >= 0 else (a[:n + v], b[-v:])
+        best = max(best, float((x * y).sum()) / (na * nb))
+    return round(max(0.0, best), 3)
+
+
 def analyse(pfad, m, mel, lab, ansichten=("voll", "ton", "schlag"), teile=None):
+    """Hört eine Datei ab. Rückgabe (t, K, P_voll): K = Stärke je Instrument und Sekunde, P_voll = alle 527 Klassen."""
     if teile is None:
         teile = teile_rechnen(pfad, ansichten)
-    V = {}
+    V, P_voll = {}, None
     for name in ansichten:
         t, Pr = zeitleiste(m, mel, teile[name])
+        if name == "voll":
+            P_voll = Pr
         V[name] = ek.slug_scores(Pr, lab)
     K = {}
     for s_ in ek.ZUORDNUNG:
         alt = "schlag" if s_ in PERKUSSIV else "ton"
         K[s_] = np.maximum(V["voll"][s_], V[alt][s_]) if alt in V else V["voll"][s_]
-    # --- Korrekturen aus den Hörproben (5. Nov 2026) ---
-    anteil = lambda s_, x=0.15: float(np.mean(K[s_] >= x))  # noqa: E731
-    akk = K["accordion"].copy()
-    K["organ"] = np.maximum(K["organ"], akk)            # Reggae-Orgel klingt für das Modell wie Akkordeon
-    K["accordion"] = akk * 0
-    if not (anteil("bowed_strings") >= 0.03 or anteil("strings") >= 0.03):
-        K["synth"] = np.maximum(K["synth"], K["violin"])  # „Violine“ ohne Streicher-Klang = Synth
-        K["violin"] = K["violin"] * 0
-    if not (K["harmonica"].max() >= 0.7 and anteil("harmonica") >= 0.05):
-        K["synth"] = np.maximum(K["synth"], K["harmonica"])
-        K["harmonica"] = K["harmonica"] * 0
-    K["lead-vocal"] = K["vocal"]
-    return t, K
+    return t, K, P_voll
 
 
-def entscheiden(t, K, erlaubt=None):
-    res = {}
+def genre_werte(P, lab):
+    """Stilrichtung aus dem ganzen Song: Mittelwert der Genre-Klassen des Hör-Modells."""
+    L = {l: i for i, l in enumerate(lab)}
+    mittel = {k: float(P[:, L[k]].mean()) for ks in er.GENRES.values() for k in ks if k in L}
+    return er.genre_aus_klassen(mittel)
+
+
+def roh_bauen(n, kandidaten, genre, paare, pegel):
+    """Alles, was die Regeln brauchen (klein genug für die App): je Instrument Spur + Zeitleiste in Prozent."""
+    inst = {}
+    for s_, (spur, x) in kandidaten.items():
+        if float(x.max()) >= 0.10:
+            inst[s_] = {"spur": spur, "k": [int(round(float(v) * 100)) for v in x]}
+    return {"fassung": er.FASSUNG, "schritt": SCHRITT, "fenster": FENSTER, "n": int(n), "instrumente": inst,
+            "genre": genre, "paare": paare, "spuren": pegel}
+
+
+def fertig_liste(roh, genre="auto"):
+    """Regeln anwenden und auf alle 53 Instrumente auffüllen (wie bisher: ein Eintrag je Instrument)."""
+    liste, info = er.auswerten(roh, genre)
+    da = {r["instrument"] for r in liste}
     for s_ in ALLE_53:
-        x = K.get(s_)
-        if x is None or (erlaubt is not None and s_ not in erlaubt):
-            continue
-        spitze, a15 = float(x.max()), float(np.mean(x >= 0.15))
-        erkannt = (a15 >= 0.03 and spitze >= (0.40 if s_ == "synth" else 0.30)) or spitze >= 0.50
-        if s_ == "synth" and spitze < 0.40:
-            erkannt = False
-        moeglich = (not erkannt) and spitze >= 0.25 and a15 > 0
-        bi = int(np.argmax(x))
-        res[s_] = {"instrument": s_, "margin": round(spitze, 3), "detected": bool(erkannt), "moeglich": bool(moeglich),
-                   "best_window_start_sec": round(float(t[bi]), 1), "anteil_prozent": round(a15 * 100, 1),
-                   "zeiten": abschnitte(t, x)}
-    return res
-
-
-def aufraeumen(res):
-    if res.get("lead-vocal", {}).get("detected") and "vocal" in res:
-        res["vocal"]["detected"] = False
-    fam = [r for k, r in res.items() if k in ("guitar", "electric-guitar", "acoustic-guitar", "banjo", "dobro",
-                                                "mandolin", "sitar", "ukulele") and r["detected"]]
-    if len(fam) > 1:
-        best = max(fam, key=lambda r: r["margin"])
-        for r in fam:
-            if r is not best:
-                r["detected"], r["moeglich"] = False, True
-    out = []
-    for s_ in ALLE_53:
-        out.append(res.get(s_, {"instrument": s_, "margin": 0.0, "detected": False, "moeglich": False,
-                                "best_window_start_sec": 0.0, "anteil_prozent": 0.0, "zeiten": []}))
-    out.sort(key=lambda r: (not r["detected"], not r["moeglich"], -r["margin"]))
-    return out
+        if s_ not in da:
+            liste.append({"instrument": s_, "margin": 0.0, "stufe": "aus", "detected": False, "moeglich": False,
+                          "best_window_start_sec": 0.0, "anteil_prozent": 0.0, "zeiten": [], "spur": ""})
+    return [r for r in liste if r["instrument"] in ALLE_53], info
 
 
 def hoerproben_schneiden(res, ordner, quelle_fuer):
@@ -270,7 +254,7 @@ def hoerproben_schneiden(res, ordner, quelle_fuer):
     os.makedirs(ordner, exist_ok=True)
     cache = {}
     for r in res:
-        if not (r["detected"] or r["moeglich"]):
+        if not (r["detected"] or r["moeglich"] or r["margin"] >= 0.40):   # auch knapp Aussortierte (andere Genre-Wahl)
             continue
         q = quelle_fuer(r)
         if q not in cache:
@@ -287,7 +271,8 @@ def _ansichten(spur):
     return ("voll", "schlag") if spur == "drums" else ("voll", "ton")
 
 
-def erkennen(pfad, hoerproben=None, spuren=None):
+def erkennen(pfad, hoerproben=None, spuren=None, genre="auto"):
+    """Rückgabe (liste, roh, info)."""
     import time
     t0 = time.time()
     vorarbeit, pool = {}, None
@@ -296,10 +281,11 @@ def erkennen(pfad, hoerproben=None, spuren=None):
         try:
             import multiprocessing as mp
             from concurrent.futures import ProcessPoolExecutor
-            kerne = max(1, min(len(spuren), (os.cpu_count() or 2) - 1, 6))
+            kerne = max(1, min(len(spuren) + 1, (os.cpu_count() or 2) - 1, 7))
             if kerne > 1:
                 pool = ProcessPoolExecutor(max_workers=kerne, mp_context=mp.get_context("spawn"))
-                vorarbeit = {spur: pool.submit(teile_rechnen, sp, _ansichten(spur)) for spur, sp in spuren.items()}
+                vorarbeit = {spur: pool.submit(teile_rechnen, sp, _ansichten(spur), True) for spur, sp in spuren.items()}
+                vorarbeit["_mix"] = pool.submit(teile_rechnen, pfad, ("voll",))
         except Exception:  # noqa: BLE001 – dann nacheinander wie bisher
             vorarbeit, pool = {}, None
     melde("… lade Hör-Modell (beim ersten Mal 274 MB Download)")
@@ -307,41 +293,60 @@ def erkennen(pfad, hoerproben=None, spuren=None):
     melde(f"… Hör-Modell rechnet auf: {GERAET}")
     lab = ek.labels(EAT_DIR)
     t_modell = time.time() - t0
+
+    def geholt(name, sonst):
+        if name in vorarbeit:
+            try:
+                return vorarbeit[name].result(timeout=1800)
+            except Exception:  # noqa: BLE001 – dann hier rechnen
+                pass
+        return sonst()
+
+    kandidaten, paare, pegel = {}, [], {}
     if not spuren:
         melde("… höre die Datei (ganz, Ton-Teil, Schlag-Teil)")
-        t, K = analyse(pfad, m, mel, lab)
-        res = aufraeumen(entscheiden(t, K))
-        if hoerproben:
-            hoerproben_schneiden(res, hoerproben, lambda r: pfad)
-        return res
-    gesamt = {}
-    for spur, sp in spuren.items():
-        erlaubt = SPUR_ERLAUBT.get(spur, set(ALLE_53))
-        melde(f"… höre Spur „{spur}“")
-        teile = None
-        if spur in vorarbeit:
-            try:
-                teile = vorarbeit[spur].result(timeout=1800)
-            except Exception:  # noqa: BLE001 – diese Spur dann hier rechnen
-                teile = None
-        t, K = analyse(sp, m, mel, lab, _ansichten(spur), teile)
-        for k, r in entscheiden(t, K, erlaubt).items():
-            r["spur"] = spur
-            r["spur_datei"] = sp
-            alt = gesamt.get(k)
-            if alt is None or (r["detected"], r["margin"]) > (alt["detected"], alt["margin"]):
-                gesamt[k] = r
+        t, K, P_mix = analyse(pfad, m, mel, lab)
+        kandidaten = {s_: ("", x) for s_, x in K.items()}
+        n = len(t)
+    else:
+        anschlag, n = {}, 0
+        for spur, sp in spuren.items():
+            melde(f"… höre Spur „{spur}“")
+            teile = geholt(spur, lambda: teile_rechnen(sp, _ansichten(spur), True))
+            t, K, _ = analyse(sp, m, mel, lab, _ansichten(spur), teile)
+            n = max(n, len(t))
+            pegel[spur] = {"pegel_db": round(teile.get("_pegel_db", -120.0), 1)}
+            anschlag[spur] = teile.get("_anschlag")
+            for s_, x in K.items():
+                if not er.spur_erlaubt(spur, s_):
+                    continue
+                alt = kandidaten.get(s_)
+                st = float(x.max()) * float(np.mean(x >= 0.15)) ** 0.5
+                if alt is None or st > alt[2]:
+                    kandidaten[s_] = (spur, x, st)
+        kandidaten = {s_: (v[0], v[1]) for s_, v in kandidaten.items()}
+        melde("… höre den ganzen Song (Stilrichtung)")
+        P_mix = zeitleiste(m, mel, geholt("_mix", lambda: teile_rechnen(pfad, ("voll",)))["voll"])[1]
+        for a_, b_ in (("guitar", "piano"), ("guitar", "other"), ("piano", "other")):
+            if a_ in anschlag and b_ in anschlag:
+                paare.append({"a": a_, "b": b_, "gleich": anschlag_gleich(anschlag[a_], anschlag[b_]),
+                              "pegel_db": round(pegel[b_]["pegel_db"] - pegel[a_]["pegel_db"], 1)})
     if pool is not None:
         pool.shutdown(wait=False)
-    res = aufraeumen(gesamt)
+    # gleich lange Zeitleisten (Spuren können um ein Fenster abweichen)
+    kandidaten = {s_: (sp, np.pad(x, (0, n - len(x))) if len(x) < n else x[:n]) for s_, (sp, x) in kandidaten.items()}
+    roh = roh_bauen(n, kandidaten, genre_werte(P_mix, lab), paare, pegel)
+    res, info = fertig_liste(roh, genre)
     t_hoeren = time.time() - t0 - t_modell
     if hoerproben:
-        hoerproben_schneiden(res, hoerproben, lambda r: r.get("spur_datei", pfad))
+        for r in res:
+            r["spur_datei"] = (spuren or {}).get(r.get("spur") or "") or pfad
+        hoerproben_schneiden(res, hoerproben, lambda r: r.get("spur_datei") or pfad)
     print("ZEITEN " + json.dumps({"modell_laden": round(t_modell, 1), "hoeren": round(t_hoeren, 1),
                                   "gesamt": round(time.time() - t0, 1), "geraet": GERAET}), flush=True)
     for r in res:
         r.pop("spur_datei", None)
-    return res
+    return res, roh, info
 
 
 if __name__ == "__main__":
@@ -351,6 +356,7 @@ if __name__ == "__main__":
     ap.add_argument("--hoerproben", default=None, help="Ordner für 6-s-Hörproben je Instrument")
     ap.add_argument("--spuren-ordner", default=None,
                     help="schon getrennte Spuren (drums/bass/guitar/piano/other/vocals.wav): jede einzeln abhören")
+    ap.add_argument("--genre", default="auto", help="auto, ohne oder eine Stilrichtung (reggae, rock, jazz …)")
     a = ap.parse_args()
     spuren = None
     if a.spuren_ordner:
@@ -360,12 +366,15 @@ if __name__ == "__main__":
             f = sorted(glob.glob(os.path.join(a.spuren_ordner, f"*{n}*.wav")))
             if f:
                 spuren[n] = f[0]
-    r = erkennen(a.input_wav, a.hoerproben, spuren)
+    r, roh, info = erkennen(a.input_wav, a.hoerproben, spuren, a.genre)
     with open(a.output_json, "w") as f:
         json.dump(r, f, indent=2, ensure_ascii=False)
-    er = [x["instrument"] for x in r if x["detected"]]
+    with open(a.output_json + ".roh.json", "w") as f:
+        json.dump({"roh": roh, "info": info}, f, ensure_ascii=False)
+    er_ = [x["instrument"] for x in r if x["detected"]]
     mo = [x["instrument"] for x in r if x["moeglich"]]
-    print(f"Fertig: {len(er)} erkannt: {', '.join(er) or '–'} | möglich: {', '.join(mo) or '–'}")
+    print(f"Genre: {info.get('genre') or '– (nicht eindeutig)'} | vermutet: {info.get('genre_auto')}")
+    print(f"Fertig: {len(er_)} sicher: {', '.join(er_) or '–'} | vielleicht: {', '.join(mo) or '–'}")
     for x in r:
         if x["detected"] and x.get("spur"):
             print(f"  {x['instrument']:15s} in Spur {x['spur']:7s} {x['anteil_prozent']:5.1f} % der Zeit  {x['zeiten'][:4]}")
