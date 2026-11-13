@@ -160,7 +160,17 @@ def rechnen(song, aus, auftrag, cache=None):
         modell = auftrag.get("modell", "")
         if not NAME_OK.match(modell):
             raise ValueError("ungültiges Modell")
-        for f in sep(song, modell, os.path.join(aus, "_roh1")):
+        try:
+            dateien = sep(song, modell, os.path.join(aus, "_roh1"))
+        except Exception as e:  # noqa: BLE001
+            # 13. Nov 2026: Das Trenn-Programm auf RunPod kennt BS-Roformer-SW (noch) nicht. Die 6 Spuren kommen dann
+            # hier auf der GPU von htdemucs_6s (10 s) – statt dass die App auf den Mac zurückfällt (viele Minuten).
+            if modell != "BS-Roformer-SW.ckpt" or auftrag.get("dann"):
+                raise
+            print(f"… BS-Roformer-SW hier nicht verfügbar ({str(e)[:120]}) – nehme htdemucs_6s", flush=True)
+            spuren, _ = rechnen(song, aus, {"art": "demucs", "modell": "htdemucs_6s"}, cache)
+            return spuren, {"ersatz_modell": "htdemucs_6s"}
+        for f in dateien:
             name = tag_von(f)
             ziel = os.path.join(aus, f"{name}.wav")
             shutil.move(f, ziel)

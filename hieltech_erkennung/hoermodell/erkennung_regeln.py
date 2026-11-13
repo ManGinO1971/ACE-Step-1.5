@@ -284,8 +284,10 @@ def auswerten(roh, genre="auto"):
 
     # ---- gleiche Quelle: zwei Familien derselben Spur, die gemeinsam steigen und fallen -> die schwächere „vielleicht“
     for spur in {sp for _, sp in E}:
+        # Reihenfolge: zuerst die Familie, der die Spur gehört (Tasten in der Piano-Spur), dann nach Stärke
         ks = sorted((k for k in E if k[1] == spur and E[k]["stufe"] != "aus"),
-                    key=lambda k: -_staerke(E[k]["m"]) * (0.6 if E[k]["unueblich"] else 1.0))
+                    key=lambda k: (k not in (("tasten", "piano"), ("gitarre", "guitar")),
+                                   -_staerke(E[k]["m"]) * (0.6 if E[k]["unueblich"] else 1.0)))
         for i, kb in enumerate(ks):
             for ka in ks[:i]:
                 if E[ka]["stufe"] != "sicher":
@@ -298,14 +300,16 @@ def auswerten(roh, genre="auto"):
                     break
 
     # ---- dieselbe Familie in zwei Spuren (z. B. Piano in „piano“, Keys in „other“): nur eine zählt, außer die zweite
-    #      hat einen anderen genauen Namen und ist für sich sicher
+    #      bleibt als „vielleicht – gehört zu …“ wählbar (13. Nov: sonst entstehen wieder zwei fast gleiche Spuren)
     for f in {k[0] for k in E}:
-        ks = sorted((k for k in E if k[0] == f), key=lambda k: (E[k]["stufe"] != "sicher", -_staerke(E[k]["m"])))
+        # die eigene Spur der Trennung (Piano-Spur, Gitarren-Spur) führt; „other“ ist dort nur der Rest
+        eigene = {"tasten": "piano", "gitarre": "guitar"}.get(f)
+        ks = sorted((k for k in E if k[0] == f),
+                    key=lambda k: (E[k]["stufe"] == "aus", not (k[1] == eigene and E[k]["stufe"] != "aus"),
+                                   E[k]["stufe"] != "sicher", -_staerke(E[k]["m"])))
         haupt = E[ks[0]]
         for k in ks[1:]:
             e = E[k]
-            if e["stufe"] == "sicher" and e["leit"] not in OBERBEGRIFF and e["leit"] != haupt["leit"]:
-                continue
             if e["leit"] == haupt["leit"] or e["stufe"] == "aus":
                 e["stufe"] = "aus"
             else:
