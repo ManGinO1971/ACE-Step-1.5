@@ -1859,7 +1859,15 @@ async def _hieltech_job_status(job_id: str = ""):
         return Response(status_code=404, content=b"Auftrag unbekannt - falscher Worker oder abgelaufen")
     elapsed = round(time.time() - job.get("started", time.time()), 1)
     if job.get("status") != "done":
-        return {"ok": True, "status": "running", "label": job.get("label"), "elapsed": elapsed}
+        fortschritt = []
+        try:                                          # Reparatur-Module: letzte Fortschritts-Zeilen mitschicken
+            with _HIELTECH_STEMS_REP_LOCK:
+                if _HIELTECH_STEMS_REP.get("aktiv"):
+                    fortschritt = list(_HIELTECH_STEMS_REP["zeilen"][-5:])
+        except NameError:
+            pass
+        return {"ok": True, "status": "running", "label": job.get("label"), "elapsed": elapsed,
+                "fortschritt": fortschritt}
     return {"ok": True, "status": "done", "label": job.get("label"), "elapsed": elapsed, "result": job.get("result")}
 
 
@@ -4390,7 +4398,7 @@ _HIELTECH_REPARIEREN_MODULE = {
                            "--spuren-ordner": "ordner", "--lautstaerke-db": 1}},
     "orgel": {"skript": os.path.join("orgel_neu", "orgel_neu_step.py"), "klang": ["piano_neu"], "modelle": True,
               "schalter": {"--klang": 1, "--ohne-swing": 0, "--leslie": 1, "--ohne-zusatztoene": 0, "--midi-bpm": 1,
-                           "--lautstaerke-db": 1, "--spuren-ordner": "ordner"}},
+                           "--lautstaerke-db": 1, "--spuren-ordner": "ordner", "--orgel-spur": "datei"}},
     "picking": {"skript": os.path.join("picking_neu", "picking_neu_step.py"), "klang": ["picking_neu", "piano_neu"],
                 "modelle": True,
                 "schalter": {"--klang": 1, "--effekt": 1, "--timing": 1, "--midi-bpm": 1, "--lautstaerke-db": 1,
@@ -4695,6 +4703,66 @@ def _hieltech_stems_reparieren_aufloesen(args, work):
     return out, ""
 
 
+# 13. Nov 2026: Reparatur-Module laufen mit Lebenszeichen und lassen sich stoppen. Die letzten Fortschritts-Zeilen
+# („[  12.3 s] … trenne …“) stehen im Auftrags-Status – so sieht die App, woran die GPU gerade arbeitet.
+_HIELTECH_STEMS_REP = {"proc": None, "zeilen": [], "aktiv": False, "gestoppt": False}
+_HIELTECH_STEMS_REP_LOCK = threading.Lock()
+
+
+def _hieltech_stems_modul_lauf(args, timeout=7200):
+    """Wie _hieltech_run_step, aber die Ausgabe wird laufend gelesen (Fortschritt) und der Prozess ist stoppbar."""
+    _hieltech_free_gpu_cache()
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    env["PYTHONUNBUFFERED"] = "1"
+    p = subprocess.Popen([sys.executable] + args, cwd=_HIELTECH_PROJECT_ROOT, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True, bufsize=1)
+    with _HIELTECH_STEMS_REP_LOCK:
+        _HIELTECH_STEMS_REP.update(proc=p, zeilen=[], aktiv=True, gestoppt=False)
+    alles = []
+
+    def _lesen():
+        for z in p.stdout:
+            alles.append(z)
+            k = z.strip()
+            if k.startswith(("[", "…", "✔")):
+                with _HIELTECH_STEMS_REP_LOCK:
+                    _HIELTECH_STEMS_REP["zeilen"] = (_HIELTECH_STEMS_REP["zeilen"] + [k[:200]])[-20:]
+            print(f"[HIELTECH-Reparieren] {k[:300]}", file=sys.stderr, flush=True)
+    leser = threading.Thread(target=_lesen, daemon=True)
+    leser.start()
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            p.kill()
+        p.wait()
+        alles.append(f"\nZeitlimit ({timeout} s) überschritten\n")
+    leser.join(10)
+    with _HIELTECH_STEMS_REP_LOCK:
+        _HIELTECH_STEMS_REP["aktiv"] = False
+    return p.returncode == 0, "".join(alles)
+
+
+@app.post("/v1/hieltech_stems_reparieren_stop")
+async def _hieltech_stems_reparieren_stop():
+    """Stoppt das laufende Reparatur-Modul (Stopp-Knopf der App)."""
+    with _HIELTECH_STEMS_REP_LOCK:
+        p = _HIELTECH_STEMS_REP.get("proc")
+        laeuft = bool(p) and p.poll() is None
+        if laeuft:
+            _HIELTECH_STEMS_REP["gestoppt"] = True
+    if laeuft:
+        try:
+            os.killpg(p.pid, 9)
+        except OSError:
+            p.kill()
+    return {"ok": True, "gestoppt": laeuft}
+
+
 def _hieltech_stems_reparieren_sync(song_sha, modul, args):
     work = tempfile.mkdtemp(prefix="hieltech_stems_reparieren_")
     t0 = time.time()
@@ -4721,10 +4789,12 @@ def _hieltech_stems_reparieren_sync(song_sha, modul, args):
             if ordner:
                 args = args + ["--spuren-ordner", ordner]
         t_modul = time.time()
-        ok, output = _hieltech_run_step([os.path.join(_HIELTECH_REPARIEREN_DIR, "_lauf.py"),
-                                         os.path.join(_HIELTECH_REPARIEREN_DIR, m["skript"]), song, aus] + args
-                                        + (["--modelle", _HIELTECH_STEMS_UVR_DIR] if m.get("modelle") else []),
-                                        timeout=7200)
+        ok, output = _hieltech_stems_modul_lauf([os.path.join(_HIELTECH_REPARIEREN_DIR, "_lauf.py"),
+                                                 os.path.join(_HIELTECH_REPARIEREN_DIR, m["skript"]), song, aus] + args
+                                                + (["--modelle", _HIELTECH_STEMS_UVR_DIR] if m.get("modelle") else []),
+                                                timeout=7200)
+        if _HIELTECH_STEMS_REP.get("gestoppt"):
+            return {"ok": False, "error": "gestoppt", "message": "Vom Nutzer gestoppt."}
         zeiten["modul"] = round(time.time() - t_modul, 1)
         info = _hieltech_last_json_line(output) or {}
         if not info.get("ok"):

@@ -4,7 +4,9 @@ HELTECH Stems – Reggae-Orgel („Bubble“) neu einspielen. Stand 5. Nov 2026,
 (Orgel Bubble v5, Swing). Funktioniert ohne Musikprogramm: das Ergebnis klingt fertig, MIDI zusätzlich.
 
 Eingabe: der GANZE Song. Ablauf:
-  1. Trennung in 6 Spuren (BS-Roformer-SW, Rückfall htdemucs_6s) – die Orgel steckt in „Other“
+  1. Trennung in 6 Spuren (BS-Roformer-SW, Rückfall htdemucs_6s) – die Orgel steckt in „Other“ oder in „Piano“
+     (13. Nov 2026: beide werden abgehört; liegt die Orgel schon aus der 53er-Trennung vor (--orgel-spur), ist sie
+     die Quelle und wird im Song sauber ersetzt)
   2. Taktraster aus dem Schlagzeug, Akkorde aus allen Instrumenten (gleiche Berechnung wie Piano-Skank)
   3. Wo setzt die Orgel ein? Hör-Modell (EfficientAT, wie die Instrumenten-Erkennung) hört „Other“ ab
      (2-s-Fenster grob, 1-s-Fenster alle 0,25 s fein für den genauen Einsatz). Ab dem Einsatz spielt die Orgel
@@ -153,7 +155,7 @@ def orgel_einsatz(beats, phase, Z):
 def bubble_plan(st, beats, akk, phase, erst, swing=True):
     lb = K.librosa()
     nb = len(beats) - 1
-    org = st["other"]
+    org = st.get("_orgel", st["other"])
     D = K.schlagzeug_anschlaege(st["drums"])
     A = beats.copy()
     j = np.clip(np.searchsorted(D, A), 1, len(D) - 1)
@@ -303,6 +305,7 @@ def main():
     ap.add_argument("--spuren-ordner", default=None)
     ap.add_argument("--noten-json", default=None, help="(Test) schon erkannte Noten der Other-Spur")
     ap.add_argument("--zeitleiste", default=None, help="(Test) schon berechnete Orgel-Zeitleiste (npz)")
+    ap.add_argument("--orgel-spur", default=None, help="Orgel-Spur aus der 53er-Trennung (wenn schon vorhanden)")
     a = ap.parse_args()
     os.makedirs(a.ziel, exist_ok=True)
     try:
@@ -328,14 +331,37 @@ def main():
         nb = len(beats) - 1
         akk, phase, ton = K.akkord_plan(beats, 3 * st.get("piano", 0) + st["other"] + st.get("guitar", 0), st["bass"])
         melde("… höre, wo die Orgel einsetzt (Hör-Modell)")
-        if a.zeitleiste:
-            z = np.load(a.zeitleiste)
-            Z = {k: z[k] for k in z.files}
-        else:
-            Z = orgel_zeitleiste(spuren["other"], a.ziel)
-        erst = orgel_einsatz(beats, phase, Z)
+        # Wo liegt die Orgel? 53er-Orgel (wenn vorhanden) > „Other“ > Piano-Spur
+        kandidaten = []
+        if a.orgel_spur and os.path.isfile(a.orgel_spur):
+            kandidaten.append(("orgel53", a.orgel_spur))
+        kandidaten += [(s_, spuren[s_]) for s_ in ("other", "piano") if s_ in spuren]
+        quelle, Z, erst = None, None, None
+        for name, pfad in kandidaten:
+            if a.zeitleiste:
+                z = np.load(a.zeitleiste)
+                Zk = {k: z[k] for k in z.files}
+            else:
+                Zk = orgel_zeitleiste(pfad, a.ziel)
+            ek = orgel_einsatz(beats, phase, Zk)
+            if ek is not None:
+                quelle, Z, erst = name, Zk, ek
+                break
+            if a.zeitleiste:
+                break
         if erst is None:
-            raise RuntimeError("In diesem Song ist keine Orgel zu hören – nichts zu reparieren")
+            raise RuntimeError("In diesem Song ist keine Orgel zu hören (weder in „Other“ noch in der Piano-Spur) – "
+                               "nichts zu reparieren")
+        org_pfad = dict(kandidaten)[quelle]
+        if quelle == "orgel53":
+            o = K.lade_mono(org_pfad)
+            st["_orgel"] = np.pad(o, (0, max(0, n - len(o))))[:n]
+            melde("✔ Orgel aus der 53er-Trennung – wird im Song sauber ersetzt")
+        else:
+            st["_orgel"] = st[quelle]
+            if quelle == "piano":
+                melde("✔ Orgel liegt in der Piano-Spur – Piano bleibt im Song, die alte Orgel ist leise darunter "
+                      "zu hören (sauberer: Orgel vorher bei den 53 Instrumenten trennen)")
         melde(f"✔ Orgel setzt bei {beats[erst]:.1f} s ein, spielt ab dort durchgehend")
         melde("… Bubble planen (rechte Hand auf dem Skank, linke Hand auf e und a)")
         stellen, T, D, info = bubble_plan(st, beats, akk, phase, erst, swing=not a.ohne_swing)
@@ -344,7 +370,7 @@ def main():
         else:
             melde("… erkenne die Töne der Original-Orgel")
             try:
-                noten, _, _ = P.noten_basic_pitch(spuren["other"], a.ziel)
+                noten, _, _ = P.noten_basic_pitch(org_pfad, a.ziel)
                 noten = [(x[0], x[1], x[2], (x[3] - 30) / 100.0) for x in noten]   # zurück auf 0..1
             except Exception as e:
                 melde(f"… Töne nicht erkennbar ({str(e)[:80]}), nehme Standard-Griffe")
@@ -383,24 +409,33 @@ def main():
         fen = [int(x * SR) for x in np.arange(beats[erst], beats[-1] - 2.8, 2.8)]
         tr = lambda x: np.array([np.sqrt(np.mean(x[q:q + kk] ** 2)) for q in fen])  # noqa: E731
         ist = np.median(tr(y.mean(1)))
-        y *= np.percentile(tr(st["other"]), 75) / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
+        y *= np.percentile(tr(st["_orgel"]), 75) / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
         if np.abs(y).max() > 0.98:
             y *= 0.98 / np.abs(y).max()
         out = os.path.join(a.ziel, "orgel_neu.wav")
         sf.write(out, y, SR, subtype="PCM_24")
-        # Song: „Other“ nur ab dem Orgel-Einsatz ersetzen (davor bleibt, was sonst in „Other“ klingt)
-        rest = None
-        for s_, p_ in spuren.items():
+        # Song: die alte Orgel nur ab dem Orgel-Einsatz ersetzen (davor bleibt alles, wie es war)
+        from scipy.ndimage import uniform_filter1d
+
+        def ab_einsatz(x):
+            maske = np.zeros(len(x))
+            maske[int(beats[erst] * SR):] = 1.0
+            return x * uniform_filter1d(maske, int(0.08 * SR))[:, None]
+
+        def stereo(p_):
             x, _ = lb.load(p_, sr=SR, mono=False)
             x = np.atleast_2d(x).T
-            if x.shape[1] == 1:
-                x = np.repeat(x, 2, 1)
-            if s_ == "other":
-                from scipy.ndimage import uniform_filter1d
-                maske = np.ones(len(x))
-                maske[int(beats[erst] * SR):] = 0.0
-                x = x * uniform_filter1d(maske, int(0.08 * SR))[:, None]
+            return np.repeat(x, 2, 1) if x.shape[1] == 1 else x
+        rest = None
+        for s_, p_ in spuren.items():
+            x = stereo(p_)
+            if s_ == "other" and quelle == "other":
+                x = x - ab_einsatz(x)                    # „Other“ ab dem Einsatz raus (wie bisher)
             rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
+        if quelle == "orgel53":                          # genau die alte Orgel abziehen, alles andere bleibt
+            o = stereo(org_pfad)
+            L0 = min(len(rest), len(o))
+            rest = rest[:L0] - ab_einsatz(o[:L0])
         L = min(len(rest), len(y))
         mix = rest[:L] + y[:L]
         mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
@@ -426,7 +461,7 @@ def main():
                         + " | ".join(f"{K.akkord_name(x):6s}" for x in akk[t0:t0 + 4]))
         with open(os.path.join(a.ziel, "orgel_neu_Akkord_Plan.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(plan) + "\n")
-        bericht = {"trennung": modell, "klang": klang, "bank": bank, "programm": prog, "leslie": a.leslie,
+        bericht = {"trennung": modell, "orgel_quelle": quelle, "alte_orgel_bleibt": quelle == "piano", "klang": klang, "bank": bank, "programm": prog, "leslie": a.leslie,
                    "tonart": f"{K.NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
                    "orgel_einsatz_s": round(float(beats[erst]), 2), **info, "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
