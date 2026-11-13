@@ -7,7 +7,25 @@ SAMPLES=os.environ.get('HIELTECH_DRUM_SAMPLES') or os.path.join(os.path.dirname(
 K=os.path.join(SAMPLES,'kit')+'/'
 ART={'kick':'01_Kick','snare':'02_Snare','rimshot':'03_Rimshot','ghost':'04_Snare_Ghost',
      'hh_zu':'05_HiHat_zu','hh_halb':'06_HiHat_halboffen','hh_offen':'07_HiHat_offen'}
-def lade_kit(k=K):
+# 13. Nov 2026: Roots-Reggae-Kit = feste Auswahl nach Gehör (samples/kit_roots.json). HIELTECH_DRUM_KIT=alt -> altes Kit.
+import json as _json
+def _roots_laden():
+    p=os.path.join(SAMPLES,'kit_roots.json')
+    if os.environ.get('HIELTECH_DRUM_KIT','').strip().lower()=='alt' or not os.path.isfile(p): return None
+    try:
+        with open(p,encoding='utf-8') as f: return _json.load(f)
+    except (OSError,ValueError): return None
+ROOTS=_roots_laden()
+def _sample(p):
+    x,_=sf.read(p,always_2d=True,dtype='float32') if not p.lower().endswith(('.mp3','.m4a')) else (None,None)
+    if x is None:
+        y,_=_lb.load(p,sr=SR,mono=False); x=(np.atleast_2d(y).T if y.ndim==1 else y.T).astype(np.float32)
+    if x.shape[1]==1: x=np.repeat(x,2,1)
+    a=np.abs(x).max(1); st=max(0,int(np.argmax(a>a.max()*0.05))-88); x=x[st:]; a=np.abs(x).max(1)  # Stille vorn weg
+    return {'x':x,'spitze':int(np.argmax(a)),'einsatz':int(np.argmax(a>a.max()*0.1)),'wert':float(np.abs(x.mean(1)).max()),'name':os.path.basename(p)}
+def lade_kit(k=K,roots=True):
+    if roots and ROOTS:
+        return {art:{st:[_sample(os.path.join(SAMPLES,p))] for st,p in ROOTS[art].items()} for art in ART if art in ROOTS}
     kit={}
     for art,ordner in ART.items():
         kit[art]={}
@@ -44,6 +62,7 @@ def spielen(laenge,hits,kit,choke_offen=True,seed=0):
         i=(k+int(rng.integers(0,max(1,min(3,len(L))))))%len(L)
         s=L[i]
         g=10**(h['pegel']/20)/max(s['wert'],1e-6)
+        if len(L)==1: g*=10**(float(rng.normal(0,0.4))/20)    # ein Klang je Stufe: winzige Lautstärke-Schwankung (lebendig)
         a=((h['einsatz']-s['einsatz']) if 'einsatz' in h else (h['spitze']-s['spitze']))+h.get('schub',0)
         if art.startswith('hh') and choke_offen and letzte_offen is not None and a>letzte_offen[0]:
             # offene Hi-Hat wird vom nächsten Hi-Hat-Schlag natürlich abgedämpft (Pedal), 30 ms weich
@@ -111,10 +130,13 @@ def _grund(seg):
 def tom_bibliothek(wurzel=None):
     T=os.path.join(SAMPLES,'toms')
     tr={}
-    for name in ('Tom1','Tom2','Tom3','Tom4'):
+    if ROOTS and ROOTS.get('toms'):
+        tr={name:[os.path.join(SAMPLES,p) for p in P] for name,P in ROOTS['toms'].items()}
+        tr={n:[p for p in P if os.path.isfile(p)] for n,P in tr.items()}; tr={n:P for n,P in tr.items() if P}
+    for name in (('Tom1','Tom2','Tom3','Tom4') if not tr else ()):
         P=sorted(glob.glob(os.path.join(T,'Muldjord '+name,'*.flac'))+glob.glob(os.path.join(T,'Muldjord '+name,'*.wav')))
         if P: tr['Muldjord '+name]=P
-    for p in sorted(glob.glob(os.path.join(T,'shots','*'))):
+    for p in (sorted(glob.glob(os.path.join(T,'shots','*'))) if not (ROOTS and ROOTS.get('toms')) else []):
         tr[os.path.basename(p)]=[p]
     lib={}
     for name,P in tr.items():
@@ -166,12 +188,17 @@ def toms_spielen(laenge,x,hits,lib,max_halbton=2.0):
 from scipy.signal import butter as _bt, sosfiltfilt as _sff
 _HP5=_bt(4,5000,'high',fs=SR,output='sos')
 def _hf(m): return _sff(_HP5,m)
-def becken_bibliothek(wurzel=None,ordner=('CrashL',)):
+def becken_bibliothek(wurzel=None,ordner=('CrashL',),pfade=None):
     mj=os.path.join(SAMPLES,'becken')+'/'
     L=[]
-    for o in ordner:
-        for p in sorted(glob.glob(mj+o+'/*.wav')+glob.glob(mj+o+'/*.flac')):
-            y,_=sf.read(p,always_2d=True,dtype='float32')
+    quellen=[(os.path.basename(os.path.dirname(p)),[p]) for p in pfade] if pfade else \
+            [(o,sorted(glob.glob(mj+o+'/*.wav')+glob.glob(mj+o+'/*.flac'))) for o in ordner]
+    for o,P in quellen:
+        for p in P:
+            if p.lower().endswith(('.mp3','.m4a')):
+                y0,_=_lb.load(p,sr=SR,mono=False); y=(np.atleast_2d(y0).T if y0.ndim==1 else y0.T).astype(np.float32)
+            else:
+                y,_=sf.read(p,always_2d=True,dtype='float32')
             if y.shape[1]==1: y=np.repeat(y,2,1)
             a=np.abs(y).max(1); st=max(0,int(np.argmax(a>a.max()*0.1))-88); y=y[st:]; a=np.abs(y).max(1)
             h=_hf(y.mean(1)); e=int(np.argmax(a>a.max()*0.1))

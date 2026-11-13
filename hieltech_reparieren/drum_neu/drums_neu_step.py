@@ -318,7 +318,10 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
     from scipy.signal import butter, sosfiltfilt
     bericht = {}
     KIT = kr.lade_kit()
-    karte = karte_bauen(teile_dir, KIT)
+    # Snare oder Rimshot wird am vollen alten Kit unterschieden (viele Varianten = sicherer); gespielt wird das Kit
+    karte = karte_bauen(teile_dir, kr.lade_kit(roots=False) if kr.ROOTS else KIT)
+    if kr.ROOTS:
+        bericht["kit"] = kr.ROOTS.get("name", "Roots-Reggae-Kit")
     if weg:
         for t, zeiten in weg.items():
             if t in karte and zeiten:
@@ -327,6 +330,18 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                 vorher = len(hits)
                 karte[t] = (x, [h for h in hits if np.min(np.abs(z - h["start"])) > 0.03 * SR])
                 bericht.setdefault("fremd_trommel_entfernt", {})[t] = vorher - len(karte[t][1])
+    x, hits = karte["toms"]                       # Kick-Übersprechen in der Tom-Spur: tief (< 90 Hz) und zur Kick
+    if hits:
+        kicks = np.array([h["start"] for h in karte["kick"][1]]) if karte["kick"][1] else np.zeros(0)
+        m_ = x.mean(1); vorher = len(hits)
+        def _kickecho(h):
+            if not len(kicks) or np.min(np.abs(kicks - h["start"])) > 0.04 * SR:
+                return False
+            return kr._grund(m_[h["start"] + int(.02 * SR):h["start"] + int(.3 * SR)]) < 90.0
+        hits = [h for h in hits if not _kickecho(h)]
+        karte["toms"] = (x, hits)
+        if vorher - len(hits):
+            bericht["toms_kick_uebersprechen_entfernt"] = vorher - len(hits)
     x, hits = karte["toms"]                       # Übersprechen in der Tom-Spur: nur nahe der lautesten
     if hits:
         top = max(h["pegel"] for h in hits)
@@ -365,9 +380,23 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
             if schub_von:
                 for h in bh:
                     h["schub"] = schub_von(h["einsatz"])
-            y, ben = kr.becken_spielen2(len(x), x, bh, kr.becken_bibliothek(None, ("CrashL", "CrashR")))
+            bn = becken_noten(teile_dir, x, bh, bericht)
+            if kr.ROOTS and bh:
+                # Ride-Schläge mit dem Ride-Klang, Crash 1 / Crash 2 mit Crash L / Crash R (Auswahl des Inhabers)
+                pf = lambda k: [os.path.join(kr.SAMPLES, p) for p in (kr.ROOTS.get(k) or [])
+                                if os.path.isfile(os.path.join(kr.SAMPLES, p))]
+                libs = {51: pf("ride") or pf("crash1"), 49: pf("crash1"), 57: pf("crash2") or pf("crash1")}
+                y, ben = np.zeros((len(x), 2), np.float32), []
+                for note, pfade in libs.items():
+                    teil_h = [h for h, n_ in zip(bh, bn) if n_ == note]
+                    if teil_h and pfade:
+                        y_, b_ = kr.becken_spielen2(len(x), x, teil_h, kr.becken_bibliothek(None, pfade=pfade))
+                        y += y_; ben += b_
+                ben.sort()
+            else:
+                y, ben = kr.becken_spielen2(len(x), x, bh, kr.becken_bibliothek(None, ("CrashL", "CrashR")))
             hits = bh
-            for h, note in zip(bh, becken_noten(teile_dir, x, bh, bericht)):
+            for h, note in zip(bh, bn):
                 noten.append(((h["einsatz"] + h.get("schub", 0)) / SR, note, h["pegel"], "becken"))
             bericht["becken"] = {"anzahl": len(bh), "schlaege(zeit,shot,hoehen_db,abstand)": ben}
         else:
@@ -379,15 +408,23 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                     hits = hihat_lautstaerke(eingabe, teile_dir, x, hits, hh_ref, bericht)
             kit_song = copy.deepcopy(KIT)
             arten = {"kick": ["kick"], "snare": ["snare", "rimshot"], "hihat": ["hh_zu", "hh_offen"]}[teil]
-            if hits:
+            oeffnung = None
+            if hits and teil == "hihat":
+                oeffnung = hh_oeffnung(x, hits, bericht, karte["becken"][0])
+                if "hh_halb" in kit_song:              # halboffen / offen auch klanglich (nicht nur im MIDI)
+                    for h, (note, cc4) in zip(hits, oeffnung):
+                        o = (127 - cc4) / 127
+                        h["art"] = "hh_offen" if o >= 0.65 else ("hh_halb" if o >= 0.3 else "hh_zu")
+            if hits and not kr.ROOTS:
                 bericht.setdefault("kit_angepasst", {}).update(kr.passend_machen(kit_song, arten, x, hits))
+            if hits:
                 if schub_von:
                     for h in hits:
                         h["schub"] = schub_von(h["einsatz"])
                 y, benutzt = kr.spielen(len(x), hits, kit_song)
                 gmn = {"kick": 36, "snare": 38, "rimshot": rimshot_note, "hh_zu": 42, "hh_offen": 46}
                 if teil == "hihat":
-                    for h, (note, cc4) in zip(hits, hh_oeffnung(x, hits, bericht, karte["becken"][0])):
+                    for h, (note, cc4) in zip(hits, oeffnung):
                         noten.append(((h["einsatz"] + h.get("schub", 0)) / SR, note, h["pegel"], teil, cc4))
                 else:
                     for h in hits:
@@ -432,8 +469,10 @@ def becken_noten(teile_dir, xb, hits, bericht):
             w = slice(h["einsatz"], h["einsatz"] + int(0.3 * SR))
             lc = 10 * np.log10(np.mean(hc[w] ** 2) + 1e-14)
             lr = 10 * np.log10(np.mean(hr[w] ** 2) + 1e-14)
-            if lr > lc + 6:
+            if lr > lc + 10:                             # 13. Nov 2026: strenger (6 -> 10 dB) – Ride ist im Reggae selten
                 noten[i] = 51
+        if 0 < noten.count(51) < 8:                     # einzelne „Ride“-Schläge sind kein Ride-Muster -> Crash
+            noten = [49 if n_ == 51 else n_ for n_ in noten]
         # zwei Crash-Becken? Klangfarbe (Schwerpunkt) muss klar in zwei Gruppen zerfallen
         import librosa
         m = cr.mean(1)
