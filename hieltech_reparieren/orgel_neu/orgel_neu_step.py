@@ -111,6 +111,24 @@ def orgel_zeitleiste(other, ziel):
     raise RuntimeError("Hör-Modell (Instrumenten-Erkennung) nicht verfügbar: " + fehler)
 
 
+def energie_zeitleiste(pfad):
+    """Zeitleiste wie vom Hör-Modell (grob/fein, Werte 0…1), aber aus der Lautstärke einer reinen Orgel-Spur
+    (53er-Trennung): 0,2 ≈ 22 dB unter den lautesten Stellen. Kein Modell nötig."""
+    y = K.lade_mono(pfad)
+
+    def leiste(fen, hop):
+        t, w = [], []
+        for a in range(0, max(1, len(y) - fen), hop):
+            t.append((a + fen / 2) / SR)
+            w.append(10 * np.log10(np.mean(y[a:a + fen] ** 2) + 1e-12))
+        return np.array(t), np.array(w)
+    gt, gw = leiste(SR * 2, SR)
+    ft, fw = leiste(SR, SR // 2)
+    ref = float(np.percentile(gw, 95))
+    norm = lambda w: np.clip((w - (ref - 26.0)) / 20.0, 0.0, 1.0)  # noqa: E731
+    return {"grob_t": gt, "grob": norm(gw), "fein_t": ft, "fein": norm(fw)}
+
+
 def laeufe(x):
     r, i = [], 0
     while i < len(x):
@@ -139,7 +157,10 @@ def orgel_einsatz(beats, phase, Z):
         if v and j - i < 2:
             tk[i:j] = False
     if not tk.any():
-        return None
+        return None, None
+    aktiv = np.zeros(nb, bool)                   # Takte, in denen die Orgel spielt (je Schlag)
+    for (a_, b_), v in zip(takte, tk):
+        aktiv[a_:b_] = v
     erst = takte[int(np.argmax(tk))][0]
     # fein nachschärfen: erster klarer Orgel-Moment (2 von 3 Fenstern >= 0,2), Fenstermitte + 0,25 s = Einsatz
     tf, of = Z["fein_t"], Z["fein"]
@@ -147,12 +168,17 @@ def orgel_einsatz(beats, phase, Z):
     lo, hi = beats[max(0, erst - 4)], beats[min(nb, erst + 8)]
     k = np.where((tf >= lo) & (tf <= hi) & klar)[0]
     if len(k):
-        erst = int(np.clip(np.searchsorted(beats, tf[k[0]] + 0.25, side="right") - 1, 0, nb - 1))
-    return erst
+        neu_erst = int(np.clip(np.searchsorted(beats, tf[k[0]] + 0.25, side="right") - 1, 0, nb - 1))
+        if neu_erst < erst:
+            aktiv[neu_erst:erst] = True
+        else:
+            aktiv[erst:neu_erst] = False
+        erst = neu_erst
+    return erst, aktiv
 
 
 # ------------------------------------------------------------ Bubble planen
-def bubble_plan(st, beats, akk, phase, erst, swing=True):
+def bubble_plan(st, beats, akk, phase, erst, swing=True, aktiv=None):
     lb = K.librosa()
     nb = len(beats) - 1
     org = st.get("_orgel", st["other"])
@@ -187,7 +213,8 @@ def bubble_plan(st, beats, akk, phase, erst, swing=True):
     def basis(i, nm):
         u = und(i)
         return u if nm == "&" else (0.5 * (As[i] + u) if nm == "e" else 0.5 * (u + As[i + 1]))
-    stellen = [(i, nm, basis(i, nm)) for i in range(erst, nb) if akk[i] is not None for nm in POS]
+    stellen = [(i, nm, basis(i, nm)) for i in range(erst, nb) if akk[i] is not None
+               and (aktiv is None or aktiv[i]) for nm in POS]
     gitter = np.array([x[2] for x in stellen])
     on = lb.onset.onset_detect(y=K.hochpass(org, 150), sr=SR, hop_length=128, units="time", backtrack=True, delta=0.05)
     versatz = {"&": 0.0, "e": 0.0, "a": 0.0}
@@ -203,10 +230,76 @@ def bubble_plan(st, beats, akk, phase, erst, swing=True):
     if swing:
         versatz.update(gemessen)
     T = gitter + np.array([versatz[x[1]] for x in stellen])
-    info = {"skank_treffer": sum(1 for i, nm, _ in stellen if nm == "&" and i in SK),
+    # erster und dritter Schlag folgen der Original-Orgel (so wie dort gespielt), der mittlere bleibt auf dem Skank
+    gefolgt = 0
+    if len(on) >= 2 and len(T):
+        for q, (i, nm, _) in enumerate(stellen):
+            if nm == "&":
+                continue
+            j = int(np.clip(np.searchsorted(on, T[q]), 1, len(on) - 1))
+            o = on[j] if abs(on[j] - T[q]) < abs(on[j - 1] - T[q]) else on[j - 1]
+            if abs(o - T[q]) <= 0.03:
+                T[q] = o
+                gefolgt += 1
+    info = {"wie_original_gespielt": gefolgt, "skank_treffer": sum(1 for i, nm, _ in stellen if nm == "&" and i in SK),
             "bubble_schlaege": len(stellen) // 3, "swing_ms": {k: round(v * 1000, 1) for k, v in gemessen.items()},
             "swing_an": bool(swing)}
     return stellen, T, D, info
+
+
+def _schlag_db(x, T, w0=-0.02, w1=0.06):
+    """Lautstärke (dB) der Original-Spur kurz um jeden Zeitpunkt (Anschlag, Höhen über 150 Hz)."""
+    h = K.hochpass(x, 150)
+    out = []
+    for t in T:
+        a, b = max(0, int((t + w0) * SR)), min(len(h), int((t + w1) * SR))
+        out.append(10 * np.log10(np.mean(h[a:b] ** 2) + 1e-12) if b > a else -120.0)
+    return np.array(out)
+
+
+def bubble_dynamik(org, stellen, T):
+    """Wie laut spielt das Original den ersten (e), mittleren (&) und dritten (a) Schlag? dB relativ zur Mitte.
+    Im Reggae-Bubble ist die Mitte (mit dem Skank) am lautesten, der erste etwas leiser, der dritte am leisesten –
+    stimmt die Messung damit nicht zusammen oder ist sie unsicher, gilt diese Regel (−3 / −6 dB)."""
+    regel = {"e": -3.0, "&": 0.0, "a": -6.0}
+    if not len(T):
+        return regel
+    L = _schlag_db(org, T)
+    pos = np.array([x[1] for x in stellen])
+    lauf = L > np.percentile(L, 95) - 30          # nur Stellen, an denen die Orgel wirklich spielt
+    m = {nm: float(np.median(L[(pos == nm) & lauf])) for nm in POS if ((pos == nm) & lauf).sum() >= 8}
+    if len(m) < 3:
+        return regel
+    e, a_ = m["e"] - m["&"], m["a"] - m["&"]
+    e = float(np.clip(e, -8.0, -1.5))
+    a_ = float(np.clip(a_, -12.0, e - 2.0))
+    return {"e": round(e, 1), "&": 0.0, "a": round(a_, 1)}
+
+
+def mit_original_vergleichen(orig, neu, abschnitte, stellen, T):
+    """Schläge der neuen Orgel gegen die Original-Orgel: Trefferquote (±35 ms), mittlere Abweichung, Dynamik."""
+    lb = K.librosa()
+    def ons(x):
+        o = lb.onset.onset_detect(y=K.hochpass(np.asarray(x, np.float32), 150), sr=SR, hop_length=128,
+                                  units="time", backtrack=True, delta=0.05)
+        return np.array([t for t in o if any(a <= t <= b for a, b in abschnitte)])
+    oa, on_ = ons(orig), ons(neu)
+    ab = []
+    for t in oa:
+        if len(on_):
+            ab.append(float(np.min(np.abs(on_ - t))))
+    ab = np.array(ab)
+    tr = float((ab <= 0.035).mean() * 100) if len(ab) else 0.0
+    dyn_neu = {}
+    if len(T):
+        Ln = _schlag_db(np.asarray(neu, np.float32), T)
+        pos = np.array([x[1] for x in stellen])
+        mm = {nm: float(np.median(Ln[pos == nm])) for nm in POS if (pos == nm).any()}
+        if "&" in mm:
+            dyn_neu = {nm: round(v - mm["&"], 1) for nm, v in mm.items()}
+    return {"original_schlaege": int(len(oa)), "neue_schlaege": int(len(on_)), "treffer_prozent": round(tr, 1),
+            "abweichung_ms": round(float(np.median(ab[ab <= 0.035]) * 1000) if (ab <= 0.035).any() else 0.0, 1),
+            "dynamik_neu_db": dyn_neu}
 
 
 def griffe(stellen, T, akk, noten):
@@ -330,7 +423,7 @@ def main():
         beats = K.taktraster(st["drums"])
         nb = len(beats) - 1
         akk, phase, ton = K.akkord_plan(beats, 3 * st.get("piano", 0) + st["other"] + st.get("guitar", 0), st["bass"])
-        melde("… höre, wo die Orgel einsetzt (Hör-Modell)")
+        melde("… suche, wo die Orgel spielt")
         # Wo liegt die Orgel? 53er-Orgel (wenn vorhanden) > „Other“ > Piano-Spur
         kandidaten = []
         if a.orgel_spur and os.path.isfile(a.orgel_spur):
@@ -341,11 +434,14 @@ def main():
             if a.zeitleiste:
                 z = np.load(a.zeitleiste)
                 Zk = {k: z[k] for k in z.files}
+            elif name == "orgel53":
+                melde("… höre, wo die Orgel spielt (Lautstärke der 53er-Orgel)")
+                Zk = energie_zeitleiste(pfad)
             else:
                 Zk = orgel_zeitleiste(pfad, a.ziel)
-            ek = orgel_einsatz(beats, phase, Zk)
+            ek, ak = orgel_einsatz(beats, phase, Zk)
             if ek is not None:
-                quelle, Z, erst = name, Zk, ek
+                quelle, Z, erst, aktiv = name, Zk, ek, ak
                 break
             if a.zeitleiste:
                 break
@@ -362,9 +458,12 @@ def main():
             if quelle == "piano":
                 melde("✔ Orgel liegt in der Piano-Spur – Piano bleibt im Song, die alte Orgel ist leise darunter "
                       "zu hören (sauberer: Orgel vorher bei den 53 Instrumenten trennen)")
-        melde(f"✔ Orgel setzt bei {beats[erst]:.1f} s ein, spielt ab dort durchgehend")
-        melde("… Bubble planen (rechte Hand auf dem Skank, linke Hand auf e und a)")
-        stellen, T, D, info = bubble_plan(st, beats, akk, phase, erst, swing=not a.ohne_swing)
+        abschnitte = [(beats[i], beats[min(j, len(beats) - 1)]) for i, j, v in laeufe(aktiv) if v]
+        melde(f"✔ Orgel setzt bei {beats[erst]:.1f} s ein, spielt in {len(abschnitte)} Abschnitt(en): "
+              + ", ".join(f"{a_:.0f}–{b_:.0f} s" for a_, b_ in abschnitte[:6]))
+        melde("… Bubble planen (Mitte genau auf dem Skank, erster und dritter Schlag wie im Original)")
+        stellen, T, D, info = bubble_plan(st, beats, akk, phase, erst, swing=not a.ohne_swing, aktiv=aktiv)
+        info["abschnitte_s"] = [[round(float(a_), 2), round(float(b_), 2)] for a_, b_ in abschnitte]
         if a.noten_json:
             noten = [tuple(x) for x in json.load(open(a.noten_json))]
         else:
@@ -377,16 +476,21 @@ def main():
                 noten = []
         G = griffe(stellen, T, akk, noten)
         P_ = float(np.median(np.diff(beats)))
+        dyn = bubble_dynamik(st["_orgel"], stellen, T)
+        info["dynamik_original_db"] = dyn
+        VEL = {nm: int(round(104 * 10 ** (dyn[nm] / 40.0))) for nm in POS}   # Anschlag ~ 40·log10(v) dB
+        melde(f"✔ Dynamik der drei Schläge: erster {dyn['e']:+.1f} dB, Mitte 0 dB, dritter {dyn['a']:+.1f} dB")
         neu = []
         for (i, nm, _), t in zip(stellen, T):
-            d, v, g = (0.30 * P_, 100, G[(akk[i], "R")]) if nm == "&" else (0.17 * P_, 92, G[(akk[i], "L")])
+            d, v, g = (0.30 * P_, VEL["&"], G[(akk[i], "R")]) if nm == "&" else (0.17 * P_, VEL[nm], G[(akk[i], "L")])
             for p in g:
                 neu.append((float(t), float(t) + d, p, v))
         extra = []
         if not a.ohne_zusatztoene and noten:
             tf, of = Z["fein_t"], Z["fein"]
             skala = {(ton[0] + i) % 12 for i in ((0, 2, 3, 5, 7, 8, 10) if ton[1] == "moll" else (0, 2, 4, 5, 7, 9, 11))}
-            extra = [x for x in noten if x[0] >= beats[erst] and np.min(np.abs(T - x[0])) > 0.07 and 55 <= x[2] <= 84
+            in_takt = lambda t: bool(aktiv[min(len(aktiv) - 1, max(0, int(np.searchsorted(beats, t, side="right") - 1)))])  # noqa: E731
+            extra = [x for x in noten if x[0] >= beats[erst] and in_takt(x[0]) and len(T) and np.min(np.abs(T - x[0])) > 0.07 and 55 <= x[2] <= 84
                      and x[2] % 12 in skala and x[1] - x[0] >= 0.1 and of[int(np.argmin(np.abs(tf - x[0])))] >= 0.3]
             if extra:
                 ze, _ = K.am_schlagzeug(np.array([x[0] for x in extra]), D)
@@ -406,7 +510,8 @@ def main():
         y = leslie(y, a.leslie)
         # gleichmäßige Lautstärke wie die Original-Orgel (nur über die Orgel-Takte)
         kk = int(2.8 * SR)
-        fen = [int(x * SR) for x in np.arange(beats[erst], beats[-1] - 2.8, 2.8)]
+        fen = [int(x * SR) for a_, b_ in abschnitte for x in np.arange(a_, b_ - 2.8, 2.8)] \
+            or [int(x * SR) for x in np.arange(beats[erst], beats[-1] - 2.8, 2.8)]   # nur in den Orgel-Abschnitten
         tr = lambda x: np.array([np.sqrt(np.mean(x[q:q + kk] ** 2)) for q in fen])  # noqa: E731
         ist = np.median(tr(y.mean(1)))
         y *= np.percentile(tr(st["_orgel"]), 75) / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
@@ -446,7 +551,8 @@ def main():
                 f"Klang: {klang} (GeneralUser GS, Bank {bank}, GM-Programm {prog + 1})"
                 + (f", Leslie {a.leslie} (nur im Audio)" if a.leslie != "aus" else ""),
                 f"Tonart: {K.NAMEN[ton[0]]}-{ton[1]}, Song-Tempo ca. {bpm_song:.1f} BPM (A# = B♭, D# = E♭)",
-                f"Orgel-Einsatz: {int(beats[erst] // 60)}:{beats[erst] % 60:05.2f}, ab dort durchgehend",
+                f"Orgel-Einsatz: {int(beats[erst] // 60)}:{beats[erst] % 60:05.2f}; spielt in: "
+                + ", ".join(f"{int(a_ // 60)}:{a_ % 60:04.1f}–{int(b_ // 60)}:{b_ % 60:04.1f}" for a_, b_ in abschnitte),
                 f"Bubble: rechte Hand auf dem „&“ (genau mit Gitarre/Piano-Skank), linke Hand auf „e“ und „a“"
                 + (f", Swing wie im Original ({info['swing_ms'].get('e', 0):.0f}/{info['swing_ms'].get('a', 0):.0f} ms)"
                    if not a.ohne_swing else ", gerade"),
@@ -461,6 +567,10 @@ def main():
                         + " | ".join(f"{K.akkord_name(x):6s}" for x in akk[t0:t0 + 4]))
         with open(os.path.join(a.ziel, "orgel_neu_Akkord_Plan.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(plan) + "\n")
+        vergleich = mit_original_vergleichen(st["_orgel"], y.mean(1), abschnitte, stellen, T)
+        melde(f"✔ Vergleich mit dem Original: {vergleich['treffer_prozent']:.0f} % der Original-Schläge getroffen, "
+              f"mittlere Abweichung {vergleich['abweichung_ms']:.0f} ms")
+        info["vergleich_mit_original"] = vergleich
         bericht = {"trennung": modell, "orgel_quelle": quelle, "alte_orgel_bleibt": quelle == "piano", "klang": klang, "bank": bank, "programm": prog, "leslie": a.leslie,
                    "tonart": f"{K.NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
                    "orgel_einsatz_s": round(float(beats[erst]), 2), **info, "midi": midi}
