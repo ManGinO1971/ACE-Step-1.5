@@ -4385,7 +4385,7 @@ os.environ.setdefault("HIELTECH_MIDI_PYTHON", "/opt/hieltech_noten_venv/bin/pyth
 _HIELTECH_REPARIEREN_MODULE = {
     "drums": {"skript": os.path.join("drum_neu", "drums_neu_step.py"), "klang": ["drums"], "modelle": True,
               "klang_env": {"drums": "HIELTECH_DRUM_SAMPLES"},
-              "schalter": {"--fremd-trommel": 0, "--timing-korrigieren": 0, "--hh-ref": 1, "--nur": 1,
+              "schalter": {"--fremd-trommel": 0, "--timing-korrigieren": 0, "--hh-ref": 1, "--nur": 1, "--vergleich": 0,
                            "--rimshot-note": 1, "--midi-bpm": 1}},
     "bass": {"skript": os.path.join("bass_neu", "bass_neu_step.py"), "klang": ["bass_neu"], "modelle": False,
              "schalter": {"--klang-wie-original": 0, "--midi-bpm": 1, "--schlagzeug": "datei",

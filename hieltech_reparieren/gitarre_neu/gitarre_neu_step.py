@@ -309,26 +309,77 @@ def skank_stellen(beats, akk, phase, git, muster="einfach"):
         if akk[i] is not None and E[i, 1] > 0.5:
             slots[(i, haupt_p)] = "haupt"
     slots = sorted((i, p, r) for (i, p), r in slots.items())
-    # Zeitpunkt: echter Gitarren-Anschlag in ±40 ms, sonst Raster + typischer Versatz
+    # 14. Nov 2026: Zeitpunkt wie im Original (wie bei der Orgel): je Schlag-Art (tchak / chack / …) misst die App, wo
+    # DIESER Gitarrist ihn im Takt wirklich spielt (nicht fest ½ / ¾), jeder Schlag folgt dem echten Anschlag, und
+    # Schläge, die das Original zusätzlich spielt (z. B. kurz vor dem Schlag), werden mitgespielt.
     on = lb.onset.onset_detect(y=h, sr=SR, hop_length=128, units="samples", backtrack=True, delta=0.05)
-    on_t = np.array([einsatz(git, int(x)) / SR for x in on])
-    zeiten, versatz = [], []
+    on_s = np.array([einsatz(git, int(x)) for x in on], dtype=int)
+    on_t = on_s / SR
+    on_k = np.array([float(np.abs(h[a:a + int(0.03 * SR)]).max()) if a < len(h) else 0.0 for a in on_s])
+
+    def lage_von(t):
+        i = int(np.searchsorted(beats, t)) - 1
+        if i < 0 or i >= n:
+            return None, None
+        return i, (t - beats[i]) / (beats[i + 1] - beats[i])
+    lagen = {}                                   # Schlag-Art -> gemessene Lage im Schlag
+    for p0 in sorted({p for _, p, _ in slots}):
+        ab = []
+        for i, p, r in slots:
+            if p != p0:
+                continue
+            t = beats[i] + p * (beats[i + 1] - beats[i]); bl = beats[i + 1] - beats[i]
+            if len(on_t):
+                j = int(np.argmin(np.abs(on_t - t)))
+                if abs(on_t[j] - t) < 0.15 * bl:
+                    ab.append((on_t[j] - t) / bl)
+        lagen[p0] = p0 + (float(np.median(ab)) if len(ab) >= 8 else 0.0)
+    zeiten, staerke, benutzt = [], [], set()
     for i, p, r in slots:
-        t = beats[i] + p * (beats[i + 1] - beats[i])
+        bl = beats[i + 1] - beats[i]; t = beats[i] + lagen[p] * bl
         if len(on_t):
             j = int(np.argmin(np.abs(on_t - t)))
-            if abs(on_t[j] - t) < (0.04 if p in (0.0, 0.5) else 0.025):
-                zeiten.append(float(on_t[j]))
-                versatz.append(on_t[j] - t)
+            if abs(on_t[j] - t) < 0.09 * bl and j not in benutzt:
+                zeiten.append(float(on_t[j])); staerke.append(on_k[j]); benutzt.add(j)
                 continue
-        zeiten.append(None)
-    dv = float(np.median(versatz)) if versatz else 0.0
+        zeiten.append(None); staerke.append(None)
+    # Der leichte Nachschlag (chack) und Kratzer nur dort, wo das Original sie wirklich spielt – ergänzt (wo die
+    # Trennung schwach ist) wird nur der Haupt-Tchak, damit kein Schlag dazukommt, den der Gitarrist nicht spielt
+    behalt = [k for k, (z, (i, p, r)) in enumerate(zip(zeiten, slots)) if z is not None or r == "haupt"]
+    slots = [slots[k] for k in behalt]; zeiten = [zeiten[k] for k in behalt]; staerke = [staerke[k] for k in behalt]
     gefunden = sum(z is not None for z in zeiten)
-    zeiten = [z if z is not None else beats[i] + p * (beats[i + 1] - beats[i]) + dv for z, (i, p, r) in zip(zeiten, slots)]
+    zeiten = [z if z is not None else beats[i] + lagen[p] * (beats[i + 1] - beats[i]) for z, (i, p, r) in zip(zeiten, slots)]
+    # zusätzliche Anschläge des Originals mitspielen: kräftig, in einem Takt mit Skank, mit Akkord, nicht doppelt
+    haupt_k = [k for k, (i, p, r) in zip(staerke, slots) if k is not None and r == "haupt"]
+    ref_k = float(np.median(haupt_k)) if haupt_k else (float(np.median(on_k)) if len(on_k) else 1.0)
+    aktiv_takt = {i for k, t in enumerate(takte) if aktiv[k] for i in range(t, min(t + 4, n))}
+    zt = np.array(sorted(zeiten)) if zeiten else np.zeros(0)
+    extra = []
+    for j, (t, k) in enumerate(zip(on_t, on_k)):
+        if j in benutzt or k < 0.45 * ref_k:
+            continue
+        i, f = lage_von(t)
+        if i is None or i not in aktiv_takt or akk[i] is None:
+            continue
+        bl = beats[i + 1] - beats[i]
+        if len(zt) and np.min(np.abs(zt - t)) < 0.12 * bl:
+            continue
+        extra.append((i, round(float(f), 3), "haupt" if abs(f - lagen.get(haupt_p, 0.5)) < 0.1 else "nach", float(t), k))
+    if extra:
+        slots = slots + [(i, f, r) for i, f, r, _, _ in extra]
+        zeiten = zeiten + [t for *_, t, _ in extra]
+        staerke = staerke + [k for *_, k in extra]
+        o = np.argsort(zeiten, kind="stable")
+        slots = [slots[q] for q in o]; zeiten = [zeiten[q] for q in o]; staerke = [staerke[q] for q in o]
+    # Lautstärke je Anschlag wie im Original (relativ zum typischen Tchak, -9 … +3 dB); ergänzte Schläge: typisch
+    rel = np.array([float(np.clip(20 * np.log10(max(k, 1e-9) / max(ref_k, 1e-9)), -9, 3)) if k is not None else 0.0
+                    for k in staerke])
     from collections import Counter
-    return slots, np.array(zeiten), {"stellen": len(slots), "im_stem_gefunden": gefunden, "ergaenzt": len(slots) - gefunden,
+    return slots, np.array(zeiten), {"stellen": len(slots), "im_stem_gefunden": gefunden + len(extra),
+                                     "ergaenzt": len(slots) - gefunden - len(extra), "zusaetzlich_wie_original": len(extra),
+                                     "lage_im_schlag": {f"{k:g}": round(v, 3) for k, v in lagen.items()},
                                      "muster": muster, "muster_erkannt": gewaehlt if muster == "auto" else None,
-                                     "schlaege": dict(Counter(r for _, _, r in slots))}
+                                     "schlaege": dict(Counter(r for _, _, r in slots)), "_rel_db": rel}
 
 
 def schlagzeug_anschlaege(drums):
@@ -405,10 +456,12 @@ def anschlag(seg, rolle):
     return seg
 
 
-def spielen(laenge, slots, zeiten, akk, wahl):
+def spielen(laenge, slots, zeiten, akk, wahl, rel_db=None):
     rng = np.random.default_rng(7)
     y = np.zeros(laenge + SR)
-    for z, (i, p, rolle) in zip(zeiten, slots):
+    if rel_db is None:
+        rel_db = np.zeros(len(slots))
+    for z, (i, p, rolle), rdb in zip(zeiten, slots, rel_db):
         s = wahl.get(akk[i])
         if s is None:
             continue
@@ -423,7 +476,7 @@ def spielen(laenge, slots, zeiten, akk, wahl):
         f = int(.02 * SR)
         w = np.ones(L)
         w[-f:] = np.linspace(1, 0, f)
-        y[a0:a0 + L] += seg[:L] * w * 10 ** (rng.normal(0, 0.6) / 20)
+        y[a0:a0 + L] += seg[:L] * w * 10 ** ((rdb + rng.normal(0, 0.6)) / 20)
     return y[:laenge]
 
 
@@ -564,13 +617,15 @@ def main():
                   f"({', '.join(f'{v}× {k}' for k, v in info['schlaege'].items())})")
         timing = None
         if a.timing_korrigieren:
-            zeiten, k = am_schlagzeug(zeiten, schlagzeug_anschlaege(st["drums"]))
+            haupt = np.array([r == "haupt" for _, _, r in slots])          # chack & Co. nicht an Hi-Hat ziehen
+            z2, k = am_schlagzeug(zeiten[haupt], schlagzeug_anschlaege(st["drums"]))
+            zeiten = zeiten.copy(); zeiten[haupt] = z2
             timing = {"am_schlagzeug": k, "von": len(zeiten)}
             melde(f"✔ Timing: {k} von {len(zeiten)} Tchaks genau auf dem Schlagzeug")
         melde("… spiele die Gitarre neu (eigene Akkord-Aufnahmen, „C fett“)")
         lib = bibliothek()
         wahl = griffe_waehlen(lib, git, slots, zeiten, akk)
-        y = fett(spielen(n, slots, zeiten, akk, wahl))
+        y = fett(spielen(n, slots, zeiten, akk, wahl, info.pop("_rel_db", None)))
         # gleichmäßige Lautstärke: wie die kräftigen Stellen der Original-Gitarre, +6 dB (wie „v2 lauter“)
         k = int(2.8 * SR)
         a0, b0 = int(zeiten[0] * SR) if len(zeiten) else 0, int(zeiten[-1] * SR) if len(zeiten) else n

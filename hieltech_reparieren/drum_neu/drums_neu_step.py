@@ -314,7 +314,7 @@ def timing_vorbereiten(eingabe, karte, teile, bericht):
 
 
 def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimshot_note=37, midi_bpm=120.0,
-                timing=False):
+                timing=False, vergleich=False):
     from scipy.signal import butter, sosfiltfilt
     bericht = {}
     KIT = kr.lade_kit()
@@ -464,6 +464,7 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                 bericht["hihat_becken_uebersprechen_entfernt"] = len(raus)
                 if hits:
                     hits = hihat_lautstaerke(eingabe, teile_dir, x, hits, hh_ref, bericht)
+                    hits = hihat_ergaenzen(eingabe, teile_dir, hits, bericht, ziel)
             kit_song = copy.deepcopy(KIT) if not kr.BIB else {a_: dict(v_) for a_, v_ in KIT.items()}
             arten = {"kick": ["kick"], "snare": ["snare", "rimshot"], "hihat": ["hh_zu", "hh_offen"]}[teil]
             if kr.BIB:
@@ -513,8 +514,8 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
     sf.write(out, mix, SR, subtype="PCM_24")
     for t in roh:
         sf.write(os.path.join(ziel, f"{t}_neu.flac"), np.clip(roh[t], -1, 1), SR, subtype="PCM_24")
-    try:                                           # Gegenprobe und Hör-Seite Original / neu (nie am Ergebnis scheitern)
-        bericht["gegenprobe"] = gegenprobe(roh, treffer, ziel)
+    try:                                           # Gegenprobe (Zahlen immer), Hör-Seite nur auf Wunsch (--vergleich)
+        bericht["gegenprobe"] = gegenprobe(roh, treffer, ziel, mit_dateien=vergleich)
     except Exception as e:  # noqa: BLE001
         bericht["gegenprobe"] = {"fehler": str(e)[:200]}
     try:
@@ -595,7 +596,7 @@ def _begrenzen(x, decke=0.97):
     return np.clip(y, -decke, decke)
 
 
-def gegenprobe(roh, treffer, ziel):
+def gegenprobe(roh, treffer, ziel, mit_dateien=False):
     """Je Element: neue Spur gegen die Original-Teilspur – getroffene Schläge (±30 ms), Abweichung, Lautstärke.
     Legt die Original-Teilspuren und eine Hör-Seite (vergleich.html) zum Gegenhören in den Ergebnis-Ordner."""
     import librosa
@@ -604,7 +605,7 @@ def gegenprobe(roh, treffer, ziel):
         x, zeiten = treffer.get(t, (None, []))
         if x is None:
             continue
-        hoer[t] = _hoerkopie(x, os.path.join(ziel, f"original_{t}.mp3"))
+        hoer[t] = _hoerkopie(x, os.path.join(ziel, f"original_{t}.mp3")) if mit_dateien else False
         if not zeiten:
             erg[t] = {"original_schlaege": 0}
             continue
@@ -625,6 +626,8 @@ def gegenprobe(roh, treffer, ziel):
         f"<td><audio controls preload='none' src='{t}_neu.flac'></audio></td>"
         f"<td>{v.get('getroffen_prozent', '–')} %</td><td>{v.get('abweichung_ms', '–')} ms</td></tr>"
         for t, v in erg.items())
+    if not mit_dateien:
+        return erg
     with open(os.path.join(ziel, "vergleich.html"), "w", encoding="utf-8") as f:
         f.write("<!doctype html><html lang='de'><head><meta charset='utf-8'><title>Schlagzeug: Original und neu</title>"
                 "<style>body{background:#12141a;color:#e8eaf0;font:15px -apple-system,system-ui,sans-serif;padding:20px}"
@@ -812,6 +815,147 @@ def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120
     return {"datei": datei, "tempo_bpm": tempo, "tempo_geschaetzt": geschaetzt, "noten": len(noten)}
 
 
+HH_HOER_HELFER = r'''
+import sys, os, io, contextlib, numpy as np
+sys.path.insert(0, sys.argv[1])
+import detect_instruments_eat as d
+import librosa, torch
+with contextlib.redirect_stdout(io.StringIO()):
+    m, mel = d.modell()
+dev = next(m.parameters()).device
+lab = d.ek.labels(d.EAT_DIR)
+i = lab.index("Hi-hat")
+y, _ = librosa.load(sys.argv[2], sr=32000, mono=True)
+W, h = 32000, 8000
+st = np.arange(0, max(1, len(y) - W + 1), h)
+P = []
+for k in range(0, len(st), 32):
+    x = torch.from_numpy(np.stack([np.pad(y[s:s + W], (0, max(0, W - len(y[s:s + W])))) for s in st[k:k + 32]])).float().to(dev)
+    with torch.no_grad():
+        p, _ = m(mel(x).unsqueeze(1))
+    P.append(torch.sigmoid(p.float()).cpu().numpy()[:, i])
+np.savez(sys.argv[3], t=st / 32000 + 0.5, hihat=np.concatenate(P))
+'''
+DETECT_PYTHON = os.path.expanduser("~/miniforge3/envs/heltech_stems_detect/bin/python")
+
+
+def hh_hoeren(eingabe, ziel):
+    """Hör-Modell (EfficientAT, wie die Instrumenten-Erkennung) hört die GANZE Schlagzeugspur ab: wie sicher klingt
+    alle 0,25 s eine Hi-Hat? Rückgabe (t, wert) oder None, wenn das Modell hier nicht verfügbar ist."""
+    import subprocess
+    app = os.path.dirname(HIER)
+    helfer, out = os.path.join(ziel, "_hh_hoer.py"), os.path.join(ziel, "_hh_hoer.npz")
+    os.makedirs(ziel, exist_ok=True)
+    with open(helfer, "w") as f:
+        f.write(HH_HOER_HELFER)
+    try:
+        for py in (DETECT_PYTHON, sys.executable):
+            if not os.path.exists(py):
+                continue
+            r = subprocess.run([py, helfer, app, eingabe, out], capture_output=True, text=True, timeout=900)
+            if r.returncode == 0 and os.path.exists(out):
+                z = np.load(out)
+                return z["t"], z["hihat"]
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        for f in (helfer, out):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    return None
+
+
+def hihat_ergaenzen(eingabe, teile_dir, hits, bericht, ziel):
+    """14. Nov 2026: Hi-Hat-Schläge, die die Trennung (Hi-Hat-Teilspur) verloren hat, aus der GANZEN Schlagzeugspur
+    ergänzen – für jede Schlagzeugspur gleich. Ein fehlender Schlag wird nur gespielt, wenn
+      1. die ganze Spur dort in den Höhen einen Anschlag hat, den Snare/Becken/Kick/Toms nicht erklären,
+      2. er klingt wie die Hi-Hat dieses Songs (Höhen gegen Mitten, schnelles Abklingen wie die echten HH-Schläge),
+      3. er ins Muster passt (ein Takt davor/danach liegt dort auch ein HH-Schlag) ODER das Hör-Modell an dieser
+         Stelle deutlich eine Hi-Hat hört.
+    Lautstärke wie die Hi-Hat-Schläge daneben (gemessen an der ganzen Spur)."""
+    import librosa
+    from scipy.signal import butter, sosfiltfilt
+    from scipy.ndimage import uniform_filter1d
+    if len(hits) < 8:
+        return hits
+    melde("… höre die ganze Schlagzeugspur nach fehlenden Hi-Hat-Schlägen ab (Hör-Modell)")
+    voll = d.lade(eingabe)
+    hp = butter(4, 7000, "high", fs=SR, output="sos")
+    M = sosfiltfilt(hp, voll.mean(1))
+    mid = sosfiltfilt(butter(4, [1000, 5000], "band", fs=SR, output="sos"), voll.mean(1))
+    O = [sosfiltfilt(hp, d.lade(os.path.join(teile_dir, f"{t}.flac")).mean(1)) for t in ("snare", "becken", "kick", "toms")]
+    w = int(0.03 * SR)
+
+    def P(q, a, x0=0.0, x1=0.03):
+        z = q[a + int(x0 * SR):a + int(x1 * SR)]
+        return float(np.mean(z ** 2)) + 1e-14 if len(z) else 1e-14
+
+    def rest(a):
+        return 10 * np.log10(max(P(M, a) - sum(P(q, a) for q in O), 1e-14))
+
+    def merk(a):
+        return (10 * np.log10(P(M, a, 0, .04) / P(mid, a, 0, .04)), 10 * np.log10(P(M, a, 0, .04) / P(M, a, .08, .14)))
+    ht = np.array(sorted(h.get("einsatz", h["start"]) for h in hits))
+    F = np.array([merk(int(a)) for a in ht if a + int(0.14 * SR) < len(M)])
+    r_min, a_min = np.nanpercentile(F[:, 0], 20), np.nanpercentile(F[:, 1], 20)
+    R = np.array([rest(int(a)) for a in ht])
+    ref_r = float(np.median(R))
+    pg = np.array([h["pegel"] for h in hits])
+    tempo, _ = librosa.beat.beat_track(y=voll.mean(1).astype(np.float32), sr=SR, hop_length=512)
+    takt = int(4 * 60 / max(float(np.atleast_1d(tempo)[0]), 40) * SR)
+    hoer = hh_hoeren(eingabe, ziel)
+    if hoer is not None:
+        ht_t, hv = hoer[0], uniform_filter1d(hoer[1], 9)
+        hoer_grenze = max(0.10, float(np.percentile(hv, 75)))
+    env = librosa.onset.onset_strength(y=M.astype(np.float32), sr=SR, hop_length=256)
+    on = librosa.onset.onset_detect(onset_envelope=env, sr=SR, hop_length=256, units="samples", backtrack=True,
+                                    delta=0.07)
+    neu, wegen = [], {"muster": 0, "hoer_modell": 0}
+    for a in on:
+        a = int(a)
+        if a + int(0.14 * SR) >= len(M) or np.min(np.abs(ht - a)) < 0.03 * SR:
+            continue
+        r_ = rest(a)
+        if r_ < ref_r - 10 or r_ < 10 * np.log10(sum(P(q, a) for q in O)):
+            continue
+        hm, ab = merk(a)
+        gehoert = hoer is not None and float(np.interp(a / SR, ht_t, hv)) >= hoer_grenze
+        # hört das Hör-Modell hier eine Hi-Hat, darf der Klang etwas weiter weg liegen (z. B. leiser gespielte Hi-Hat)
+        streng = ab >= a_min and hm >= r_min
+        locker = ab >= a_min - 6 and hm >= r_min - 7
+        muster = streng and any(np.min(np.abs(ht - (a + k * takt))) < 0.03 * SR for k in (-2, -1, 1, 2))
+        if not (muster or (gehoert and locker)):
+            if os.environ.get("HH_DEBUG") and a / SR < 10:
+                melde(f"  HH-Debug {a / SR:.2f} rest {r_:.1f}/{ref_r:.1f} klang {hm:.1f}/{r_min:.1f} ab {ab:.1f}/{a_min:.1f} hoer {gehoert}")
+            continue
+        p_ = float(np.clip(np.median(pg) + (r_ - ref_r), pg.min(), np.percentile(pg, 90)))
+        neu.append({"start": a, "einsatz": a, "spitze": a, "pegel": p_, "art": "hh_zu", "ergaenzt": True,
+                    "ausklang": 0.1, "_grund": "muster" if muster else "hoer_modell"})
+    # nur vom Hör-Modell bestätigte Schläge zusätzlich nur, wenn sie in einer gleichmäßigen Reihe stehen
+    # (mind. 4 Schläge im gleichen Abstand, wie eine gespielte Hi-Hat) – einzelne Höhen-Reste bleiben draußen
+    alle = np.array(sorted(list(ht) + [h["start"] for h in neu]))
+
+    def in_reihe(a):
+        i = int(np.searchsorted(alle, a))
+        for lo in range(max(0, i - 3), i + 1):
+            seg = alle[lo:lo + 4]
+            if len(seg) == 4 and seg[0] <= a <= seg[-1]:
+                dd = np.diff(seg)
+                if dd.min() > 0.07 * SR and dd.max() < 1.2 * dd.min() + 0.01 * SR:
+                    return True
+        return False
+    neu = [h for h in neu if h["_grund"] == "muster" or in_reihe(h["start"])]
+    for h in neu:
+        wegen[h.pop("_grund")] += 1
+    bericht["hihat_ergaenzt"] = {"schlaege": len(neu), "grund": wegen, "hoer_modell": hoer is not None,
+                                 "zeiten": [round(h["start"] / SR, 2) for h in neu][:60]}
+    if neu:
+        melde(f"✔ {len(neu)} Hi-Hat-Schläge ergänzt, die beim Trennen verloren gingen")
+    return sorted(hits + neu, key=lambda h: h["start"])
+
+
 def hihat_lautstaerke(eingabe, teile_dir, x, hits, hh_ref, bericht):
     """Trennverlust ausgleichen (echte HH-Höhen = Gesamtspur minus alle anderen Teile) und
     gleichmäßige Grundlautstärke wie an der Bezugsstelle; wirklich leise Schläge bleiben leise,
@@ -863,6 +1007,8 @@ def main():
     ap.add_argument("ziel")
     ap.add_argument("--hh-ref", default=None)
     ap.add_argument("--fremd-trommel", action="store_true")
+    ap.add_argument("--vergleich", action="store_true",
+                    help="Original-Teilspuren (MP3) + vergleich.html zum Gegenhören mit ablegen (kostet Abholzeit)")
     ap.add_argument("--teile-ordner", default=None)
     ap.add_argument("--weg-json", default=None)
     ap.add_argument("--nur", choices=list(TEILE), default=None,
@@ -888,7 +1034,8 @@ def main():
             melde("… suche gestimmte Fremd-Trommel")
             weg, info_fremd = fremd_trommel_finden(teile_dir)
         hh_ref = tuple(float(v) for v in a.hh_ref.split(",")) if a.hh_ref else None
-        out, bericht = neu_spielen(a.eingabe, teile_dir, a.ziel, hh_ref, weg, a.nur, a.rimshot_note, a.midi_bpm, a.timing_korrigieren)
+        out, bericht = neu_spielen(a.eingabe, teile_dir, a.ziel, hh_ref, weg, a.nur, a.rimshot_note, a.midi_bpm, a.timing_korrigieren,
+                                   vergleich=a.vergleich)
         if info_fremd:
             bericht["fremd_trommel"] = info_fremd
         print(json.dumps({"ok": True, "datei": out, "ordner": a.ziel,
