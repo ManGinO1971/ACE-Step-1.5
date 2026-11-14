@@ -448,6 +448,23 @@ def gleichmaessig(y, ref, zeiten, faktor):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -528,6 +545,7 @@ def main():
             aktiv = np.abs(m) > np.abs(m).max() * 0.01
             g = rms(m[aktiv]) / rms(y.mean(1)[aktiv[:len(y)]]) if aktiv.any() else 1.0
             y *= g * 10 ** (a.lautstaerke_db / 20)
+        y = _hoer_tor(y, m, "piano")
         spitze = float(np.abs(y).max())
         if spitze > 0.98:
             y *= 0.98 / spitze
@@ -562,7 +580,7 @@ def main():
             zeilen += akkord_liste(noten, len(m) / SR)
         with open(os.path.join(a.ziel, "piano_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(zeilen) + "\n")
-        bericht = {"verfahren": verfahren, "noten": len(noten), "anschlaege_ausgerichtet": feinzeit, "pedal": len(pedal), "klang": klang,
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "verfahren": verfahren, "noten": len(noten), "anschlaege_ausgerichtet": feinzeit, "pedal": len(pedal), "klang": klang,
                    "programm": a.klang, "timing": timing, "skank": skank, "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
         import shutil

@@ -322,6 +322,23 @@ def midi_schreiben(rollen, ziel, bpm=120.0):
     return p
 
 
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe", help="Bläser-Spur (getrennt)")
@@ -469,6 +486,8 @@ def main():
         if np.abs(mix).max() * fak > 0.98:
             fak = 0.98 / np.abs(mix).max()
         mix *= fak
+        mix = _hoer_tor(mix, yr, "blaeser")
+        einzel = {k_: _hoer_tor(v_, yr, "blaeser") for k_, v_ in einzel.items()}
         out = os.path.join(a.ziel, "blaeser_neu.wav")
         sf.write(out, mix, SR, subtype="PCM_24")
         # jedes Instrument in seiner eigenen Spur (direkt so gespielt, nicht nachträglich getrennt)
@@ -495,7 +514,7 @@ def main():
                        + ("voller Song" if v < 0 else "Bläser-Spur"))
         with open(os.path.join(a.ziel, "blaeser_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(txt) + "\n")
-        bericht = {"art": "repariert", "trennung": modell, "klang": KLAENGE[klang], "toene": len(V),
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "art": "repariert", "trennung": modell, "klang": KLAENGE[klang], "toene": len(V),
                    "ergaenzt": ergaenzt, "korrigiert": int(korr), "mit_kurve": n_kurve,
                    "sekunden": round(blaeser_s, 1), "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)

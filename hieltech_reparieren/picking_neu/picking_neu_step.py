@@ -444,6 +444,23 @@ def midi_schreiben(noten, bank, prog, ziel, bpm=120.0):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -550,6 +567,7 @@ def main():
         bezug = st["guitar"] if "guitar" in st and st["guitar"].any() else st["bass"]
         y *= akt(bezug) / max(akt(y[:, 1]), 1e-12) * 10 ** ((-8 if bezug is not st["bass"] else -6) / 20) \
             * 10 ** (a.lautstaerke_db / 20)
+        y = _hoer_tor(y, bezug, "gitarre")
         if np.abs(y).max() > 0.98:
             y *= 0.98 / np.abs(y).max()
         out = os.path.join(a.ziel, "picking_neu.wav")
@@ -607,7 +625,7 @@ def main():
             zeilen.append(f"{int(tt // 60)}:{tt % 60:06.3f}  {K.NAMEN[p % 12]}{p // 12 - 1}")
         with open(os.path.join(a.ziel, "picking_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(zeilen) + "\n")
-        bericht = {"trennung": modell, "klang": KLAENGE[klang], "effekt": EFFEKTE[eff], "timing": a.timing,
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "trennung": modell, "klang": KLAENGE[klang], "effekt": EFFEKTE[eff], "timing": a.timing,
                    "toene": len(noten), "art": art, "modus": a.modus, "erkennung": erk, **info, "tonart": f"{K.NAMEN[ton[0]]}-{ton[1]}", "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
         import shutil

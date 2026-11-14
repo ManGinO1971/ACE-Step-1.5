@@ -815,56 +815,18 @@ def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120
     return {"datei": datei, "tempo_bpm": tempo, "tempo_geschaetzt": geschaetzt, "noten": len(noten)}
 
 
-HH_HOER_HELFER = r'''
-import sys, os, io, contextlib, numpy as np
-sys.path.insert(0, sys.argv[1])
-import detect_instruments_eat as d
-import librosa, torch
-with contextlib.redirect_stdout(io.StringIO()):
-    m, mel = d.modell()
-dev = next(m.parameters()).device
-lab = d.ek.labels(d.EAT_DIR)
-i = lab.index("Hi-hat")
-y, _ = librosa.load(sys.argv[2], sr=32000, mono=True)
-W, h = 32000, 8000
-st = np.arange(0, max(1, len(y) - W + 1), h)
-P = []
-for k in range(0, len(st), 32):
-    x = torch.from_numpy(np.stack([np.pad(y[s:s + W], (0, max(0, W - len(y[s:s + W])))) for s in st[k:k + 32]])).float().to(dev)
-    with torch.no_grad():
-        p, _ = m(mel(x).unsqueeze(1))
-    P.append(torch.sigmoid(p.float()).cpu().numpy()[:, i])
-np.savez(sys.argv[3], t=st / 32000 + 0.5, hihat=np.concatenate(P))
-'''
-DETECT_PYTHON = os.path.expanduser("~/miniforge3/envs/heltech_stems_detect/bin/python")
-
-
 def hh_hoeren(eingabe, ziel):
     """Hör-Modell (EfficientAT, wie die Instrumenten-Erkennung) hört die GANZE Schlagzeugspur ab: wie sicher klingt
-    alle 0,25 s eine Hi-Hat? Rückgabe (t, wert) oder None, wenn das Modell hier nicht verfügbar ist."""
-    import subprocess
-    app = os.path.dirname(HIER)
-    helfer, out = os.path.join(ziel, "_hh_hoer.py"), os.path.join(ziel, "_hh_hoer.npz")
-    os.makedirs(ziel, exist_ok=True)
-    with open(helfer, "w") as f:
-        f.write(HH_HOER_HELFER)
+    alle 0,5 s eine Hi-Hat? Gemeinsames Hör-Modul aller Reparaturen (hoer_tor.py) – jede Spur wird pro Song nur einmal
+    abgehört. Rückgabe (t, wert) oder None, wenn das Modell hier nicht verfügbar ist."""
     try:
-        for py in (DETECT_PYTHON, sys.executable):
-            if not os.path.exists(py):
-                continue
-            r = subprocess.run([py, helfer, app, eingabe, out], capture_output=True, text=True, timeout=900)
-            if r.returncode == 0 and os.path.exists(out):
-                z = np.load(out)
-                return z["t"], z["hihat"]
+        d_ = os.path.dirname(HIER)
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as ht
+        return ht.verlauf(d.lade(eingabe), SR, "hihat")
     except Exception:  # noqa: BLE001
-        pass
-    finally:
-        for f in (helfer, out):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-    return None
+        return None
 
 
 def hihat_ergaenzen(eingabe, teile_dir, hits, bericht, ziel):
@@ -907,7 +869,7 @@ def hihat_ergaenzen(eingabe, teile_dir, hits, bericht, ziel):
     takt = int(4 * 60 / max(float(np.atleast_1d(tempo)[0]), 40) * SR)
     hoer = hh_hoeren(eingabe, ziel)
     if hoer is not None:
-        ht_t, hv = hoer[0], uniform_filter1d(hoer[1], 9)
+        ht_t, hv = hoer[0], uniform_filter1d(hoer[1], 5)
         hoer_grenze = max(0.10, float(np.percentile(hv, 75)))
     env = librosa.onset.onset_strength(y=M.astype(np.float32), sr=SR, hop_length=256)
     on = librosa.onset.onset_detect(onset_envelope=env, sr=SR, hop_length=256, units="samples", backtrack=True,

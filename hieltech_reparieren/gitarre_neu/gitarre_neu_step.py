@@ -578,6 +578,23 @@ def plan_schreiben(beats, akk, phase, ton, ziel, bpm_song, bpm_midi, wahl):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -638,6 +655,7 @@ def main():
         rest = sum(v for s, v in st.items() if s != "guitar")
         if "vocals" in sp:
             rest = rest + lade_mono(sp["vocals"])[:n]
+        y = _hoer_tor(y, git, "gitarre")
         s_max = max(np.abs(y).max(), 1e-12)
         if s_max > 0.98:
             y *= 0.98 / s_max
@@ -648,7 +666,7 @@ def main():
         sf.write(os.path.join(a.ziel, "song_mit_neuer_gitarre.wav"), mix, SR, subtype="PCM_24")
         bpm_song = 60.0 / float(np.median(np.diff(beats)))
         plan_schreiben(beats, akk, phase, ton, a.ziel, bpm_song, a.midi_bpm, wahl)
-        bericht = {"trennung": modell, "tonart": f"{NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "trennung": modell, "tonart": f"{NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
                    "skank": info, "timing_am_schlagzeug": timing,
                    "griffe": {akkord_name(k_): s["name"] for k_, s in wahl.items()},
                    "akkorde": {akkord_name(x): sum(1 for i, _, _ in slots if akk[i] == x) for x in {akk[i] for i, _, _ in slots}}}

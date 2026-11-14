@@ -439,6 +439,23 @@ def midi_schreiben(noten, bank, programm, ziel, bpm=120.0):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -629,6 +646,7 @@ def main():
         tr = lambda x: np.array([np.sqrt(np.mean(x[q:q + kk] ** 2)) for q in fen])  # noqa: E731
         ist = np.median(tr(y.mean(1)))
         y *= np.percentile(tr(st["_orgel"]), 75) / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
+        y = _hoer_tor(y, st["_orgel"], "orgel")
         if np.abs(y).max() > 0.98:
             y *= 0.98 / np.abs(y).max()
         out = os.path.join(a.ziel, "orgel_neu.wav")
@@ -685,7 +703,7 @@ def main():
         melde(f"✔ Vergleich mit dem Original: {vergleich['treffer_prozent']:.0f} % der Original-Schläge getroffen, "
               f"mittlere Abweichung {vergleich['abweichung_ms']:.0f} ms")
         info["vergleich_mit_original"] = vergleich
-        bericht = {"trennung": modell, "orgel_quelle": quelle, "alte_orgel_bleibt": quelle == "piano", "klang": klang, "bank": bank, "programm": prog, "leslie": a.leslie,
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "trennung": modell, "orgel_quelle": quelle, "alte_orgel_bleibt": quelle == "piano", "klang": klang, "bank": bank, "programm": prog, "leslie": a.leslie,
                    "tonart": f"{K.NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
                    "orgel_einsatz_s": round(float(beats[erst]), 2), **info, "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)

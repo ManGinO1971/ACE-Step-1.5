@@ -428,6 +428,23 @@ def midi_schreiben(noten, ziel, bpm=120.0):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -473,6 +490,8 @@ def main():
         if a.klang_wie_original:
             melde("… gleiche Klang an das Original an")
             y, bericht["eq_korrektur_db"] = klang_angleichen(y, m)
+        y = _hoer_tor(y, m, "bass")
+        bericht["hoer_modell"] = _HOER.get("hoer_modell", {})
         spitze = float(np.abs(y).max())
         if spitze > 0.98:
             y *= 0.98 / spitze

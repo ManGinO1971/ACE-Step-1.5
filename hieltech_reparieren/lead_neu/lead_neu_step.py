@@ -333,6 +333,23 @@ def stereo(x):
     return x[:, :2]
 
 
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe")
@@ -407,7 +424,7 @@ def main():
         st *= np.sqrt(np.mean(git[maske] ** 2)) / (np.sqrt(np.mean(st.mean(1)[maske] ** 2)) + 1e-12)
         melde("… nehme die alte Lead-Gitarre aus der Gitarren-Spur (Skank bleibt)")
         ohne = lead_entfernen(git_st, f0, noten)
-        st = st[:L]
+        st = _hoer_tor(st[:L], git, "gitarre")
         if np.abs(st).max() > 0.98:
             st *= 0.98 / np.abs(st).max()
         out = os.path.join(a.ziel, "lead_neu.wav")
@@ -434,7 +451,7 @@ def main():
             txt.append(f"{int(t0 // 60)}:{t0 % 60:06.3f}  {d:5.2f}s  {K.NAMEN[p % 12]}{p // 12 - 1:<3}  {umf:4.1f} HT")
         with open(os.path.join(a.ziel, "lead_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(txt) + "\n")
-        bericht = {"art": "repariert", "trennung": modell, "klang": KLAENGE[klang], "effekt": EFFEKTE[eff],
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "art": "repariert", "trennung": modell, "klang": KLAENGE[klang], "effekt": EFFEKTE[eff],
                    "toene": len(noten), "phrasen": len(phrasen), "lead_sekunden": round(lead_s, 1), "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
         import shutil

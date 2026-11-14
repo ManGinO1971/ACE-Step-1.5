@@ -517,6 +517,23 @@ def neu_spielen(g, wahl, hits, perc, alle_t, L, ton, opt):
 
 
 # ------------------------------------------------------------ Ablauf
+_HOER = {}
+
+
+def _hoer_tor(y, ref, gruppe):
+    """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
+    zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
+    einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return y
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eingabe"); ap.add_argument("ziel")
@@ -602,6 +619,8 @@ def main():
         neu += y
         einzel.append((g, wahl[g], y))
         melde(f"{g}: {len(hits)} Schläge neu ({NAMEN.get(wahl[g], wahl[g])})")
+    neu = _hoer_tor(neu, perc, "percussion")
+    einzel = [(g_, w_, _hoer_tor(y_, perc, "percussion")) for g_, w_, y_ in einzel]
     fak = begrenz_faktor(neu)
     neu = neu * fak[:, None]
     sf.write(os.path.join(opt.ziel, "percussion_neu.wav"), neu, SR, subtype="PCM_24")
@@ -627,7 +646,7 @@ def main():
         sf.write(os.path.join(opt.ziel, "song_mit_percussion_neu.wav"), mix, SR, subtype="PCM_24")
         melde("Song mit neuer Percussion geschrieben")
     midi_und_liste([s for s in S if s["art"] in GRUPPEN], zu, opt, opt.ziel, opt.midi_bpm if opt.midi_bpm > 0 else 120.0)
-    bericht = dict(schlaege=len(S), arten=zaehl, stimmen=[librosa.midi_to_note(int(round(t))) for t in ton],
+    bericht = dict(hoer_modell=_HOER.get("hoer_modell", {}), schlaege=len(S), arten=zaehl, stimmen=[librosa.midi_to_note(int(round(t))) for t in ton],
                    wahl=wahl, stimmung=opt.stimmung, nur=opt.nur, mit_analyse=bool(klang_von))
     with open(os.path.join(opt.ziel, "bericht.json"), "w", encoding="utf-8") as f:
         json.dump(bericht, f, ensure_ascii=False, indent=1)
