@@ -4558,7 +4558,9 @@ def _hieltech_stems_erg_eintrag(song_pfad, auftrag, spur=""):
     try:
         from stems_trennen_gpu import schluessel as _schluessel
         erg = os.path.join(os.path.dirname(song_pfad), "erg")
-        key = f"s53_{spur}" if auftrag.get("art") == "s53" and spur else _schluessel(auftrag)
+        f53 = int(auftrag.get("fassung", 1) or 1)          # 14. Nov 2026: 53er Fassung 2 hat eigene Einträge
+        key = ((f"s53_{spur}" if f53 < 2 else f"s53v{f53}_{spur}") if auftrag.get("art") == "s53" and spur
+               else _schluessel(auftrag))
         d = os.path.join(erg, key)
         with open(os.path.join(d, "fertig.json"), encoding="utf-8") as f:
             info = json.load(f)

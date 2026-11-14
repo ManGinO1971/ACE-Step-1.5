@@ -9,6 +9,7 @@ BSRoformer aus ZFTurbo/Music-Source-Separation-Training (fester Stand) + eigene 
 (20-s-Stücke, halbe Überlappung, weiche Ränder) wie dort.
 
 Aufruf: python stems53_ref_step.py <song> <ausgabe.wav> <instrument> [<instrument2> <ausgabe2.wav> ...]
+        [--sechs <ordner mit drums/bass/guitar/piano/vocals/other>]   (14. Nov 2026: Fassung 2, s53_saeubern.py)
         (mehrere Paare: Song wird nur einmal geladen)
 Letzte stdout-Zeile: JSON-Bericht.
 """
@@ -114,10 +115,37 @@ def trennen(m, chunk, mix, dev):
     return (out / np.maximum(w, 1e-6))[:, pad_l:pad_l + n]
 
 
+def sechs_laden(ordner, n):
+    """6-Spuren-Trennung des Songs (für Stufe 2) als {name: (2, n)} – fehlende Spuren werden ausgelassen."""
+    import glob
+    out = {}
+    for name in ("drums", "bass", "guitar", "piano", "vocals", "other"):
+        f = sorted(glob.glob(os.path.join(ordner, f"{name}.*")))
+        if not f:
+            continue
+        a, sr = sf.read(f[0], dtype="float32", always_2d=True)
+        if sr != SR:
+            import librosa
+            a = np.stack([librosa.resample(a[:, c], orig_sr=sr, target_sr=SR) for c in range(a.shape[1])], 1)
+        if a.shape[1] == 1:
+            a = np.repeat(a, 2, 1)
+        y = np.zeros((2, n), np.float32)
+        k = min(n, len(a))
+        y[:, :k] = a[:k, :2].T
+        out[name] = y
+    return out
+
+
 def main():
     import torch
-    song = sys.argv[1]
-    paare = list(zip(sys.argv[3::2], sys.argv[2::2]))  # (instrument, ausgabe)
+    argv = list(sys.argv)
+    sechs_dir = None
+    if "--sechs" in argv:
+        k = argv.index("--sechs")
+        sechs_dir = argv[k + 1]
+        del argv[k:k + 2]
+    song = argv[1]
+    paare = list(zip(argv[3::2], argv[2::2]))  # (instrument, ausgabe)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     tmp = song + ".44k.wav"
     r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", song, "-ac", "2", "-ar", str(SR), "-c:a", "pcm_f32le", tmp],
@@ -127,15 +155,43 @@ def main():
     a, _ = sf.read(tmp, dtype="float32", always_2d=True)
     os.remove(tmp)
     mix = np.ascontiguousarray(a.T)
-    bericht = {"ok": True, "geraet": dev, "instrumente": {}}
+    bericht = {"ok": True, "geraet": dev, "instrumente": {}, "fassung": 2 if sechs_dir else 1}
+    sechs, eltern_cache = {}, {}
+    if sechs_dir:
+        try:
+            import s53_saeubern as S2
+            sechs = sechs_laden(sechs_dir, mix.shape[1])
+        except Exception as e:  # noqa: BLE001
+            bericht["sechs_fehler"] = str(e)[:200]
     for inst, ziel in paare:
         t0 = time.time()
         try:
             m, chunk = modell(inst, dev)
             y = trennen(m, chunk, mix, dev)
+            info = {}
+            if sechs:
+                eltern = [e for e in S2.ELTERN.get(inst, ()) if e in sechs]
+                if eltern:
+                    kz = tuple(eltern)
+                    if kz not in eltern_cache:                  # Eltern-Spur + ihr Spektrum nur einmal je Kombination
+                        P_ = np.ascontiguousarray(sum(sechs[e] for e in eltern))
+                        eltern_cache.clear()
+                        eltern_cache[kz] = (P_, S2._stft(P_))
+                    P, SP = eltern_cache[kz]
+                    try:
+                        B = trennen(m, chunk, np.ascontiguousarray(P), dev)
+                        y, info["stufe2"] = S2.verbessern(inst, y, B, P, SR, SP)
+                        info["stufe2"]["eltern"] = eltern
+                    except Exception as e:  # noqa: BLE001 – nie schlechter als Fassung 1
+                        info["stufe2"] = {"fehler": str(e)[:200]}
+                try:
+                    y, info["saeubern"] = S2.saeubern(inst, y, SR)
+                except Exception as e:  # noqa: BLE001
+                    info["saeubern"] = {"fehler": str(e)[:200]}
             sf.write(ziel, y.T, SR, subtype="FLOAT")
             bericht["instrumente"][inst] = {"ok": True, "sekunden": round(time.time() - t0, 1),
-                                            "pegel_db": round(float(20 * np.log10(np.sqrt((y ** 2).mean()) + 1e-12)), 1)}
+                                            "pegel_db": round(float(20 * np.log10(np.sqrt((y ** 2).mean()) + 1e-12)), 1),
+                                            **info}
             del m
             if dev == "cuda":
                 torch.cuda.empty_cache()

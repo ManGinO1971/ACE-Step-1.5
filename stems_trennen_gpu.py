@@ -212,6 +212,10 @@ def rechnen(song, aus, auftrag, cache=None):
         args = [sys.executable, os.path.join(HERE, "stems53_ref_step.py"), song]
         for i in namen:
             args += [os.path.join(aus, f"{i}.wav"), i]
+        if int(auftrag.get("fassung", 1) or 1) >= 2:
+            sd = sechs_spuren(song, aus, cache)              # Stufe 1: 6 Spuren (aus dem Speicher, sonst ~10 s)
+            if sd:
+                args += ["--sechs", sd]
         r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
         for i in namen:
             p = os.path.join(aus, f"{i}.wav")
@@ -286,22 +290,52 @@ def rechnen(song, aus, auftrag, cache=None):
     return spuren, extra
 
 
+def sechs_spuren(song, aus, cache):
+    """14. Nov 2026: 6-Spuren-Trennung des Songs als Ordner für die 53er-Stufe 2. Bevorzugt BS-Roformer-SW (beste
+    Qualität), sonst htdemucs_6s – beides aus dem Ergebnis-Speicher, wenn schon da (die Erkennung legt htdemucs_6s
+    ab); sonst einmal htdemucs_6s rechnen (~10 s auf der GPU) und ablegen."""
+    d = os.path.join(aus, "_sechs53")
+    try:
+        for a in ({"art": "sep", "modell": "BS-Roformer-SW.ckpt"}, {"art": "demucs", "modell": "htdemucs_6s"}):
+            da = aus_speicher(cache, schluessel(a))
+            if da and len([n for n in da[0] if n in ("drums", "bass", "guitar", "piano", "vocals", "other")]) >= 5:
+                os.makedirs(d, exist_ok=True)
+                for n, p in da[0].items():
+                    if n in ("drums", "bass", "guitar", "piano", "vocals", "other"):
+                        shutil.copy(p, os.path.join(d, n + os.path.splitext(p)[1]))
+                return d
+        a = {"art": "demucs", "modell": "htdemucs_6s"}
+        sp, _ = rechnen(song, os.path.join(aus, "_sechs_neu"), a)
+        sp = in_speicher(cache, schluessel(a), sp, {}) if cache else sp
+        os.makedirs(d, exist_ok=True)
+        for n, p in sp.items():
+            if n in ("drums", "bass", "guitar", "piano", "vocals", "other"):
+                shutil.copy(p, os.path.join(d, n + os.path.splitext(p)[1]))
+        return d
+    except Exception as e:  # noqa: BLE001 – ohne Stufe 2 weiter (wie bisher)
+        print(f"… 6 Spuren für Stufe 2 nicht verfügbar ({str(e)[:120]})", flush=True)
+        return None
+
+
 def s53_mit_speicher(song, aus, auftrag, cache):
-    """53er-Modell: je Instrument ein eigener Speicher-Eintrag – nur fehlende Instrumente werden gerechnet."""
+    """53er-Modell: je Instrument ein eigener Speicher-Eintrag – nur fehlende Instrumente werden gerechnet.
+    Fassung 2 (sauberer, 14. Nov 2026) hat eigene Einträge (s53v2_…), die alten bleiben unberührt."""
     namen = [i for i in auftrag.get("instrumente") or [] if re.match(r"^[a-z_-]{2,20}$", i)][:53]
     if not namen:
         raise ValueError("keine Instrumente")
+    fassung = int(auftrag.get("fassung", 1) or 1)
+    vor = "s53_" if fassung < 2 else f"s53v{fassung}_"
     spuren, fehlt = {}, []
     for i in namen:
-        da = aus_speicher(cache, f"s53_{i}")
+        da = aus_speicher(cache, f"{vor}{i}")
         if da:
             spuren.update(da[0])
         else:
             fehlt.append(i)
     if fehlt:
-        neu, _ = rechnen(song, aus, {"art": "s53", "instrumente": fehlt})
+        neu, _ = rechnen(song, aus, {"art": "s53", "instrumente": fehlt, "fassung": fassung}, cache)
         for i, p in neu.items():
-            spuren.update(in_speicher(cache, f"s53_{i}", {i: p}, {}))
+            spuren.update(in_speicher(cache, f"{vor}{i}", {i: p}, {}))
     return spuren, {"aus_speicher": [i for i in namen if i not in fehlt]}
 
 
@@ -327,7 +361,7 @@ def main():
         else:
             spuren, extra = rechnen(song, aus, auftrag, cache)
             spuren = in_speicher(cache, key, spuren, extra)
-    for d in ("_roh1", "_roh2", "_demucs"):
+    for d in ("_roh1", "_roh2", "_demucs", "_sechs53", "_sechs_neu"):
         shutil.rmtree(os.path.join(aus, d), ignore_errors=True)
     print(json.dumps({"ok": True, "spuren": spuren, "extra": extra, "sekunden": round(time.time() - t0, 1), "geraet": geraet()},
                      ensure_ascii=False), flush=True)

@@ -77,7 +77,8 @@ np.savez(sys.argv[3], **out)
 
 def _app_ordner():
     """Ordner mit detect_instruments_eat.py + hoermodell/ (Mac: ~/HELTECH_Stems, GPU: hieltech_reparieren)."""
-    for d in (HIER, os.path.dirname(HIER), os.path.expanduser("~/HELTECH_Stems")):
+    for d in (HIER, os.path.dirname(HIER), os.path.join(os.path.dirname(HIER), "hieltech_erkennung"),
+              os.path.expanduser("~/HELTECH_Stems")):
         if os.path.isfile(os.path.join(d, "detect_instruments_eat.py")):
             return d
     return None
