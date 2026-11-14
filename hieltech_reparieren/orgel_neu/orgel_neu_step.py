@@ -257,6 +257,61 @@ def _schlag_db(x, T, w0=-0.02, w1=0.06):
     return np.array(out)
 
 
+def original_anschlaege(org):
+    """Anschläge einer Orgel-Spur – nur hörbare (höchstens 30 dB unter den lautesten), kein Übersprech-Rest."""
+    lb = K.librosa()
+    h = K.hochpass(np.asarray(org, np.float32), 150)
+    on = np.asarray(lb.onset.onset_detect(y=h, sr=SR, hop_length=128, units="time", backtrack=True, delta=0.05))
+    if not len(on):
+        return on
+    pg = np.array([10 * np.log10(np.mean(h[int(t * SR):int(t * SR) + int(0.1 * SR)] ** 2) + 1e-12) for t in on])
+    return on[pg >= np.percentile(pg, 95) - 30]
+
+
+def takte_der_orgel(org, beats, phase, on, Z):
+    """Je Schlag: spielt die Orgel (aktiv) und hält sie dort nur Akkorde (gehalten)? – je Takt entschieden."""
+    nb = len(beats) - 1
+    takte = ([(0, phase)] if phase else []) + [(t0, min(t0 + 4, nb)) for t0 in range(phase, nb, 4)]
+    tf, of = Z["fein_t"], Z["fein"]
+    aktiv, gehalten = np.zeros(nb, bool), np.zeros(nb, bool)
+    for a_, b_ in takte:
+        if b_ <= a_:
+            continue
+        t0, t1 = beats[a_], beats[b_]
+        klang = of[(tf >= t0) & (tf < t1)]
+        hoerbar = bool(len(klang)) and float(np.mean(klang >= 0.2)) >= 0.5
+        n_on = int(((on >= t0) & (on < t1)).sum())
+        if hoerbar or n_on >= 2:
+            aktiv[a_:b_] = True
+            if hoerbar and n_on < 2:
+                gehalten[a_:b_] = True
+    return aktiv, gehalten
+
+
+def dem_original_folgen(stellen, T, on, beats, aktiv, akk):
+    """Schläge wie im Original: geplante ohne Original-Anschlag fallen weg, fehlende kommen dazu."""
+    T = np.asarray(T, float)
+    neu_s, neu_T, weg = [], [], 0
+    for (i, nm, b), t in zip(stellen, T):
+        if len(on) and np.min(np.abs(on - t)) <= 0.06:
+            neu_s.append((i, nm, b)); neu_T.append(t)
+        else:
+            weg += 1
+    dazu = 0
+    nb = len(beats) - 1
+    for o in on:
+        i = int(np.clip(np.searchsorted(beats, o, side="right") - 1, 0, nb - 1))
+        if not aktiv[i] or akk[i] is None:
+            continue
+        if neu_T and np.min(np.abs(np.asarray(neu_T) - o)) <= 0.04:
+            continue
+        lage = (o - beats[i]) / max(beats[i + 1] - beats[i], 1e-6)
+        nm = min(POS, key=lambda k: abs(POS[k] - lage))
+        neu_s.append((i, nm, float(o))); neu_T.append(float(o)); dazu += 1
+    ordnung = np.argsort(neu_T)
+    return [neu_s[k] for k in ordnung], np.asarray(neu_T)[ordnung], {"weg": weg, "dazu": dazu}
+
+
 def bubble_dynamik(org, stellen, T):
     """Wie laut spielt das Original den ersten (e), mittleren (&) und dritten (a) Schlag? dB relativ zur Mitte.
     Im Reggae-Bubble ist die Mitte (mit dem Skank) am lautesten, der erste etwas leiser, der dritte am leisesten –
@@ -458,11 +513,24 @@ def main():
             if quelle == "piano":
                 melde("✔ Orgel liegt in der Piano-Spur – Piano bleibt im Song, die alte Orgel ist leise darunter "
                       "zu hören (sauberer: Orgel vorher bei den 53 Instrumenten trennen)")
+        on_org = original_anschlaege(st["_orgel"])
+        gehalten = np.zeros(len(aktiv), bool)
+        if quelle == "orgel53":                       # reine Orgel-Spur: Takt für Takt, ohne Glätten
+            aktiv, gehalten = takte_der_orgel(st["_orgel"], beats, phase, on_org, Z)
+            if aktiv.any():
+                erst = int(np.argmax(aktiv))
         abschnitte = [(beats[i], beats[min(j, len(beats) - 1)]) for i, j, v in laeufe(aktiv) if v]
         melde(f"✔ Orgel setzt bei {beats[erst]:.1f} s ein, spielt in {len(abschnitte)} Abschnitt(en): "
               + ", ".join(f"{a_:.0f}–{b_:.0f} s" for a_, b_ in abschnitte[:6]))
         melde("… Bubble planen (Mitte genau auf dem Skank, erster und dritter Schlag wie im Original)")
-        stellen, T, D, info = bubble_plan(st, beats, akk, phase, erst, swing=not a.ohne_swing, aktiv=aktiv)
+        stellen, T, D, info = bubble_plan(st, beats, akk, phase, erst, swing=not a.ohne_swing,
+                                          aktiv=aktiv & ~gehalten)
+        if quelle == "orgel53" and len(on_org):
+            stellen, T, folgen = dem_original_folgen(stellen, T, on_org, beats, aktiv & ~gehalten, akk)
+            info["wie_original"] = folgen
+            melde(f"✔ Schläge wie im Original: {folgen['weg']} geplante ohne Original-Schlag weggelassen, "
+                  f"{folgen['dazu']} Original-Schläge dazu")
+        info["gehaltene_takte"] = int(gehalten.sum() // 4)
         info["abschnitte_s"] = [[round(float(a_), 2), round(float(b_), 2)] for a_, b_ in abschnitte]
         if a.noten_json:
             noten = [tuple(x) for x in json.load(open(a.noten_json))]
@@ -475,16 +543,47 @@ def main():
                 melde(f"… Töne nicht erkennbar ({str(e)[:80]}), nehme Standard-Griffe")
                 noten = []
         G = griffe(stellen, T, akk, noten)
+        for i_ in np.where(gehalten)[0]:                 # gehaltene Akkorde brauchen auch einen Griff
+            if akk[i_] is not None and (akk[i_], "R") not in G:
+                G.update(griffe([(int(i_), "&", 0.0)], np.array([beats[i_]]), akk, noten))
         P_ = float(np.median(np.diff(beats)))
         dyn = bubble_dynamik(st["_orgel"], stellen, T)
         info["dynamik_original_db"] = dyn
         VEL = {nm: int(round(104 * 10 ** (dyn[nm] / 40.0))) for nm in POS}   # Anschlag ~ 40·log10(v) dB
         melde(f"✔ Dynamik der drei Schläge: erster {dyn['e']:+.1f} dB, Mitte 0 dB, dritter {dyn['a']:+.1f} dB")
+        # Lautstärke-Verlauf wie im Original: spielt die Original-Orgel eine Stelle leiser (z. B. ein ruhiger Teil),
+        # spielt die neue dort auch leiser – je Schlag, relativ zur typischen Lautstärke der Orgel (−12 … +3 dB)
+        rel = np.zeros(len(T))
+        if quelle == "orgel53" and len(T) > 20:
+            Lh = _schlag_db(st["_orgel"], T, -0.02, 0.08)
+            pos_ = np.array([x[1] for x in stellen])
+            for nm_ in POS:                          # je Schlag-Art getrennt (die Abstufung e/&/a bleibt erhalten)
+                m_ = pos_ == nm_
+                if m_.sum() > 5:
+                    rel[m_] = np.clip(Lh[m_] - np.median(Lh[m_]), -12.0, 3.0)
+            info["lautstaerke_wie_original"] = True
         neu = []
-        for (i, nm, _), t in zip(stellen, T):
+        for q_, ((i, nm, _), t) in enumerate(zip(stellen, T)):
             d, v, g = (0.30 * P_, VEL["&"], G[(akk[i], "R")]) if nm == "&" else (0.17 * P_, VEL[nm], G[(akk[i], "L")])
+            v = int(np.clip(round(v * 10 ** (rel[q_] / 40.0)), 20, 127))
             for p in g:
                 neu.append((float(t), float(t) + d, p, v))
+        # gehaltene Akkorde: je Takt (bzw. Akkordwechsel) ein langer Griff, ruhige Stärke
+        q = 0
+        idx = np.where(gehalten)[0]
+        while q < len(idx):
+            i0 = idx[q]; j_ = q
+            while j_ + 1 < len(idx) and idx[j_ + 1] == idx[j_] + 1 and akk[idx[j_ + 1]] == akk[i0]:
+                j_ += 1
+            if akk[i0] is not None:
+                t0_ = float(beats[i0]); t1_ = float(beats[min(idx[j_] + 1, len(beats) - 1)])
+                if len(on_org):
+                    k_ = np.where((on_org >= t0_ - 0.05) & (on_org < t1_))[0]
+                    if len(k_):
+                        t0_ = float(on_org[k_[0]])
+                for p in G.get((akk[i0], "R"), []):
+                    neu.append((t0_, t1_ - 0.03, p, int(VEL["&"] * 0.85)))
+            q = j_ + 1
         extra = []
         if not a.ohne_zusatztoene and noten:
             tf, of = Z["fein_t"], Z["fein"]
@@ -508,6 +607,21 @@ def main():
             L = min(len(y), len(y2))
             y = y[:L] + y2[:L]
         y = leslie(y, a.leslie)
+        if quelle == "orgel53" and len(on_org):
+            on_y = original_anschlaege(y.mean(1))
+            if len(on_y) > 20:
+                dd = np.array([on_y[np.argmin(np.abs(on_y - t))] - t for t in on_org])
+                dd = dd[np.abs(dd) <= 0.04]
+                if len(dd) > 20:
+                    v_ = float(np.median(dd))
+                    if abs(v_) >= 0.002:                # neue Orgel früher/später als das Original -> ausgleichen
+                        sch = int(round(-v_ * SR))
+                        y = np.roll(y, sch, axis=0)
+                        if sch > 0:
+                            y[:sch] = 0
+                        else:
+                            y[sch:] = 0
+                        info["versatz_ausgeglichen_ms"] = round(-v_ * 1000, 1)
         # gleichmäßige Lautstärke wie die Original-Orgel (nur über die Orgel-Takte)
         kk = int(2.8 * SR)
         fen = [int(x * SR) for a_, b_ in abschnitte for x in np.arange(a_, b_ - 2.8, 2.8)] \
