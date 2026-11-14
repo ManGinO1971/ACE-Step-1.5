@@ -23,7 +23,110 @@ def _sample(p):
     if x.shape[1]==1: x=np.repeat(x,2,1)
     a=np.abs(x).max(1); st=max(0,int(np.argmax(a>a.max()*0.05))-88); x=x[st:]; a=np.abs(x).max(1)  # Stille vorn weg
     return {'x':x,'spitze':int(np.argmax(a)),'einsatz':int(np.argmax(a>a.max()*0.1)),'wert':float(np.abs(x.mean(1)).max()),'name':os.path.basename(p)}
+# 14. Nov 2026: Bibliothek je Element (viele Klänge, die App wählt je Song die passendsten). Hat Vorrang vor dem
+# festen Roots-Kit; die Favoriten des Inhabers stecken darin (bevorzugt, nicht erzwungen). HIELTECH_DRUM_KIT=alt|roots
+BIB_DIR=os.path.join(SAMPLES,'bibliothek')
+def _bib_laden():
+    if os.environ.get('HIELTECH_DRUM_KIT','').strip().lower() in ('alt','roots'): return None
+    p=os.path.join(BIB_DIR,'bibliothek.json')
+    if not os.path.isfile(p): return None
+    try:
+        with open(p,encoding='utf-8') as f: d=_json.load(f)['klaenge']
+    except (OSError,ValueError,KeyError): return None
+    d=[e for e in d if os.path.isfile(os.path.join(BIB_DIR,e['datei']))]
+    return d or None
+BIB=_bib_laden()
+if BIB: ROOTS=None
+POOL={'kick':['Kick'],'snare':['Snare','Snare_hoch','Snare_tief','Snare_Rand_Fell'],'rimshot':['Rimshot'],
+      'ghost':['Ghost','Snare','Snare_hoch'],'hh_zu':['HiHat_zu'],'hh_halb':['HiHat_halb_offen'],
+      'hh_offen':['HiHat_offen']}
+_BIB_CACHE={}
+def _bib_sample(e):
+    p=os.path.join(BIB_DIR,e['datei'])
+    if p not in _BIB_CACHE:
+        s=_sample(p); s['favorit']=bool(e.get('favorit')); s['element']=e['element']; s['name']=e['datei']; _BIB_CACHE[p]=s
+    return _BIB_CACHE[p]
+def bib_pfade(elemente):
+    return [os.path.join(BIB_DIR,e['datei']) for e in (BIB or []) if e['element'] in elemente]
+def lade_kit_bib():
+    kit={}
+    for art,els in POOL.items():
+        L=[_bib_sample(e) for e in BIB if e['element'] in els]
+        if L: kit[art]={'alle':L}
+    return kit
+def passend_bib(kit,arten,x,hits,k=3):
+    """Je Art und Stärke (leise/mittel/laut des Originals) die k Bibliotheks-Klänge, die den Original-Schlägen
+    dieser Stärke am ähnlichsten klingen (Favoriten 10 % bevorzugt). Kein Kürzen des Ausklangs."""
+    m=x.mean(1); ber={}
+    for art in arten:
+        if art not in kit or 'alle' not in kit[art]: continue
+        pool=kit[art]['alle']
+        for s in pool:
+            if 'fp' not in s: s['fp']=_fp(s['x'].mean(1))
+        hs=[h for h in hits if h.get('art',art)==art]
+        if not hs:
+            kit[art]={'mittel':pool[:k]}; continue
+        frei=einzelne(hs,len(m)) or hs
+        pg=[h['pegel'] for h in hs]
+        neu,b={},{}
+        for st in ('leise','mittel','laut'):
+            sel=[h for h in frei if stufe_von(h['pegel'],pg)==st] if len(hs)>=6 else frei
+            if len(sel)<3: sel=frei
+            ref=np.median([_fp(m[max(0,h['einsatz']-88):]) for h in sel],0)
+            ab=sorted(((float(np.linalg.norm(s['fp']-ref)/40)*(0.9 if s.get('favorit') else 1.0),i) for i,s in enumerate(pool)))
+            neu[st]=[pool[i] for _,i in ab[:k]]
+            b[st]={'klaenge':[pool[i]['name'] for _,i in ab[:k]],'abstand':round(ab[0][0],2)}
+        kit[art]=neu; ber[art]=b
+    return ber
+def _ton(seg):
+    """Grundton des Fells (120–600 Hz) aus 93 ms ab 5 ms nach dem Anschlag"""
+    seg=seg[200:200+4096]
+    if len(seg)<1024: return 0.0
+    # tiefster kräftiger Teilton = Grundton. Der stärkste Teilton springt bei derselben Snare zwischen Grundton und
+    # 1,6-fachem Oberton (Fell-Moden) – das hat eine Snare fälschlich in „normal“ und „hoch“ geteilt.
+    from scipy.signal import find_peaks
+    S=np.abs(np.fft.rfft(seg*np.hanning(len(seg)),1<<15)); f=np.fft.rfftfreq(1<<15,1/SR); b=(f>120)&(f<600)
+    p,_=find_peaks(S[b],height=S[b].max()*0.3,distance=30)
+    return float(f[b][p[0]]) if len(p) else float(f[b][np.argmax(S[b])])
+def _farbe(seg,dauer=0.25):
+    S=_lb.feature.melspectrogram(y=np.ascontiguousarray(seg[:int(dauer*SR)],dtype=np.float32),sr=SR,n_mels=40,fmin=60)
+    v=_lb.power_to_db(S.mean(1)+1e-12); return v-v.mean()
+def snare_gruppen(kit,x,hits):
+    """Snare-Trommeln des Originals an den LAUTEN Schlägen nach Tonhöhe trennen (eine oder zwei, z. B. hohe Intro-Snare
+    und normale Snare). Je Trommel genau EIN Klang aus dem passenden Ordner (hoch -> Snare_hoch, sonst Snare), gewählt
+    nach Tonhöhe und Klangfarbe. Leise Schläge (Ghost) und Übersprechen bekommen den Klang der Trommel, deren lauter
+    Schlag zeitlich am nächsten liegt – so wechselt der Klang nie willkürlich zwischen zwei Snares."""
+    m=x.mean(1); sn=[h for h in hits if h.get('art','snare') in ('snare','ghost')]
+    if not sn: return {}
+    pg=np.array([h['pegel'] for h in sn]); laut=[h for h in sn if h['pegel']>=np.percentile(pg,90)-8] or sn   # nur echte, kräftige Schläge bestimmen die Trommeln
+    ton=np.array([_ton(m[h['einsatz']:]) for h in laut]); lg=np.log2(np.maximum(ton,60))
+    gruppen=[list(range(len(laut)))]
+    o=np.argsort(lg); sp=np.diff(lg[o])
+    if len(sp):
+        i=int(np.argmax(sp)); lo,hi=list(o[:i+1]),list(o[i+1:])
+        if sp[i]*12>=4 and min(len(lo),len(hi))>=max(4,0.05*len(laut)): gruppen=[lo,hi]
+    bib={el:[_bib_sample(e) for e in BIB if e['element']==el] for el in ('Snare','Snare_hoch','Snare_tief','Snare_Rand_Fell')}
+    for L in bib.values():
+        for s in L:
+            if 'ton' not in s: s['ton']=_ton(s['x'].mean(1)[s['einsatz']:]); s['farbe']=_farbe(s['x'].mean(1)[s['einsatz']:])
+    ber={}; zeit=[]; 
+    for gi,G in enumerate(gruppen):
+        t=float(np.median(ton[G])); ref=np.median([_farbe(m[laut[j]['einsatz']:]) for j in G],0)
+        hoch=(len(gruppen)==2 and gi==1) or (len(gruppen)==1 and t>380)
+        pool=(bib['Snare_hoch'] if hoch else bib['Snare']+bib['Snare_tief']) or [s for L in bib.values() for s in L]
+        if not pool: return {}
+        ab=sorted((0.5*abs(12*np.log2(max(s['ton'],60)/t))+float(np.linalg.norm(s['farbe']-ref)/np.sqrt(40)),k) for k,s in enumerate(pool))
+        s=pool[ab[0][1]]; art=f'snare_{gi+1}'; kit[art]={'leise':[s],'mittel':[s],'laut':[s]}
+        ber[art]={'ton_original_hz':round(t),'schlaege_laut':len(G),'klang':s['name'],'abstand':round(ab[0][0],2)}
+        zeit+= [(laut[j]['einsatz'],art) for j in G]
+    zeit.sort(); zt=np.array([z for z,_ in zeit])
+    for h in sn:
+        i=int(np.argmin(np.abs(zt-h['einsatz']))); h['art']=zeit[i][1]
+    for a_ in ber: ber[a_]['schlaege_gesamt']=sum(1 for h in sn if h['art']==a_)
+    return ber
 def lade_kit(k=K,roots=True):
+    if roots and BIB:
+        return lade_kit_bib()
     if roots and ROOTS:
         return {art:{st:[_sample(os.path.join(SAMPLES,p))] for st,p in ROOTS[art].items()} for art in ART if art in ROOTS}
     kit={}
@@ -130,13 +233,17 @@ def _grund(seg):
 def tom_bibliothek(wurzel=None):
     T=os.path.join(SAMPLES,'toms')
     tr={}
+    if BIB:                                       # je Trommel (Element + Herkunft) ein Eintrag mit ihren Stärken
+        for e in BIB:
+            if e['element'] in ('Tom_hoch','Tom_mittel','Tom_tief','Standtom','Timbales_RotoToms'):
+                tr.setdefault(e['element']+': '+os.path.basename(os.path.dirname(e.get('quelle',''))),[]).append(os.path.join(BIB_DIR,e['datei']))
     if ROOTS and ROOTS.get('toms'):
         tr={name:[os.path.join(SAMPLES,p) for p in P] for name,P in ROOTS['toms'].items()}
         tr={n:[p for p in P if os.path.isfile(p)] for n,P in tr.items()}; tr={n:P for n,P in tr.items() if P}
-    for name in (('Tom1','Tom2','Tom3','Tom4') if not tr else ()):
+    for name in (('Tom1','Tom2','Tom3','Tom4') if not tr else ()):  # noqa: E501
         P=sorted(glob.glob(os.path.join(T,'Muldjord '+name,'*.flac'))+glob.glob(os.path.join(T,'Muldjord '+name,'*.wav')))
         if P: tr['Muldjord '+name]=P
-    for p in (sorted(glob.glob(os.path.join(T,'shots','*'))) if not (ROOTS and ROOTS.get('toms')) else []):
+    for p in (sorted(glob.glob(os.path.join(T,'shots','*'))) if not (ROOTS and ROOTS.get('toms')) and not BIB else []):
         tr[os.path.basename(p)]=[p]
     lib={}
     for name,P in tr.items():
@@ -147,7 +254,7 @@ def tom_bibliothek(wurzel=None):
             a=np.abs(y).max(1); st=max(0,int(np.argmax(a>a.max()*0.1))-88); y=y[st:].astype(np.float32); a=np.abs(y).max(1)
             L.append({'x':y,'einsatz':int(np.argmax(a>a.max()*0.1)),'wert':float(np.abs(y.mean(1)).max()),'name':os.path.basename(p)})
         L.sort(key=lambda s:s['wert']); g=float(np.median([_grund(s['x'].mean(1)[int(.02*SR):int(.3*SR)]) for s in L]))
-        lib[name]={'stufen':L,'ton':g}
+        lib[name]={'stufen':L,'ton':g,'roto':('roto' in name.lower() or 'timbales' in name.lower())}
     return lib
 def _stimmen(s,halbton):
     if abs(halbton)<0.05: return s
@@ -168,10 +275,16 @@ def toms_spielen(laenge,x,hits,lib,max_halbton=2.0):
         ziel=float(np.median([h['ton2'] for h in rr]))
         ref=np.median([_fp(m[h['einsatz']-88:],0.3) for h in rr],0)
         best=None
+        # 14. Nov 2026: Tonhöhe zählt – tiefe Tom bleibt tief. Roto-Toms/Timbales nur, wenn das Original höher ist als
+        # die höchste normale Tom der Bibliothek (+4 Halbtöne).
+        normal=[d['ton'] for d in lib.values() if not d.get('roto')]
+        roto_ok=not normal or ziel>max(normal)*2**(4/12)
         for name,d in lib.items():
-            st=float(np.clip(12*np.log2(ziel/d['ton']),-max_halbton,max_halbton))
+            if d.get('roto') and not roto_ok: continue
+            roh_st=12*np.log2(ziel/d['ton'])
+            st=float(np.clip(roh_st,-max_halbton,max_halbton))
             mid=d['stufen'][len(d['stufen'])//2]; s=_stimmen(mid,st)
-            dist=float(np.linalg.norm(_fp(s['x'].mean(1),0.3)-ref)/40)
+            dist=float(np.linalg.norm(_fp(s['x'].mean(1),0.3)-ref)/40)+1.5*max(0.0,abs(roh_st)-max_halbton)
             if best is None or dist<best[0]: best=(dist,name,st)
         dist,name,st=best; L=[_stimmen(s,st) for s in lib[name]['stufen']]
         # KEIN Kürzen: Toms klingen immer natürlich ganz aus (ein Schlagzeuger dämpft nicht ab)
@@ -202,7 +315,9 @@ def becken_bibliothek(wurzel=None,ordner=('CrashL',),pfade=None):
             if y.shape[1]==1: y=np.repeat(y,2,1)
             a=np.abs(y).max(1); st=max(0,int(np.argmax(a>a.max()*0.1))-88); y=y[st:]; a=np.abs(y).max(1)
             h=_hf(y.mean(1)); e=int(np.argmax(a>a.max()*0.1))
-            L.append({'x':y,'einsatz':e,'hf':float(np.sqrt(np.mean(h[e+int(.02*SR):e+int(.3*SR)]**2))),'name':o+'/'+os.path.basename(p)})
+            # Splash/China nur, wenn sie klar besser passen (getrennte Crashs klingen oft kürzer als echte -> Splash-Falle)
+            malus={'Splash':1.25,'China':1.6}.get(o,1.0)
+            L.append({'x':y,'einsatz':e,'hf':float(np.sqrt(np.mean(h[e+int(.02*SR):e+int(.3*SR)]**2))),'name':o+'/'+os.path.basename(p),'malus':malus})
     L.sort(key=lambda s:s['hf']); return L
 def becken_karte(xb,abstand=0.3,unter_max=30.0,anstieg=10.0):
     m=xb.mean(1); h=_hf(m); k=int(.01*SR); n=len(h)//k
@@ -242,7 +357,8 @@ def _hf_huelle(m,dauer=1.5,ms=10):
 def becken_spielen2(laenge,xb,hits,lib):
     """wie becken_spielen, aber je Schlag die Variante, deren Ausklang-Verlauf (Höhen, 1,5 s) am besten passt"""
     y=np.zeros((laenge,2),np.float32); hb=_hf(xb.mean(1)); ben=[]; vorher=None
-    for s in lib: s['huelle']=_hf_huelle(_hf(s['x'].mean(1))[s['einsatz']:])
+    for s in lib: s['huelle']=_hf_huelle(_hf(s['x'].mean(1))[s['einsatz']:]); s['farbe']=_farbe(s['x'].mean(1)[s['einsatz']:],0.5)
+    mb=xb.mean(1)
     for j,h in enumerate(hits):
         nxt=hits[j+1]['einsatz'] if j+1<len(hits) else laenge
         ziel=_hf_huelle(hb[h['einsatz']:]); n=max(10,min(len(ziel),int((nxt-h['einsatz'])/(SR*0.01))))
@@ -251,9 +367,16 @@ def becken_spielen2(laenge,xb,hits,lib):
             z=ziel[:n]; ok=z>z.max()-40; ok[:5]=False
             g0=h['ziel_hf']/max(s['hf'],1e-9); gdb=float(np.median(z[ok]-s['huelle'][:n][ok])) if ok.sum()>5 else 20*np.log10(g0)
             gdb=float(np.clip(gdb,20*np.log10(g0)-6,20*np.log10(g0)+6)); g=10**(gdb/20); e=s['huelle'][:n]+gdb
-            dist=float(np.mean(np.abs(e[ok]-z[ok]))) + (1.0 if s is vorher else 0.0)
+            # 14. Nov 2026: Klangfarbe des Anschlags zählt mit (sonst gewinnt ein Ride-artiges Becken mit passendem
+            # Ausklang); derselbe Klang wie beim letzten Schlag wird leicht bevorzugt (ein Becken bleibt ein Becken)
+            fz=_farbe(mb[h['einsatz']:],0.5); farbe=float(np.linalg.norm(s['farbe']-fz)/np.sqrt(40))
+            dist=float(np.mean(np.abs(e[ok]-z[ok])))*s.get('malus',1.0)+0.6*farbe-(0.5 if s is vorher else 0.0)
             if best is None or dist<best[0]: best=(dist,s,g)
         dist,s,g=best; vorher=s; a=h['einsatz']-s['einsatz']+h.get('schub',0)
+        # 14. Nov 2026: nie lauter als das Original an dieser Stelle (+1 dB) – sonst wird ein leiser Rest zum lauten Becken
+        o=float(np.abs(xb[h['einsatz']:h['einsatz']+int(0.06*SR)]).max()) if h['einsatz']<len(xb) else 0.0
+        sp=float(np.abs(s['x'][s['einsatz']:s['einsatz']+int(0.06*SR)]).max()) if len(s['x'])>s['einsatz'] else 1.0
+        if o>0 and g*sp>1.12*o: g=1.12*o/max(sp,1e-9)
         q0=max(0,-a); a0=max(0,a); m=min(len(s['x'])-q0,laenge-a0)
         if m>0: y[a0:a0+m]+=g*s['x'][q0:q0+m]
         ben.append((round(h['einsatz']/SR,2),s['name'],round(20*np.log10(h['ziel_hf']+1e-9),1),round(dist,1)))

@@ -319,9 +319,47 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
     bericht = {}
     KIT = kr.lade_kit()
     # Snare oder Rimshot wird am vollen alten Kit unterschieden (viele Varianten = sicherer); gespielt wird das Kit
-    karte = karte_bauen(teile_dir, kr.lade_kit(roots=False) if kr.ROOTS else KIT)
+    karte = karte_bauen(teile_dir, KIT if kr.BIB else (kr.lade_kit(roots=False) if kr.ROOTS else KIT))
     if kr.ROOTS:
         bericht["kit"] = kr.ROOTS.get("name", "Roots-Reggae-Kit")
+    if kr.BIB:
+        bericht["kit"] = f"Bibliothek ({len(kr.BIB)} Klänge, je Song die passendsten)"
+    # 14. Nov 2026: Reste der Trennung raus – ein Schlag weit unter dem typischen Pegel seiner Teilspur ist kein Schlag
+    # (gilt für jede Teilspur; Becken strenger, weil dort leiser Rest sonst als Becken klingt)
+    for t_ in ("kick", "hihat", "toms", "becken"):
+        x_t, h_t = karte.get(t_, (None, []))
+        if not h_t or len(h_t) < 4:
+            continue
+        pg_ = np.array([h["pegel"] for h in h_t])
+        grenze = float(np.percentile(pg_, 75)) - 15 if t_ == "becken" else float(np.median(pg_)) - 24
+        gut_ = [h for h in h_t if h["pegel"] >= grenze]
+        if len(gut_) < len(h_t):
+            bericht.setdefault("reste_entfernt", {})[t_] = len(h_t) - len(gut_)
+            karte[t_] = (x_t, gut_)
+    x_s, hs = karte.get("snare", (None, []))
+    if hs:
+        med = float(np.median([h["pegel"] for h in hs]))
+        hh_t = np.array([h["start"] for h in karte["hihat"][1]]) if karte.get("hihat") and karte["hihat"][1] else np.zeros(0)
+        ms_ = x_s.mean(1)
+
+        def _hf_anteil(h):
+            w = ms_[h["start"]:h["start"] + int(0.04 * SR)]
+            if len(w) < 256:
+                return 0.0
+            S = np.abs(np.fft.rfft(w * np.hanning(len(w)))); f = np.fft.rfftfreq(len(w), 1 / SR)
+            return float(S[f > 6000].sum() / max(S.sum(), 1e-9))
+        an = np.array([_hf_anteil(h) for h in hs]); ref_an = float(np.median(an))
+        gut = []
+        for h, a_ in zip(hs, an):
+            if h["pegel"] < med - 24:
+                continue                                  # zu leise für einen echten Schlag: Rest der Trennung
+            nahe = len(hh_t) and np.min(np.abs(hh_t - h["start"])) < 0.015 * SR
+            if nahe and h["pegel"] < med - 12 and a_ > ref_an + 0.15:
+                continue                                  # leise, hell und genau mit der Hi-Hat: Hi-Hat-Übersprechen
+            gut.append(h)
+        if len(gut) < len(hs):
+            bericht["snare_uebersprechen_entfernt"] = len(hs) - len(gut)
+        karte["snare"] = (x_s, gut)
     if weg:
         for t, zeiten in weg.items():
             if t in karte and zeiten:
@@ -347,7 +385,7 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
         top = max(h["pegel"] for h in hits)
         karte["toms"] = (x, [h for h in hits if h["pegel"] > top - 20])
 
-    roh = {}
+    roh, treffer = {}, {}
     noten = []                                   # (zeit_s, gm_note, pegel_db, teil) für den MIDI-Export
     schub_von = timing_vorbereiten(eingabe, karte, TEILE if not nur else (nur,), bericht) if timing else None
     for teil in (TEILE if not nur else (nur,)):
@@ -377,11 +415,31 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
             bh = kr.becken_karte(x)
             if bh:
                 bh = [h for h in bh if h["pegel"] > max(q["pegel"] for q in bh) - 25]
+                bh = _becken_uebersprechen(x, bh, karte, bericht)
             if schub_von:
                 for h in bh:
                     h["schub"] = schub_von(h["einsatz"])
             bn = becken_noten(teile_dir, x, bh, bericht)
-            if kr.ROOTS and bh:
+            if bh and 51 in bn:                          # leise „Ride“-Schläge = Übersprechen -> weg
+                grenze = float(np.percentile([h["pegel"] for h in bh], 75)) - 15
+                behalten = [i for i, (h, n_) in enumerate(zip(bh, bn)) if not (n_ == 51 and h["pegel"] < grenze)]
+                if len(behalten) < len(bh):
+                    bericht["ride_uebersprechen_entfernt"] = len(bh) - len(behalten)
+                bh = [bh[i] for i in behalten]; bn = [bn[i] for i in behalten]
+                if 0 < bn.count(51) < 8:
+                    bn = [49 if n_ == 51 else n_ for n_ in bn]
+            if kr.BIB and bh:
+                # je Schlag der passendste Klang: Crash-Noten aus Crash/Splash/China, Ride-Noten aus Ride/Ride-Glocke
+                libs = {"crash": (kr.bib_pfade(("Crash", "Splash", "China")), (49, 57)),
+                        "ride": (kr.bib_pfade(("Ride",)) or kr.bib_pfade(("Ride_Glocke",)) or kr.bib_pfade(("Crash",)), (51,))}
+                y, ben = np.zeros((len(x), 2), np.float32), []
+                for _, (pfade, nn) in libs.items():
+                    teil_h = [h for h, n_ in zip(bh, bn) if n_ in nn]
+                    if teil_h and pfade:
+                        y_, b_ = kr.becken_spielen2(len(x), x, teil_h, kr.becken_bibliothek(None, pfade=pfade))
+                        y += y_; ben += b_
+                ben.sort()
+            elif kr.ROOTS and bh:
                 # Ride-Schläge mit dem Ride-Klang, Crash 1 / Crash 2 mit Crash L / Crash R (Auswahl des Inhabers)
                 pf = lambda k: [os.path.join(kr.SAMPLES, p) for p in (kr.ROOTS.get(k) or [])
                                 if os.path.isfile(os.path.join(kr.SAMPLES, p))]
@@ -406,8 +464,15 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                 bericht["hihat_becken_uebersprechen_entfernt"] = len(raus)
                 if hits:
                     hits = hihat_lautstaerke(eingabe, teile_dir, x, hits, hh_ref, bericht)
-            kit_song = copy.deepcopy(KIT)
+            kit_song = copy.deepcopy(KIT) if not kr.BIB else {a_: dict(v_) for a_, v_ in KIT.items()}
             arten = {"kick": ["kick"], "snare": ["snare", "rimshot"], "hihat": ["hh_zu", "hh_offen"]}[teil]
+            if kr.BIB:
+                arten = {"kick": ["kick"], "snare": ["snare", "rimshot", "ghost"], "hihat": ["hh_zu", "hh_halb", "hh_offen"]}[teil]
+                if teil == "snare" and hits:
+                    # 14. Nov 2026: je Snare-Trommel des Originals EIN fester Klang (z. B. hohe Intro-Snare + normale
+                    # Snare); leise Zwischenschläge bekommen den Klang der Trommel, die gerade gespielt wird
+                    arten = ["rimshot"]
+                    bericht["snare_klaenge"] = kr.snare_gruppen(kit_song, x, hits)
             oeffnung = None
             if hits and teil == "hihat":
                 oeffnung = hh_oeffnung(x, hits, bericht, karte["becken"][0])
@@ -415,7 +480,9 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                     for h, (note, cc4) in zip(hits, oeffnung):
                         o = (127 - cc4) / 127
                         h["art"] = "hh_offen" if o >= 0.65 else ("hh_halb" if o >= 0.3 else "hh_zu")
-            if hits and not kr.ROOTS:
+            if hits and kr.BIB:
+                bericht.setdefault("klangwahl", {}).update(kr.passend_bib(kit_song, arten, x, hits))
+            elif hits and not kr.ROOTS:
                 bericht.setdefault("kit_angepasst", {}).update(kr.passend_machen(kit_song, arten, x, hits))
             if hits:
                 if schub_von:
@@ -431,24 +498,141 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                         noten.append(((h["einsatz"] + h.get("schub", 0)) / SR, gmn.get(h.get("art"), 38), h["pegel"], teil))
             else:
                 y = np.zeros((len(x), 2), np.float32)
+        if kr.BIB and hits and teil in ("kick", "snare", "hihat", "toms"):
+            y = _pegel_wie_original(x, y, [h.get("einsatz", h["start"]) + h.get("schub", 0) for h in hits], teil, bericht)
         roh[teil] = y
+        treffer[teil] = (x, [h.get("einsatz", h["start"]) + h.get("schub", 0) for h in hits])
         bericht.setdefault("schlaege", {})[teil] = len(hits)
         melde(f"✔ {teil}: {len(hits)} Schläge")
     n = min(len(t) for t in roh.values())
     mix = sum(t[:n, :2] for t in roh.values())
     bericht["nur"] = nur or "alles"
-    mix *= min(1.0, 0.98 / max(float(np.abs(mix).max()), 1e-6))
+    mix = _begrenzen(mix)                         # Lautstärke wie im Original lassen, nur Spitzen weich abfangen
     os.makedirs(ziel, exist_ok=True)
     out = os.path.join(ziel, "drums_neu.wav")
     sf.write(out, mix, SR, subtype="PCM_24")
     for t in roh:
         sf.write(os.path.join(ziel, f"{t}_neu.flac"), np.clip(roh[t], -1, 1), SR, subtype="PCM_24")
+    try:                                           # Gegenprobe und Hör-Seite Original / neu (nie am Ergebnis scheitern)
+        bericht["gegenprobe"] = gegenprobe(roh, treffer, ziel)
+    except Exception as e:  # noqa: BLE001
+        bericht["gegenprobe"] = {"fehler": str(e)[:200]}
     try:
         bericht["midi"] = midi_schreiben(eingabe, noten, ziel, nur, rimshot_note, midi_bpm)
     except Exception as e:                         # MIDI ist eine Zugabe – Audio-Ergebnis nie daran scheitern lassen
         bericht["midi"] = {"fehler": str(e)}
     json.dump(bericht, open(os.path.join(ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
     return out, bericht
+
+
+def _hoerkopie(x, pfad):
+    """Kleine Hörkopie (Mono, 22 kHz, MP3 ~1,5 MB je 5 Min.) – klein, damit sie auch über eine schwache Leitung
+    schnell zurückkommt. Ohne MP3-Unterstützung: keine Kopie (nie ein Fehler)."""
+    try:
+        import librosa
+        m = librosa.resample(np.asarray(x, np.float32).mean(1), orig_sr=SR, target_sr=22050)
+        sf.write(pfad, np.clip(m, -1, 1), 22050, format="MP3", subtype="MPEG_LAYER_III")
+        return True
+    except Exception:  # noqa: BLE001
+        try:
+            os.remove(pfad)
+        except OSError:
+            pass
+        return False
+
+
+def _becken_uebersprechen(xb, bh, karte, bericht):
+    """Becken in den Höhen messen (dort klingt ein Becken). Ein „Becken-Schlag“, bei dem Hi-Hat oder Snare im selben
+    Moment genauso laut oder lauter sind (bis 1 dB darunter), ist deren Übersprechen – ebenso alles 20 dB unter dem lautesten Becken.
+    Gilt für jede Schlagzeugspur (14. Nov 2026: sonst entstanden Ride-/Becken-Schläge, die im Original nicht da sind)."""
+    if not bh:
+        return bh
+    hb = kr._hf(xb.mean(1))
+    andere = [kr._hf(karte[t][0].mean(1)) for t in ("hihat", "snare") if karte.get(t) and karte[t][0] is not None]
+    n50 = int(0.05 * SR)
+
+    def _db(v, a):
+        w = v[a:a + n50]
+        return 10 * np.log10(np.mean(w ** 2) + 1e-14) if len(w) else -140.0
+    lv = [_db(hb, h["einsatz"]) for h in bh]
+    oben = max(lv)
+    gut = [h for h, l_ in zip(bh, lv) if l_ >= oben - 20 and all(_db(v, h["einsatz"]) < l_ - 1 for v in andere)]
+    if len(gut) < len(bh):
+        bericht["becken_uebersprechen_entfernt"] = len(bh) - len(gut)
+    return gut
+
+
+def _pegel_wie_original(x, y, zeiten, teil, bericht):
+    """Gleiche Lautheit wie das Original: Energie der ersten 40 ms je Schlag (nicht nur die Spitze) vergleichen und die
+    ganze Teilspur um den Median-Unterschied angleichen (höchstens ±10 dB)."""
+    n = int(0.04 * SR)
+    d = []
+    for q in zeiten:
+        if 0 <= q < len(x) - n:
+            o = np.sqrt(np.mean(x[q:q + n] ** 2)); w = np.sqrt(np.mean(y[q:q + n] ** 2))
+            if o > 1e-6 and w > 1e-6:
+                d.append(20 * np.log10(o / w))
+    if len(d) < 4:
+        return y
+    k = float(np.clip(np.median(d), -10, 10))
+    bericht.setdefault("pegel_angeglichen_db", {})[teil] = round(k, 1)
+    return y * np.float32(10 ** (k / 20)) if abs(k) >= 0.5 else y
+
+
+def _begrenzen(x, decke=0.97):
+    """Spitzen-Begrenzer (5 ms Vorlauf, 80 ms Rücklauf): nur die Stellen über der Decke werden leiser, der Rest bleibt
+    so laut wie gespielt (früher wurde die ganze Spur abgesenkt -> alles zu leise)."""
+    from scipy.ndimage import maximum_filter1d, uniform_filter1d
+    a = np.abs(x).max(1)
+    if a.max() <= decke:
+        return x
+    g = np.minimum(1.0, decke / np.maximum(a, 1e-9))
+    vor = int(0.005 * SR)
+    g = -maximum_filter1d(-g, size=2 * vor + 1)                   # Minimum im Fenster: rechtzeitig absenken
+    g = np.minimum(g, uniform_filter1d(g, size=int(0.08 * SR)))   # langsam zurück
+    g = uniform_filter1d(g, size=vor)
+    y = x * g[:, None]
+    return np.clip(y, -decke, decke)
+
+
+def gegenprobe(roh, treffer, ziel):
+    """Je Element: neue Spur gegen die Original-Teilspur – getroffene Schläge (±30 ms), Abweichung, Lautstärke.
+    Legt die Original-Teilspuren und eine Hör-Seite (vergleich.html) zum Gegenhören in den Ergebnis-Ordner."""
+    import librosa
+    erg, hoer = {}, {}
+    for t, y in roh.items():
+        x, zeiten = treffer.get(t, (None, []))
+        if x is None:
+            continue
+        hoer[t] = _hoerkopie(x, os.path.join(ziel, f"original_{t}.mp3"))
+        if not zeiten:
+            erg[t] = {"original_schlaege": 0}
+            continue
+        on = librosa.onset.onset_detect(y=y.mean(1), sr=SR, hop_length=128, units="samples", backtrack=True)
+        z = np.array(zeiten)
+        ab = np.array([np.min(np.abs(on - q)) for q in z]) / SR if len(on) else np.full(len(z), 9.0)
+        ok = ab <= 0.03
+        lo = [20 * np.log10(np.abs(x[q:q + int(.05 * SR)]).max() + 1e-9) for q in z]
+        ln = [20 * np.log10(np.abs(y[q:q + int(.05 * SR)]).max() + 1e-9) for q in z]
+        d = np.array(ln) - np.array(lo)
+        erg[t] = {"original_schlaege": int(len(z)), "getroffen_prozent": round(float(ok.mean() * 100), 1),
+                  "abweichung_ms": round(float(np.median(ab[ok]) * 1000), 1) if ok.any() else None,
+                  "lautstaerke_unterschied_db": round(float(np.median(d - np.median(d))), 1),
+                  "lautstaerke_streuung_db": round(float(np.std(d)), 1)}
+    zeilen = "".join(
+        f"<tr><td>{ {'kick': 'Kick', 'snare': 'Snare', 'hihat': 'Hi-Hat', 'toms': 'Toms', 'becken': 'Becken'}.get(t, t)}</td><td>" + (f"<audio controls preload='none' src='original_{t}.mp3'></audio>" if hoer.get(t) else "–")
+        + "</td>"
+        f"<td><audio controls preload='none' src='{t}_neu.flac'></audio></td>"
+        f"<td>{v.get('getroffen_prozent', '–')} %</td><td>{v.get('abweichung_ms', '–')} ms</td></tr>"
+        for t, v in erg.items())
+    with open(os.path.join(ziel, "vergleich.html"), "w", encoding="utf-8") as f:
+        f.write("<!doctype html><html lang='de'><head><meta charset='utf-8'><title>Schlagzeug: Original und neu</title>"
+                "<style>body{background:#12141a;color:#e8eaf0;font:15px -apple-system,system-ui,sans-serif;padding:20px}"
+                "td,th{padding:6px 10px;border-bottom:1px solid #2a2f3c;text-align:left}audio{width:260px}</style></head>"
+                "<body><h2>Schlagzeug: Original-Teilspur und neu, je Element</h2><table><tr><th>Element</th>"
+                "<th>Original (getrennt)</th><th>Neu</th><th>Schläge getroffen</th><th>Abweichung</th></tr>"
+                + zeilen + "</table></body></html>")
+    return erg
 
 
 def becken_noten(teile_dir, xb, hits, bericht):
