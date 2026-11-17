@@ -16,7 +16,7 @@ Eingabe: der GANZE Song. Ablauf:
   5. Griffe je Hand aus den Tönen der Original-Orgel; zusätzliche Orgel-Töne nur wo das Hör-Modell klar Orgel hört
   6. Klang aus GeneralUser GS (Hammond, Perkussiv, Rock, Pfeife, Harmonium …), optional Leslie-Effekt,
      gleichmäßige Lautstärke wie die Original-Orgel
-  7. Ausgabe: orgel_neu.wav (nur die eigene Spur), orgel_neu.mid,
+  7. Ausgabe: orgel_neu.wav, song_mit_neuer_orgel.wav („Other“ nur ab dem Orgel-Einsatz ersetzt), orgel_neu.mid,
      Akkord-Plan, bericht.json
 
 Aufruf:
@@ -442,7 +442,7 @@ def midi_schreiben(noten, bank, programm, ziel, bpm=120.0):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe, song=None):
+def _hoer_tor(y, ref, gruppe):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -451,20 +451,7 @@ def _hoer_tor(y, ref, gruppe, song=None):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
-    except Exception:  # noqa: BLE001
-        return y
-
-
-def _pegel(y, ref, song, versatz_db=0.0):
-    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
-    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
-    try:
-        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if d_ not in sys.path:
-            sys.path.insert(0, d_)
-        import hoer_tor as _ht
-        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
+        return _ht.tor(y, ref, SR, gruppe, _HOER)
     except Exception:  # noqa: BLE001
         return y
 
@@ -659,13 +646,37 @@ def main():
         tr = lambda x: np.array([np.sqrt(np.mean(x[q:q + kk] ** 2)) for q in fen])  # noqa: E731
         ist = np.median(tr(y.mean(1)))
         y *= np.percentile(tr(st["_orgel"]), 75) / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
-        y = _hoer_tor(y, st["_orgel"], "orgel", song=a.eingabe)
-        y = _pegel(y, st["_orgel"], a.eingabe)
+        y = _hoer_tor(y, st["_orgel"], "orgel")
         if np.abs(y).max() > 0.98:
             y *= 0.98 / np.abs(y).max()
         out = os.path.join(a.ziel, "orgel_neu.wav")
         sf.write(out, y, SR, subtype="PCM_24")
-        # 17. Nov 2026: Stem-App – nur die eigene Spur, kein „Song mit …“ mehr
+        # Song: die alte Orgel nur ab dem Orgel-Einsatz ersetzen (davor bleibt alles, wie es war)
+        from scipy.ndimage import uniform_filter1d
+
+        def ab_einsatz(x):
+            maske = np.zeros(len(x))
+            maske[int(beats[erst] * SR):] = 1.0
+            return x * uniform_filter1d(maske, int(0.08 * SR))[:, None]
+
+        def stereo(p_):
+            x, _ = lb.load(p_, sr=SR, mono=False)
+            x = np.atleast_2d(x).T
+            return np.repeat(x, 2, 1) if x.shape[1] == 1 else x
+        rest = None
+        for s_, p_ in spuren.items():
+            x = stereo(p_)
+            if s_ == "other" and quelle == "other":
+                x = x - ab_einsatz(x)                    # „Other“ ab dem Einsatz raus (wie bisher)
+            rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
+        if quelle == "orgel53":                          # genau die alte Orgel abziehen, alles andere bleibt
+            o = stereo(org_pfad)
+            L0 = min(len(rest), len(o))
+            rest = rest[:L0] - ab_einsatz(o[:L0])
+        L = min(len(rest), len(y))
+        mix = rest[:L] + y[:L]
+        mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
+        sf.write(os.path.join(a.ziel, "song_mit_neuer_orgel.wav"), mix, SR, subtype="PCM_24")
         midi = midi_schreiben(sorted(neu + extra), bank, prog, a.ziel, a.midi_bpm)
         bpm_song = 60.0 / P_
         plan = ["Orgel (Bubble) – Akkord-Plan, erkannt aus allen Instrumenten",

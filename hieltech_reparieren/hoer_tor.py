@@ -9,8 +9,6 @@ Benutzung in einem Modul:
     y = ht.tor(y, stem, SR, "bass", bericht)        # spielt nur dort, wo das Instrument im Original zu hören ist
     t, p = ht.verlauf(stem, SR, "hihat")            # Verlauf einer Gruppe (z. B. zum Ergänzen)
 
-    y = ht.pegel(y, stem, song, SR, bericht)      # 17. Nov: Lautstärke-Sicherung gegenüber dem Original-Song
-
 Fehlt das Modell (oder torch), ändert nichts das Ergebnis: tor() gibt y unverändert zurück.
 """
 import hashlib
@@ -144,15 +142,13 @@ def verlauf(audio, sr, gruppe):
     return z["t"], z[gruppe]
 
 
-def tor(y, ref, sr, gruppe, bericht=None, min_pause_s=4.0, blende_s=0.3, song=None):
+def tor(y, ref, sr, gruppe, bericht=None, min_pause_s=4.0, blende_s=0.3):
     """Spielt die neue Spur nur dort, wo das Hör-Modell das Instrument in der Original-Spur (ref) hört.
     Stumm geschaltet werden nur lange, sichere Pausen (≥ min_pause_s), in denen das Modell das Instrument klar NICHT
     hört UND die Original-Spur mindestens 15 dB leiser ist als beim echten Spielen – dort spielt die Reparatur sonst
     nur Reste der Trennung nach. Sicherungen:
       * Hört das Modell das Instrument im ganzen Song kaum (unsicher für dieses Instrument), bleibt alles wie es ist.
-      * Würde mehr als 40 % der gespielten Zeit wegfallen, bleibt alles wie es ist (Modell vermutlich daneben).
-      * 17. Nov 2026 (song = ganzer Original-Song): stumm wird nur, wo das Instrument AUCH im ganzen Song nicht zu
-        hören ist. Hat die Trennung es nur aufgefressen (im Song zu hören, in der Spur nicht), bleibt die Stelle."""
+      * Würde mehr als 40 % der gespielten Zeit wegfallen, bleibt alles wie es ist (Modell vermutlich daneben)."""
     info = {"gruppe": gruppe}
     try:
         from scipy.ndimage import uniform_filter1d
@@ -168,12 +164,6 @@ def tor(y, ref, sr, gruppe, bericht=None, min_pause_s=4.0, blende_s=0.3, song=No
             info["stand"] = "Hör-Modell unsicher bei diesem Instrument – nichts geändert"
             return y
         weg = p < max(0.03, 0.15 * p90)
-        if song is not None:
-            ls = luecken(ref, song, sr, gruppe)
-            if ls is not None:
-                im_song = np.interp(t, ls["t"], ls["song"].astype(float)) > 0.5
-                info["aufgefressen_s"] = ls["info"]["aufgefressen_s"]
-                weg &= ~im_song
         # Sicherung über die Lautstärke: nur wo die Original-Spur dort auch deutlich leiser ist als beim echten Spielen
         # (Reste der Trennung sind leise). Ist sie normal laut, irrt das Modell (z. B. Reggae-Skank) -> nicht anfassen.
         rm = np.asarray(ref, dtype=np.float32)
@@ -221,195 +211,3 @@ def tor(y, ref, sr, gruppe, bericht=None, min_pause_s=4.0, blende_s=0.3, song=No
     finally:
         if bericht is not None:
             bericht.setdefault("hoer_modell", {})[gruppe] = info
-
-
-def _mono(x, sr):
-    """Pfad oder Array -> mono float32 (Pfad wird mit sr geladen)."""
-    if x is None:
-        return None
-    if isinstance(x, str):
-        if not os.path.isfile(x):
-            return None
-        import librosa
-        x, _ = librosa.load(x, sr=sr, mono=True)
-    x = np.asarray(x, dtype=np.float32)
-    return x.mean(1) if x.ndim == 2 else x
-
-
-def pegel(y, ref, song, sr, bericht=None, versatz_db=0.0, toleranz_db=6.0, ersatz_unter_song_db=16.0):
-    """17. Nov 2026 – Lautstärke-Sicherung für alle Reparaturen: die neue Spur soll so laut sein wie das Instrument
-    im Original-Song – nie unhörbar leise, nie lauter als im Original.
-    Gemessen wird nur dort, wo die neue Spur spielt (0,5-s-Abschnitte, höchstens 30 dB unter ihrer lautesten Stelle).
-      * ref = getrennte Original-Spur des Instruments (None = keine brauchbare), song = ganzer Original-Song.
-      * Ziel = Pegel der Original-Spur (+ versatz_db, z. B. Picking 8 dB unter der Gitarre).
-      * Hat die Trennung das Instrument verloren (Original-Spur mehr als 35 dB unter dem Song), gilt als Ziel
-        „ersatz_unter_song_db“ unter dem Song.
-      * Die Module stellen die Lautstärke selbst ein; geändert wird nur, wenn sie mehr als toleranz_db vom Ziel
-        abweicht (also klar falsch ist) oder lauter als das Original wäre (3 dB unter dem ganzen Song bzw. die Original-
-        Spur +1 dB). Spitzen ≤ 0,98."""
-    info = {}
-    try:
-        yy = np.asarray(y, dtype=np.float32)
-        ym = yy.mean(1) if yy.ndim == 2 else yy
-        r = _mono(ref, sr)
-        s = _mono(song, sr)
-        if s is None:
-            s = r
-        if s is None or len(ym) < sr:
-            info["stand"] = "ohne Vergleich – nichts geändert"
-            return y
-        ohne_ref = r is None
-        if ohne_ref:                    # keine brauchbare Original-Spur: Ziel nur nach dem Song
-            r = np.zeros_like(s)
-        n = min(len(ym), len(r), len(s))
-        h = int(0.5 * sr)
-        k = n // h
-        if k < 2:
-            info["stand"] = "zu kurz – nichts geändert"
-            return y
-
-        def db(x):
-            e = np.sqrt(np.mean(x[:k * h].reshape(k, h).astype(np.float64) ** 2, 1)) + 1e-12
-            return e
-        ey, er, es = db(ym), db(r), db(s)
-        if ey.max() < 1e-7:
-            info["stand"] = "neue Spur leer – nichts geändert"
-            return y
-        akt = ey > ey.max() * 10 ** (-30 / 20)
-
-        def lv(e):
-            return float(20 * np.log10(np.sqrt(np.mean(e[akt] ** 2)) + 1e-12))
-        L_y, L_r, L_s = lv(ey), lv(er), lv(es)
-        info.update(neu_db=round(L_y, 1), original_spur_db=None if ohne_ref else round(L_r, 1), song_db=round(L_s, 1))
-        if not ohne_ref and L_r >= L_s - 35:
-            ziel, art = L_r + versatz_db, "wie die Original-Spur"
-        else:
-            ziel, art = L_s - ersatz_unter_song_db + versatz_db, "Original-Spur fast leer (Trennung) – nach dem Song"
-        # nie lauter als das Original: höchstens 3 dB unter dem ganzen Song (ist „song“ selbst nur die Spur, zählt
-        # die Spur +1 dB)
-        deckel = max(L_s - 3.0, (L_r + 1.0) if not ohne_ref else -999.0)
-        ziel = min(ziel, deckel)
-        info["ziel_db"] = round(ziel, 1)
-        g_db = 0.0
-        if abs(L_y - ziel) > toleranz_db or L_y > deckel:
-            g_db = ziel - L_y
-            yy = yy * np.float32(10 ** (g_db / 20))
-        sp = float(np.abs(yy).max())
-        if sp > 0.98:
-            yy = yy * np.float32(0.98 / sp)
-        info["angepasst_db"] = round(g_db, 1)
-        info["stand"] = (f"angepasst um {g_db:+.1f} dB ({art})" if g_db else f"passt ({art})")
-        return yy.astype(np.asarray(y).dtype) if g_db or sp > 0.98 else y
-    except Exception as e:  # noqa: BLE001 – nie am Ergebnis scheitern
-        info["stand"] = f"übersprungen ({str(e)[:120]})"
-        return y
-    finally:
-        if bericht is not None:
-            bericht.setdefault("hoer_modell", {})["pegel"] = info
-
-
-SONG_SCHWELLE = 0.08        # Sicherheit (über 2 s geglättet), ab der ein Instrument im ganzen Song als „zu hören“ gilt
-
-
-def _putzen(b, schritt, min_s=2.0):
-    """Lücken < min_s zwischen zwei True-Stellen schließen, True-Stücke < min_s weglassen."""
-    b = np.asarray(b, bool).copy()
-    n = max(1, int(round(min_s / schritt)))
-    for wert in (False, True):
-        i = 0
-        while i < len(b):
-            if b[i] != wert:
-                i += 1
-                continue
-            j = i
-            while j < len(b) and b[j] == wert:
-                j += 1
-            if j - i < n and (wert or (0 < i and j < len(b))):
-                b[i:j] = not wert
-            i = j
-    return b
-
-
-def luecken(stem, song, sr, gruppe, schwelle_spur=0.10, schwelle_song=SONG_SCHWELLE):
-    """17. Nov 2026 – das Hör-Modell hört für EIN Instrument zwei Dinge ab: die getrennte Spur (stem) und den ganzen
-    Original-Song (song). Daraus weiß jedes Modul, was die Trennung aufgefressen hat:
-        spur  = Instrument in seiner Spur zu hören       -> reparieren
-        song  = Instrument im ganzen Song zu hören
-        fehlt = im Song zu hören, aber nicht in der Spur  -> ergänzen
-    Beide Verläufe werden zwischengespeichert (pro Song nur einmal abgehört). Rückgabe dict oder None (Modell fehlt)."""
-    try:
-        from scipy.ndimage import uniform_filter1d
-        st_ = _mono(stem, sr)
-        so_ = _mono(song, sr)
-        if st_ is None or so_ is None:
-            return None
-        vs = verlauf(st_, sr, gruppe)
-        vg = verlauf(so_, sr, gruppe)
-        if vs is None or vg is None:
-            return None
-        t = vg[0]
-        hs = float(np.median(np.diff(t))) if len(t) > 1 else SCHRITT_S
-        k = max(1, int(round(2.0 / hs)))
-        pg = uniform_filter1d(vg[1].astype(float), k)
-        ps = np.interp(t, vs[0], uniform_filter1d(vs[1].astype(float), k))
-        spur = _putzen(ps >= schwelle_spur, hs)
-        im_song = _putzen(pg >= schwelle_song, hs) | spur
-        fehlt = im_song & ~spur
-        return {"t": t, "spur": spur, "song": im_song, "fehlt": fehlt, "schritt": hs,
-                "info": {"spur_s": round(float(spur.sum() * hs), 1), "song_s": round(float(im_song.sum() * hs), 1),
-                         "aufgefressen_s": round(float(fehlt.sum() * hs), 1),
-                         "sicherheit_song_p90": round(float(np.percentile(pg, 90)), 3)}}
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def anteil(ls, schluessel, a, b):
-    """Anteil der Zeit [a, b] (Sekunden), in der ls[schluessel] gilt (0…1)."""
-    if ls is None:
-        return 0.0
-    t, w = ls["t"], ls[schluessel]
-    m = (t >= a) & (t <= b)
-    if not m.any():
-        i = int(np.clip(np.searchsorted(t, (a + b) / 2), 0, len(t) - 1))
-        return float(w[i])
-    return float(np.mean(w[m]))
-
-
-def takte_ergaenzen(aktiv, takte, beats, ls, max_takte=8, schluessel="song"):
-    """17. Nov 2026: Skank-Takte, die die Trennung aufgefressen hat, wieder einschalten: Lücken (höchstens max_takte
-    Takte) ZWISCHEN zwei gespielten Takten, in denen das Hör-Modell das Instrument im ganzen Song hört (≥ 50 %).
-    Anfang/Ende/Breaks bleiben, wie sie sind. Rückgabe: neues aktiv, Anzahl ergänzter Takte."""
-    aktiv = np.asarray(aktiv, bool).copy()
-    if ls is None or not aktiv.any():
-        return aktiv, 0
-    n = len(beats) - 1
-    idx = np.where(aktiv)[0]
-    neu = 0
-    for a, b in zip(idx[:-1], idx[1:]):
-        if 1 < b - a <= max_takte + 1:
-            for k in range(a + 1, b):
-                t0 = beats[takte[k]]
-                t1 = beats[min(takte[k] + 4, n)]
-                if anteil(ls, schluessel, t0, t1) >= 0.5:
-                    aktiv[k] = True
-                    neu += 1
-    return aktiv, neu
-
-
-def ergaenzer(stem, song, sr, gruppe, bericht=None, max_takte=8):
-    """17. Nov 2026: Für Skank-Module (Gitarre, Piano …): liefert eine Funktion f(aktiv, takte, beats) -> aktiv, die
-    aufgefressene Takte wieder einschaltet (siehe takte_ergaenzen), und schreibt ins Bericht, wie viele es waren.
-    Ohne Modell / ohne Song: None (dann bleibt alles wie bisher)."""
-    if song is None:
-        return None
-    ls = luecken(stem, song, sr, gruppe)
-    if ls is None:
-        return None
-
-    def f(aktiv, takte, beats):
-        neu, k = takte_ergaenzen(aktiv, takte, beats, ls, max_takte)
-        if bericht is not None:
-            d = bericht.setdefault("hoer_modell", {}).setdefault("ergaenzt", {})
-            d[gruppe] = {"takte": int(k), **ls["info"]}
-        return neu
-    return f
