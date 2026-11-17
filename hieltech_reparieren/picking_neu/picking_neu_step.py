@@ -14,7 +14,8 @@ Ablauf:
   4. Timing: „mit dem Bass“ (Standard, jeder Ton exakt mit dem Bass) oder „auf dem Schlagzeug“
      (Schlag bzw. Sechzehntel-Raster)
   5. Klang: eigene gedämpfte Töne (samples/) oder Gitarren aus GeneralUser GS; Klangfarbe/Effekt darauf
-  6. Lautstärke ca. 8 dB unter der Skank-Gitarre; Ausgabe picking_neu.wav, song_mit_picking.wav, MIDI, Notenliste
+  6. Lautstärke ca. 8 dB unter der Skank-Gitarre; Ausgabe picking_neu.wav (nur die eigene Spur), MIDI, Notenliste
+     17. Nov 2026: Modus „auto“ – spielt im Song keine Picking-Gitarre, wird nichts erzeugt (art = keine_picking)
 
 Aufruf:
   python picking_neu_step.py <song.wav> <ziel> [--klang eigene|0:28|8:28|…] [--effekt original|warm|fett|…]
@@ -447,7 +448,7 @@ def midi_schreiben(noten, bank, prog, ziel, bpm=120.0):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -456,7 +457,20 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -522,7 +536,14 @@ def main():
                       f"({pb['von_gitarre'] + pn['nachgeprueft_gefunden']} Töne von der Gitarre, "
                       f"{pb['aufgefuellt']} Lücken aus dem Bass, {pb['zusatztoene']} Zusatztöne)")
             else:
-                melde("✔ Keine Picking-Gitarre im Song gefunden – sie wird neu hinzugefügt")
+                melde("✔ Keine Picking-Gitarre im Song gefunden")
+        if a.modus == "auto" and art == "neu":
+            # 17. Nov 2026: Stem-App repariert nur, was im Song ist – keine Picking-Gitarre -> nichts erzeugen
+            bericht = {"art": "keine_picking", "trennung": modell, "erkennung": erk}
+            json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
+            melde("✔ In diesem Song spielt keine Picking-Gitarre – nichts erzeugt")
+            print(json.dumps({"ok": True, "datei": "", "ordner": a.ziel, "art": "keine_picking"}, ensure_ascii=False))
+            return
 
         def lage(b, letzte):                              # b = Basston: Gitarre 1–3 Oktaven höher, C3…E4
             kand = [k for k in (b + 12, b + 24, b + 36) if 47 <= k <= 64] or \
@@ -567,52 +588,17 @@ def main():
         bezug = st["guitar"] if "guitar" in st and st["guitar"].any() else st["bass"]
         y *= akt(bezug) / max(akt(y[:, 1]), 1e-12) * 10 ** ((-8 if bezug is not st["bass"] else -6) / 20) \
             * 10 ** (a.lautstaerke_db / 20)
-        y = _hoer_tor(y, bezug, "gitarre")
+        y = _hoer_tor(y, bezug, "gitarre", song=a.eingabe)
+        y = _pegel(y, bezug, a.eingabe, versatz_db=(-8 if bezug is not st["bass"] else -6))
         if np.abs(y).max() > 0.98:
             y *= 0.98 / np.abs(y).max()
         out = os.path.join(a.ziel, "picking_neu.wav")
         sf.write(out, y, SR, subtype="PCM_24")
-        skank_neu = None
-        if art == "repariert":
-            try:
-                melde("… spiele auch den Skank neu (eigene Akkord-Aufnahmen, „C fett“), damit nichts doppelt klingt")
-                K.SAMPLES = os.path.join(APP, "gitarre_neu", "samples")
-                akk_s, phase_s, _ = K.akkord_plan(beats, st.get("piano", 0) + st.get("other", 0) + 3 * git, st["bass"])
-                sl_s, zt_s, _ = K.skank_stellen(beats, akk_s, phase_s, git)
-                zt_s, _ = K.am_schlagzeug(zt_s, D)
-                wahl = K.griffe_waehlen(K.bibliothek(), git, sl_s, zt_s, akk_s)
-                skank_neu = K.fett(K.spielen(n, sl_s, zt_s, akk_s, wahl))
-                kk = int(2.8 * SR)
-                a0, b0 = int(zt_s[0] * SR), int(zt_s[-1] * SR)
-
-                def tr(x):
-                    return np.array([np.sqrt(np.mean(x[i:i + kk] ** 2)) for i in range(a0, max(a0 + 1, b0 - kk), kk)])
-                skank_neu *= 2.0 * np.percentile(tr(git), 75) / max(np.median(tr(skank_neu.mean(1))), 1e-12)
-                sf.write(os.path.join(a.ziel, "skank_neu.wav"), skank_neu, SR, subtype="PCM_24")
-            except Exception as e:
-                melde(f"… Skank konnte nicht neu gespielt werden ({str(e)[:80]}) – alte Gitarren-Spur bleibt im Song")
-                skank_neu = None
-                art = "repariert_alte_bleibt"
-        rest = None
-        for s_, p_ in spuren.items():
-            if s_ == "guitar" and skank_neu is not None:
-                x = skank_neu
-                rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
-                continue
-            x, _ = lb.load(p_, sr=SR, mono=False)
-            x = np.atleast_2d(x).T
-            if x.shape[1] == 1:
-                x = np.repeat(x, 2, 1)
-            rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
-        L = min(len(rest), len(y))
-        mix = rest[:L] + y[:L]
-        mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
-        sf.write(os.path.join(a.ziel, "song_mit_picking.wav"), mix, SR, subtype="PCM_24")
+        # 17. Nov 2026: Stem-App – nur die eigene Spur (kein neuer Skank, kein „Song mit …“)
         midi = midi_schreiben(noten, bank, prog, a.ziel, a.midi_bpm)
         zeilen = ["Picking-Gitarre – gedämpfte Begleit-Gitarre, spielt die Basslinie eine Oktave höher",
                   {"neu": "Keine Picking-Gitarre im Song gefunden – neu aus der Basslinie gespielt",
-                   "repariert": "Vorhandene Picking-Gitarre erkannt – ihre Töne übernommen; im Song ist die ganze "
-                                "Gitarren-Spur ersetzt (neuer Skank + reparierte Picking-Gitarre)",
+                   "repariert": "Vorhandene Picking-Gitarre erkannt – ihre Töne übernommen und repariert",
                    "repariert_alte_bleibt": "Vorhandene Picking-Gitarre erkannt – ihre Töne übernommen (alte "
                                             "Gitarren-Spur bleibt im Song)"}[art],
                   f"Klang: {KLAENGE[klang]}, Klangfarbe: {EFFEKTE[eff]} (Effekt nur im Audio)",

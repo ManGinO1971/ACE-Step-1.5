@@ -219,7 +219,7 @@ def einsatz(m, a, fenster=0.05):
     return a + int(np.argmax(w > w.max() * 0.1)) if len(w) and w.max() > 0 else a
 
 
-def skank_stellen(beats, akk, phase, git):
+def skank_stellen(beats, akk, phase, git, ergaenzen=None):
     lb = librosa()
     h = hochpass(git)
     hop = 128
@@ -239,6 +239,8 @@ def skank_stellen(beats, akk, phase, git):
     for a, b in zip(idx[:-1], idx[1:]):
         if b - a <= 3:
             aktiv[a:b] = True                  # Lücken bis 2 Takte füllen (Trennung schwach)
+    if ergaenzen is not None:                  # 17. Nov 2026: von der Trennung aufgefressene Takte (Hör-Modell, ganzer Song)
+        aktiv = ergaenzen(aktiv, takte, beats)
     slots = set()
     for k, t in enumerate(takte):
         for i in range(t, min(t + 4, n)):

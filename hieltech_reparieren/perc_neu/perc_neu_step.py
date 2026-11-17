@@ -520,7 +520,7 @@ def neu_spielen(g, wahl, hits, perc, alle_t, L, ton, opt):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -529,7 +529,20 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -619,8 +632,13 @@ def main():
         neu += y
         einzel.append((g, wahl[g], y))
         melde(f"{g}: {len(hits)} Schläge neu ({NAMEN.get(wahl[g], wahl[g])})")
-    neu = _hoer_tor(neu, perc, "percussion")
-    einzel = [(g_, w_, _hoer_tor(y_, perc, "percussion")) for g_, w_, y_ in einzel]
+    neu = _hoer_tor(neu, perc, "percussion", song=opt.song or None)
+    einzel = [(g_, w_, _hoer_tor(y_, perc, "percussion", song=opt.song or None)) for g_, w_, y_ in einzel]
+    _sp0 = float(np.abs(neu).max()) + 1e-12
+    neu = _pegel(neu, perc, opt.song or opt.eingabe)
+    _gp = float(np.abs(neu).max()) / _sp0             # Einzelspuren und „Original behalten“ gleich mitziehen
+    einzel = [(g_, w_, y_ * _gp) for g_, w_, y_ in einzel]
+    rest = rest * _gp
     fak = begrenz_faktor(neu)
     neu = neu * fak[:, None]
     sf.write(os.path.join(opt.ziel, "percussion_neu.wav"), neu, SR, subtype="PCM_24")
@@ -638,13 +656,7 @@ def main():
         melde(f"{spuren_n} Einzelspuren geschrieben")
     melde("Percussion neu geschrieben")
 
-    if opt.song and os.path.exists(opt.song):
-        song = lade_stereo(opt.song)
-        n = min(len(song), L)
-        mix = song[:n] - perc[:n] + neu[:n]
-        mix *= min(1.0, 0.98 / (np.abs(mix).max() + 1e-12))
-        sf.write(os.path.join(opt.ziel, "song_mit_percussion_neu.wav"), mix, SR, subtype="PCM_24")
-        melde("Song mit neuer Percussion geschrieben")
+    # 17. Nov 2026: Stem-App – nur die eigene Spur, kein „Song mit …“ mehr
     midi_und_liste([s for s in S if s["art"] in GRUPPEN], zu, opt, opt.ziel, opt.midi_bpm if opt.midi_bpm > 0 else 120.0)
     bericht = dict(hoer_modell=_HOER.get("hoer_modell", {}), schlaege=len(S), arten=zaehl, stimmen=[librosa.midi_to_note(int(round(t))) for t in ton],
                    wahl=wahl, stimmung=opt.stimmung, nur=opt.nur, mit_analyse=bool(klang_von))

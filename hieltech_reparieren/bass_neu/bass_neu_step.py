@@ -431,7 +431,7 @@ def midi_schreiben(noten, ziel, bpm=120.0):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -440,7 +440,20 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -490,7 +503,8 @@ def main():
         if a.klang_wie_original:
             melde("… gleiche Klang an das Original an")
             y, bericht["eq_korrektur_db"] = klang_angleichen(y, m)
-        y = _hoer_tor(y, m, "bass")
+        y = _hoer_tor(y, m, "bass", song=a.eingabe)
+        y = _pegel(y, m, a.eingabe)
         bericht["hoer_modell"] = _HOER.get("hoer_modell", {})
         spitze = float(np.abs(y).max())
         if spitze > 0.98:

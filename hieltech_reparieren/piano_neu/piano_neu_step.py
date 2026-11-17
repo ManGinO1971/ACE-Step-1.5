@@ -13,7 +13,10 @@ Ablauf:
   4. Neu spielen mit einem Klang aus der SoundFont GeneralUser GS (Flügel, Rhodes, Clavinet, Orgel …),
      eigener SF2-Abspieler (sf2_spieler.py), Lautstärke wie im Original
   5. Ausgabe: piano_neu.wav, piano_neu.mid (Programmwechsel, Anschlag, Haltepedal, Tempo, Takt),
-     Noten-/Akkordliste, bericht.json (+ song_mit_neuem_piano.wav bei ganzem Song)
+     Noten-/Akkordliste, bericht.json – nur die eigene Spur (17. Nov 2026: kein Song-Mix mehr)
+  17. Nov 2026: Das Hör-Modell prüft zuerst, ob und wo ein Piano spielt (Piano-Spur + „Other“). Kein Piano ->
+     nichts erzeugt (art = keine_piano). Versteckt unter Gitarre/Orgel -> Skank auf den Stellen der Gitarre, nur wo
+     das Piano zu hören ist; Zwischentöne und kurze Soli nur dort, wo es in seiner Spur deutlich klingt.
 
 Aufruf:
   python piano_neu_step.py <eingabe> <ziel> [--klang 0] [--ganzer-song] [--timing-korrigieren] [--midi-bpm 120]
@@ -365,21 +368,25 @@ def standard_griff(a, K):
     return g + [g[0] + 12]
 
 
-def skank_plan(st, noten, timing):
+def skank_plan(st, noten, timing, immer=False, da=None, ergaenzen=None):
     """Akkorde aus allen Instrumenten, Skank-Stellen wo Piano ODER Gitarre skankt, Griffe vom Original-Piano,
     zusätzliche erkannte Töne (nicht auf den Skank-Stellen, passend zur Tonart). Rückgabe: Skank-Noten,
-    zusätzliche Noten, Infos – oder None, wenn das Piano keinen Skank spielt (dann exakt nach Noten spielen)."""
+    zusätzliche Noten, Infos – oder None, wenn das Piano keinen Skank spielt (dann exakt nach Noten spielen).
+    17. Nov 2026: da(t) = Piano im Original zu hören (Hör-Modell) – Skank nur dort; immer=True: das Piano ist unter
+    Gitarre/Orgel versteckt (Piano-Spur fast leer), es spielt den Skank auf den Stellen der Gitarre."""
     import skank_kern as K
     pno, git = st["piano"], st.get("guitar", st["piano"] * 0)
     beats = K.taktraster(st["drums"])
     akk, phase, ton = K.akkord_plan(beats, 3 * pno + st.get("other", 0) + git, st["bass"])
-    sl_p, z_p, _ = K.skank_stellen(beats, akk, phase, pno)
+    sl_p, z_p, _ = K.skank_stellen(beats, akk, phase, pno, ergaenzen=ergaenzen)
     d = {}
     if git.any():
         sl_g, z_g, _ = K.skank_stellen(beats, akk, phase, git)
         d = {s: z for s, z in zip(sl_g, z_g)}
     d.update({s: z for s, z in zip(sl_p, z_p)})
     slots = sorted(d)
+    if da is not None:
+        slots = [s_ for s_ in slots if da(d[s_])]
     zeiten = np.array([d[s] for s in slots])
     if len(slots) < 16:
         return None
@@ -387,7 +394,7 @@ def skank_plan(st, noten, timing):
     ans = np.array(sorted({round(a, 2) for a, *_ in noten}))
     if len(ans):
         auf = float(np.mean([np.min(np.abs(zeiten - t)) < 0.07 for t in ans]))
-        if auf < 0.4:
+        if auf < 0.4 and not immer:
             return None
     else:
         auf = 0.0
@@ -444,14 +451,17 @@ def gleichmaessig(y, ref, zeiten, faktor):
     def tr(x):
         return np.array([np.sqrt(np.mean(x[i:i + k] ** 2)) for i in range(a0, max(a0 + 1, b0 - k), k)])
     ist = float(np.median(tr(y.mean(1))))
-    return y * (faktor * float(np.percentile(tr(ref), 75)) / max(ist, 1e-12))
+    soll = faktor * float(np.percentile(tr(ref), 75))
+    if ist < 1e-6 or soll < 1e-6:        # 17. Nov 2026: Piano-Spur fast leer -> Lautstärke macht danach _pegel()
+        return y
+    return y * (soll / ist)
 
 
 # ------------------------------------------------------------ Ablauf
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -460,9 +470,132 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
     except Exception:  # noqa: BLE001
         return y
+
+
+def _ergaenzer(stem, song, gruppe):
+    """17. Nov 2026: aufgefressene Skank-Takte ergänzen (Hör-Modell: Spur + ganzer Song). Ohne Modell: None."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.ergaenzer(stem, song, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – so laut wie das Piano im Original-Song, nie unhörbar, nie lauter."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+PIANO_SCHWELLE = 0.10      # Hör-Modell-Sicherheit (über 2 s geglättet), ab der ein Piano als „zu hören“ gilt
+PIANO_MIN_S = 4.0          # weniger Piano im ganzen Song -> „kein Piano“, nichts wird erzeugt
+
+
+def _laeufe_putzen(b, schritt, min_s=2.0):
+    """Lücken < min_s schließen, Stücke < min_s weglassen (b = bool je Hör-Modell-Schritt)."""
+    b = b.copy()
+    n = max(1, int(round(min_s / schritt)))
+    for wert in (False, True):            # erst Lücken füllen, dann kurze Stücke weg
+        i = 0
+        while i < len(b):
+            if b[i] == wert:
+                j = i
+                while j < len(b) and b[j] == wert:
+                    j += 1
+                kurz = j - i < n
+                innen = 0 < i and j < len(b)          # Lücken nur zwischen zwei Piano-Stellen füllen
+                if kurz and (wert or innen):
+                    b[i:j] = not wert
+                i = j
+            else:
+                i += 1
+    return b
+
+
+def piano_hoeren(m, spuren, song=None):
+    """17. Nov 2026: Spielt im Song überhaupt ein Piano – und wo? Das Hör-Modell hört die getrennte Piano-Spur und
+    (wenn vorhanden) die „Other“-Spur ab: im Reggae ist das Piano oft unter Gitarre und Orgel versteckt und landet
+    bei der Trennung teilweise in „Other“. 17. Nov 2026: zusätzlich der GANZE Song – was die Trennung aufgefressen
+    hat, hört das Modell dort noch und das Piano wird an diesen Stellen ergänzt. Rückgabe None (Modell fehlt) oder dict mit
+    da(t) = Piano irgendwo zu hören, spur(t) = Piano in der Piano-Spur selbst zu hören, info (Sekunden, Sicherheit)."""
+    try:
+        d_ = os.path.dirname(HIER)
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        from scipy.ndimage import uniform_filter1d
+        v = _ht.verlauf(m, SR, "piano")
+        if v is None:
+            return None
+        t, ps = v
+        hs = float(np.median(np.diff(t))) if len(t) > 1 else _ht.SCHRITT_S
+        k = max(1, int(round(2.0 / hs)))
+        ps = uniform_filter1d(ps.astype(float), k)
+        po = np.zeros_like(ps)
+        if spuren and "other" in spuren:
+            import librosa
+            o, _ = librosa.load(spuren["other"], sr=SR, mono=True)
+            vo = _ht.verlauf(o, SR, "piano")
+            if vo is not None:
+                po = np.interp(t, vo[0], uniform_filter1d(vo[1].astype(float), k))
+        pg = np.zeros_like(ps)
+        if song is not None:
+            vg = _ht.verlauf(_ht._mono(song, SR), SR, "piano")
+            if vg is not None:
+                pg = np.interp(t, vg[0], uniform_filter1d(vg[1].astype(float), k))
+        spur = _laeufe_putzen(ps >= PIANO_SCHWELLE, hs)
+        im_song = _laeufe_putzen(pg >= _ht.SONG_SCHWELLE, hs)
+        da = _laeufe_putzen((np.maximum(ps, po) >= PIANO_SCHWELLE) | im_song, hs)
+
+        def frage(b):
+            def f(x):
+                i = int(np.clip(np.searchsorted(t, x), 0, len(t) - 1))
+                if i > 0 and abs(t[i - 1] - x) < abs(t[i] - x):
+                    i -= 1
+                return bool(b[i]) and abs(t[i] - x) <= hs
+            return f
+        bereiche, start = [], None
+        for i, w in enumerate(np.r_[da, False]):
+            if w and start is None:
+                start = i
+            elif not w and start is not None:
+                bereiche.append([round(float(t[start]), 1), round(float(t[min(i, len(t)) - 1]), 1)])
+                start = None
+        info = {"sekunden_gehoert": round(float(da.sum() * hs), 1), "sekunden_piano_spur": round(float(spur.sum() * hs), 1),
+                "sicherheit_piano_spur_p90": round(float(np.percentile(ps, 90)), 3),
+                "sicherheit_other_p90": round(float(np.percentile(po, 90)), 3),
+                "sicherheit_song_p90": round(float(np.percentile(pg, 90)), 3),
+                "aufgefressen_ergaenzt_s": round(float((da & ~spur).sum() * hs), 1), "bereiche": bereiche[:40]}
+        return {"da": frage(da), "spur": frage(spur), "t": t, "da_b": da, "info": info}
+    except Exception as e:  # noqa: BLE001 – ohne Hör-Modell wie bisher
+        _HOER.setdefault("hoer_modell", {})["piano_da"] = {"stand": f"übersprungen ({str(e)[:120]})"}
+        return None
+
+
+def maske_anwenden(y, hoer, blende_s=0.3):
+    """Neue Spur nur dort, wo das Piano im Original zu hören ist (weiche Ein-/Ausblende)."""
+    from scipy.ndimage import uniform_filter1d
+    n = len(y)
+    g = np.zeros(n, np.float32)
+    t, b = hoer["t"], hoer["da_b"]
+    h = (float(np.median(np.diff(t))) if len(t) > 1 else 0.5) / 2
+    for ti, w in zip(t, b):
+        if w:
+            g[int(max(0.0, ti - h) * SR):int(min(n / SR, ti + h) * SR)] = 1.0
+    g = uniform_filter1d(g, max(1, int(blende_s * SR)))
+    return y * (g[:, None] if y.ndim == 2 else g)
 
 
 def main():
@@ -498,12 +631,30 @@ def main():
                 raise RuntimeError("Trennung lieferte keine Piano-Spur")
             piano = spuren["piano"]
         m, _ = librosa.load(piano, sr=SR, mono=True)
+        # 17. Nov 2026: nur reparieren, was im Song ist – Hör-Modell prüft, ob und wo ein Piano spielt
+        melde("… höre, ob und wo im Song ein Piano spielt")
+        hoer = piano_hoeren(m, spuren, a.eingabe if spuren else None)
+        if hoer is not None:
+            _HOER.setdefault("hoer_modell", {})["piano_da"] = hoer["info"]
+            if hoer["info"]["sekunden_gehoert"] < PIANO_MIN_S:
+                bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "art": "keine_piano"}
+                json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
+                import shutil
+                shutil.rmtree(os.path.join(a.ziel, "spuren_roh"), ignore_errors=True)
+                melde("✔ In diesem Song spielt kein Piano – nichts erzeugt")
+                print(json.dumps({"ok": True, "datei": "", "ordner": a.ziel, "art": "keine_piano"}, ensure_ascii=False))
+                return
+            melde(f"✔ Piano zu hören: {hoer['info']['sekunden_gehoert']:.0f} s "
+                  f"(davon {hoer['info']['sekunden_piano_spur']:.0f} s deutlich in der Piano-Spur)")
+        versteckt = hoer is not None and hoer["info"]["sekunden_piano_spur"] < 0.5 * hoer["info"]["sekunden_gehoert"]
         melde("… erkenne die Noten (mehrstimmig)")
         if a.noten_midi:
             noten, pedal, verfahren = midi_lesen(a.noten_midi), [], "MIDI-Datei (Test)"
         else:
             noten, pedal, verfahren = noten_erkennen(piano, a.ziel, a.modelle)
         noten = [n for n in noten if 21 <= n[2] <= 108 and n[1] > n[0]]
+        if hoer is not None:      # nur Töne, wo das Piano in seiner Spur wirklich zu hören ist (keine Reste anderer)
+            noten = [n for n in noten if hoer["spur"](n[0])]
         melde(f"✔ {len(noten)} Noten erkannt ({verfahren})")
         noten, feinzeit = anschlaege_verfeinern(noten, m)
         melde(f"✔ Anschläge auf die Spur ausgerichtet ({feinzeit['verfeinert']} von {feinzeit['anschlaege']})")
@@ -515,7 +666,9 @@ def main():
             st = {s: librosa.load(p_, sr=SR, mono=True)[0].astype(np.float64) for s, p_ in spuren.items() if s != "vocals"}
             nn = min(len(v) for v in st.values())
             st = {s: v[:nn] for s, v in st.items()}
-            erg = skank_plan(st, noten, a.timing_korrigieren)
+            erg = skank_plan(st, noten, a.timing_korrigieren, immer=versteckt,
+                             da=hoer["da"] if hoer is not None else None,
+                             ergaenzen=_ergaenzer(m, a.eingabe, "piano"))
             if erg is None:
                 melde("… das Piano spielt hier keinen Skank – spiele die erkannten Noten genau nach")
             else:
@@ -532,6 +685,14 @@ def main():
                 noten = sorted(sk + [(x[0], x[1], x[2], x[3]) for x in pedal_anwenden(extra, pedal)])
                 pedal = []          # Skank ohne Haltepedal (im MIDI schon in die Notenlängen eingerechnet)
                 timing = {"am_schlagzeug": skank["am_schlagzeug"]} if a.timing_korrigieren else None
+        if skank is None and not noten:
+            bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "art": "keine_piano"}
+            json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
+            import shutil
+            shutil.rmtree(os.path.join(a.ziel, "spuren_roh"), ignore_errors=True)
+            melde("✔ Kein Piano-Ton sicher erkannt – nichts erzeugt")
+            print(json.dumps({"ok": True, "datei": "", "ordner": a.ziel, "art": "keine_piano"}, ensure_ascii=False))
+            return
         if skank is None:
             if a.timing_korrigieren and noten:
                 noten, timing = timing_korrigieren(noten, m)
@@ -545,24 +706,17 @@ def main():
             aktiv = np.abs(m) > np.abs(m).max() * 0.01
             g = rms(m[aktiv]) / rms(y.mean(1)[aktiv[:len(y)]]) if aktiv.any() else 1.0
             y *= g * 10 ** (a.lautstaerke_db / 20)
-        y = _hoer_tor(y, m, "piano")
+        if hoer is not None:      # nur wo das Piano im Original zu hören ist
+            y = maske_anwenden(y, hoer)
+        else:
+            y = _hoer_tor(y, m, "piano", song=a.eingabe if spuren else None)
+        # Lautstärke wie das Piano im Original-Song; ist es in der Piano-Spur kaum drin (versteckt), nach dem Song
+        y = _pegel(y, None if versteckt else m, a.eingabe)
         spitze = float(np.abs(y).max())
         if spitze > 0.98:
             y *= 0.98 / spitze
-        out = os.path.join(a.ziel, "piano_neu.wav")
+        out = os.path.join(a.ziel, "piano_neu.wav")      # 17. Nov 2026: nur die eigene Spur (kein Song-Mix)
         sf.write(out, y, SR, subtype="PCM_24")
-        if spuren:
-            rest = None
-            for s_, p_ in spuren.items():
-                if s_ == "piano":
-                    continue
-                x, _ = librosa.load(p_, sr=SR, mono=False)
-                x = np.atleast_2d(x).T
-                rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
-            n = min(len(rest), len(y))
-            mix = rest[:n] + y[:n]
-            mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
-            sf.write(os.path.join(a.ziel, "song_mit_neuem_piano.wav"), mix, SR, subtype="PCM_24")
         midi = midi_schreiben(noten, pedal, a.klang, a.ziel, a.midi_bpm)
         from collections import Counter
         c = Counter(p for _, _, p, _ in noten)
@@ -580,7 +734,8 @@ def main():
             zeilen += akkord_liste(noten, len(m) / SR)
         with open(os.path.join(a.ziel, "piano_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(zeilen) + "\n")
-        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "verfahren": verfahren, "noten": len(noten), "anschlaege_ausgerichtet": feinzeit, "pedal": len(pedal), "klang": klang,
+        bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "art": "repariert", "piano_versteckt": versteckt,
+                   "verfahren": verfahren, "noten": len(noten), "anschlaege_ausgerichtet": feinzeit, "pedal": len(pedal), "klang": klang,
                    "programm": a.klang, "timing": timing, "skank": skank, "midi": midi}
         json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
         import shutil

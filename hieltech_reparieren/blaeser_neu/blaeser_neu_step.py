@@ -12,7 +12,7 @@ Ablauf:
   4. Neu gespielt: Bläsersatz (Trompete + Tenorsax + Posaune eine Oktave tiefer, Mittelstimmen Altsax/Posaune)
      oder ein einzelnes Instrument oder Melodica; Lautstärke je Ton wie im Original, Oberstimme folgt der Kurve
   5. Klangfarbe ans Original angeglichen, etwas Sättigung und Raum, Pegel wie das Original
-  6. Ausgabe: blaeser_neu.wav, song_mit_blaesern_neu.wav, blaeser_neu.mid (Spur je Instrument, Pitch-Bend),
+  6. Ausgabe: blaeser_neu.wav (nur die eigene Spur), blaeser_neu.mid (Spur je Instrument, Pitch-Bend),
      Notenliste
 
 Aufruf:
@@ -325,7 +325,7 @@ def midi_schreiben(rollen, ziel, bpm=120.0):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -334,7 +334,20 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -486,8 +499,11 @@ def main():
         if np.abs(mix).max() * fak > 0.98:
             fak = 0.98 / np.abs(mix).max()
         mix *= fak
-        mix = _hoer_tor(mix, yr, "blaeser")
-        einzel = {k_: _hoer_tor(v_, yr, "blaeser") for k_, v_ in einzel.items()}
+        mix = _hoer_tor(mix, yr, "blaeser", song=a.song or a.eingabe)
+        einzel = {k_: _hoer_tor(v_, yr, "blaeser", song=a.song or a.eingabe) for k_, v_ in einzel.items()}
+        _sp0 = float(np.abs(mix).max()) + 1e-12
+        mix = _pegel(mix, yr, a.song or a.eingabe)
+        fak *= float(np.abs(mix).max()) / _sp0          # Einzelspuren gleich mitziehen (Summe = blaeser_neu.wav)
         out = os.path.join(a.ziel, "blaeser_neu.wav")
         sf.write(out, mix, SR, subtype="PCM_24")
         # jedes Instrument in seiner eigenen Spur (direkt so gespielt, nicht nachträglich getrennt)
@@ -496,12 +512,7 @@ def main():
             os.makedirs(eo, exist_ok=True)
             for nr, ins in enumerate([k for k in ("tp", "ts", "as", "tb", "me") if k in einzel], 1):
                 sf.write(os.path.join(eo, f"{nr}_{SPURNAME[ins]}.wav"), einzel[ins] * fak, SR, subtype="PCM_24")
-        if a.song:
-            song = stereo(L_.load(a.song, sr=SR, mono=False)[0])
-            n = min(len(song), L)
-            neu = song[:n] - raw[:n] + mix[:n]
-            neu *= min(1.0, 0.98 / max(np.abs(neu).max(), 1e-12))
-            sf.write(os.path.join(a.ziel, "song_mit_blaesern_neu.wav"), neu, SR, subtype="PCM_24")
+        # 17. Nov 2026: Stem-App – nur die eigene Spur, kein „Song mit …“ mehr
         midi = midi_schreiben(rollen, a.ziel, a.midi_bpm)
         txt = [f"Bläser / Melodica – neu gespielt: {KLAENGE[klang]}",
                f"MIDI-Datei mit {a.midi_bpm:g} BPM: Logic-Projekt auf {a.midi_bpm:g} BPM stellen.",

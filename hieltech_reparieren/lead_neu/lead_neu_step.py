@@ -13,8 +13,8 @@ Ablauf:
      Lautstärke-Verlauf wie das Original; Klang: eigene Clean-Töne oder Gitarren aus GeneralUser GS
   5. Klangfarbe/Effekt (wie Picking + Overdrive)
   6. Alte Lead-Gitarre wird über ihre Obertöne (entlang der Kurve) aus der Gitarren-Spur genommen,
-     Skank/Picking bleiben; Song = übrige Spuren + Gitarre ohne Lead + neue Lead-Gitarre
-  7. Ausgabe: lead_neu.wav, gitarre_ohne_lead.wav, song_mit_lead_neu.wav, MIDI (mit Pitch-Bend), Notenliste
+     Skank/Picking bleiben; (17. Nov 2026: kein Song-Mix mehr – Stem-App)
+  7. Ausgabe: lead_neu.wav (nur die eigene Spur), gitarre_ohne_lead.wav, MIDI (mit Pitch-Bend), Notenliste
 
 Aufruf:
   python lead_neu_step.py <song.wav> <ziel> [--klang eigene|0:27|…] [--effekt original|overdrive|…]
@@ -336,7 +336,7 @@ def stereo(x):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -345,7 +345,20 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -424,21 +437,14 @@ def main():
         st *= np.sqrt(np.mean(git[maske] ** 2)) / (np.sqrt(np.mean(st.mean(1)[maske] ** 2)) + 1e-12)
         melde("… nehme die alte Lead-Gitarre aus der Gitarren-Spur (Skank bleibt)")
         ohne = lead_entfernen(git_st, f0, noten)
-        st = _hoer_tor(st[:L], git, "gitarre")
+        st = _hoer_tor(st[:L], git, "gitarre", song=a.eingabe)
+        st = _pegel(st, git, a.eingabe)
         if np.abs(st).max() > 0.98:
             st *= 0.98 / np.abs(st).max()
         out = os.path.join(a.ziel, "lead_neu.wav")
         sf.write(out, st, SR, subtype="PCM_24")
         sf.write(os.path.join(a.ziel, "gitarre_ohne_lead.wav"), ohne, SR, subtype="PCM_24")
-        if not a.nur_gitarre:
-            rest = None
-            for s_, p_ in spuren.items():
-                x = ohne if s_ == "guitar" else stereo(L_.load(p_, sr=SR, mono=False)[0])
-                rest = x if rest is None else rest[:min(len(rest), len(x))] + x[:min(len(rest), len(x))]
-            n = min(len(rest), len(st))
-            mix = rest[:n] + st[:n]
-            mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
-            sf.write(os.path.join(a.ziel, "song_mit_lead_neu.wav"), mix, SR, subtype="PCM_24")
+        # 17. Nov 2026: Stem-App – nur die eigene Spur (Lead-Gitarre allein), kein „Song mit …“ mehr
         rms = L_.feature.rms(y=git, frame_length=1024, hop_length=HOP)[0]
         midi, zeilen = midi_schreiben(phrasen, f0, rms / (np.percentile(rms, 99) + 1e-12), bank, prog, a.ziel, a.midi_bpm)
         txt = ["Lead-Gitarre – Melodie-Gitarre (Fills, Melodien, Soli) neu gespielt mit der Tonhöhen-Kurve des Originals",

@@ -15,7 +15,7 @@ Eingabe: der GANZE Song (Piano, Bass und Schlagzeug werden gebraucht). Ablauf:
   5. Timing: echter Anschlag der Gitarre; mit --timing-korrigieren genau auf den Schlagzeug-Schlag
   6. Neu spielen mit den eigenen Akkord-Aufnahmen (samples/), feste Griffposition je Akkord, gleichmäßige
      Lautstärke, „C fett“-Ton (EQ wie klassische Reggae-Skanks, Kompression, kurzer Raum, Stereo-Doppelung)
-  7. Ausgabe: gitarre_neu.wav, song_mit_neuer_gitarre.wav, gitarre_neu.mid, Akkord-Plan, bericht.json
+  7. Ausgabe: gitarre_neu.wav (nur die eigene Spur), gitarre_neu.mid, Akkord-Plan, bericht.json
 
 Aufruf:
   python gitarre_neu_step.py <song.wav> <ausgabe_ordner> [--timing-korrigieren] [--midi-bpm 120]
@@ -251,7 +251,7 @@ def einsatz(m, a, fenster=0.05):
     return a + int(np.argmax(w > w.max() * 0.1)) if len(w) and w.max() > 0 else a
 
 
-def skank_stellen(beats, akk, phase, git, muster="einfach"):
+def skank_stellen(beats, akk, phase, git, muster="einfach", ergaenzen=None):
     lb = librosa()
     h = hochpass(git)
     hop = 128
@@ -275,6 +275,8 @@ def skank_stellen(beats, akk, phase, git, muster="einfach"):
     for a, b in zip(idx[:-1], idx[1:]):
         if b - a <= 3:
             aktiv[a:b] = True                  # Lücken bis 2 Takte füllen (Trennung schwach)
+    if ergaenzen is not None:                  # 17. Nov 2026: von der Trennung aufgefressene Takte (Hör-Modell, ganzer Song)
+        aktiv = ergaenzen(aktiv, takte, beats)
     # Rhythmus-Schlag: fest gewählt oder automatisch wie im Original
     gewaehlt = muster
     akt_beats = [i for k, t in enumerate(takte) if aktiv[k] for i in range(t, min(t + 4, n)) if akk[i] is not None]
@@ -581,7 +583,7 @@ def plan_schreiben(beats, akk, phase, ton, ziel, bpm_song, bpm_midi, wahl):
 _HOER = {}
 
 
-def _hoer_tor(y, ref, gruppe):
+def _hoer_tor(y, ref, gruppe, song=None):
     """14. Nov 2026: Hör-Modell (wie bei der Erkennung) – die neue Spur spielt nur dort, wo das Instrument im Original
     zu hören ist; lange Pausen, in denen nur Reste der Trennung liegen, bleiben still. Jede Spur wird pro Song nur
     einmal abgehört (Zwischenspeicher). Ohne Modell bleibt alles unverändert."""
@@ -590,7 +592,32 @@ def _hoer_tor(y, ref, gruppe):
         if d_ not in sys.path:
             sys.path.insert(0, d_)
         import hoer_tor as _ht
-        return _ht.tor(y, ref, SR, gruppe, _HOER)
+        return _ht.tor(y, ref, SR, gruppe, _HOER, song=song)
+    except Exception:  # noqa: BLE001
+        return y
+
+
+def _ergaenzer(stem, song, gruppe):
+    """17. Nov 2026: aufgefressene Skank-Takte ergänzen (Hör-Modell: Spur + ganzer Song). Ohne Modell: None."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.ergaenzer(stem, song, SR, gruppe, _HOER)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pegel(y, ref, song, versatz_db=0.0):
+    """17. Nov 2026: Lautstärke-Sicherung – die neue Spur so laut wie das Instrument im Original-Song, nie unhörbar,
+    nie lauter (Ersatz nach dem Song, wenn die Trennung das Instrument verloren hat). Ohne hoer_tor: unverändert."""
+    try:
+        d_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if d_ not in sys.path:
+            sys.path.insert(0, d_)
+        import hoer_tor as _ht
+        return _ht.pegel(y, ref, song, SR, _HOER, versatz_db=versatz_db)
     except Exception:  # noqa: BLE001
         return y
 
@@ -628,7 +655,8 @@ def main():
         akk, phase, ton = akkord_plan(beats, harm, st["bass"])
         melde(f"✔ Tonart {NAMEN[ton[0]]}-{ton[1]}, {len(beats)} Schläge")
         melde("… Skank-Stellen")
-        slots, zeiten, info = skank_stellen(beats, akk, phase, git, a.muster)
+        slots, zeiten, info = skank_stellen(beats, akk, phase, git, a.muster,
+                                            ergaenzen=_ergaenzer(git, a.eingabe, "gitarre"))
         if a.muster == "auto":
             melde(f"✔ Rhythmus-Schlag automatisch: {MUSTER_NAMEN.get(info['muster_erkannt'], 'wie im Original')} "
                   f"({', '.join(f'{v}× {k}' for k, v in info['schlaege'].items())})")
@@ -652,18 +680,13 @@ def main():
         ziel_rms = np.percentile(takt_rms(git), 75)
         ist = np.median(takt_rms(y.mean(1)))
         y *= 2.0 * ziel_rms / max(ist, 1e-12) * 10 ** (a.lautstaerke_db / 20)
-        rest = sum(v for s, v in st.items() if s != "guitar")
-        if "vocals" in sp:
-            rest = rest + lade_mono(sp["vocals"])[:n]
-        y = _hoer_tor(y, git, "gitarre")
+        y = _hoer_tor(y, git, "gitarre", song=a.eingabe)
+        y = _pegel(y, git, a.eingabe)
         s_max = max(np.abs(y).max(), 1e-12)
         if s_max > 0.98:
             y *= 0.98 / s_max
-        mix = np.stack([rest, rest], 1) + y
-        mix *= min(1.0, 0.98 / max(np.abs(mix).max(), 1e-12))
-        out = os.path.join(a.ziel, "gitarre_neu.wav")
+        out = os.path.join(a.ziel, "gitarre_neu.wav")      # 17. Nov 2026: nur die eigene Spur (kein Song-Mix)
         sf.write(out, y, SR, subtype="PCM_24")
-        sf.write(os.path.join(a.ziel, "song_mit_neuer_gitarre.wav"), mix, SR, subtype="PCM_24")
         bpm_song = 60.0 / float(np.median(np.diff(beats)))
         plan_schreiben(beats, akk, phase, ton, a.ziel, bpm_song, a.midi_bpm, wahl)
         bericht = {"hoer_modell": _HOER.get("hoer_modell", {}), "trennung": modell, "tonart": f"{NAMEN[ton[0]]}-{ton[1]}", "tempo_bpm": round(bpm_song, 2),
