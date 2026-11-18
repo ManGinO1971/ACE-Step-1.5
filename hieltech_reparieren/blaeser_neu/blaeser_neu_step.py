@@ -12,8 +12,8 @@ Ablauf:
   4. Neu gespielt: Bläsersatz (Trompete + Tenorsax + Posaune eine Oktave tiefer, Mittelstimmen Altsax/Posaune)
      oder ein einzelnes Instrument oder Melodica; Lautstärke je Ton wie im Original, Oberstimme folgt der Kurve
   5. Klangfarbe ans Original angeglichen, etwas Sättigung und Raum, Pegel wie das Original
-  6. Ausgabe: blaeser_neu.wav, song_mit_blaesern_neu.wav, blaeser_neu.mid (Spur je Instrument, Pitch-Bend),
-     Notenliste
+  6. Ausgabe: blaeser_neu.wav (ein Instrument) bzw. beim Bläsersatz je Instrument eine eigene Spur im Ordner
+     Einzelspuren (keine Sammelspur, kein Song-Mix – 18. Nov 2026), blaeser_neu.mid (Spur je Instrument), Notenliste
 
 Aufruf:
   python blaeser_neu_step.py <blaeser.wav> <ziel> [--song song.wav] [--klang satz|trompete|altsax|tenorsax|posaune|melodica]
@@ -489,19 +489,17 @@ def main():
         mix = _hoer_tor(mix, yr, "blaeser")
         einzel = {k_: _hoer_tor(v_, yr, "blaeser") for k_, v_ in einzel.items()}
         out = os.path.join(a.ziel, "blaeser_neu.wav")
-        sf.write(out, mix, SR, subtype="PCM_24")
+        # 18. Nov 2026: nie mehrere Bläser zusammen in einer Spur – bei einem einzelnen Instrument genau diese eine
+        # Spur, beim Bläsersatz je Instrument eine eigene Spur (Einzelspuren), keine Sammelspur
+        if len(einzel) <= 1:
+            sf.write(out, mix, SR, subtype="PCM_24")
         # jedes Instrument in seiner eigenen Spur (direkt so gespielt, nicht nachträglich getrennt)
         if len(einzel) > 1:
             eo = os.path.join(a.ziel, "Einzelspuren")
             os.makedirs(eo, exist_ok=True)
             for nr, ins in enumerate([k for k in ("tp", "ts", "as", "tb", "me") if k in einzel], 1):
                 sf.write(os.path.join(eo, f"{nr}_{SPURNAME[ins]}.wav"), einzel[ins] * fak, SR, subtype="PCM_24")
-        if a.song:
-            song = stereo(L_.load(a.song, sr=SR, mono=False)[0])
-            n = min(len(song), L)
-            neu = song[:n] - raw[:n] + mix[:n]
-            neu *= min(1.0, 0.98 / max(np.abs(neu).max(), 1e-12))
-            sf.write(os.path.join(a.ziel, "song_mit_blaesern_neu.wav"), neu, SR, subtype="PCM_24")
+        # 18. Nov 2026: kein „Song mit neuen Bläsern“ mehr – nur die Bläser-Spur(en)
         midi = midi_schreiben(rollen, a.ziel, a.midi_bpm)
         txt = [f"Bläser / Melodica – neu gespielt: {KLAENGE[klang]}",
                f"MIDI-Datei mit {a.midi_bpm:g} BPM: Logic-Projekt auf {a.midi_bpm:g} BPM stellen.",
