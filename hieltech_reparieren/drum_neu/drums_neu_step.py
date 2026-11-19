@@ -23,6 +23,13 @@ Aufruf:
         [--timing-korrigieren]      Timing-Wackeln entfernen (Raster aus der Spur selbst)
         [--midi-bpm 120]            Tempo der MIDI-Datei (Standard 120 wie ein neues Logic-Projekt)
         [--modelle ORDNER]          Modell-Ordner für audio-separator
+        [--s53-toms/--s53-snare/--s53-congas/--s53-percussion/--s53-hh DATEI]
+                                    18. Nov 2026: 53er-Spuren des ganzen Songs – Trommeln werden damit aus Toms und
+                                    Snare abgezogen, bevor gespielt wird (siehe trommeln_abziehen); die Haupt-Snare
+                                    des Songs bleibt dabei geschützt (snare_schutz.py)
+  19. Nov 2026 (Hörtests Rise Up + 4 Songs): beim ganzen Schlagzeug danach der Feinschliff (drum_feinschliff.py):
+        Hi-Hat-Muster des Songs gleich laut, eine Snare + hohe Snare/Fills, ein Kick-Klang, Toms und Becken in der
+        richtigen Lautstärke. Ohne 53er-Spuren (Eingabe = Drum-Spur) läuft nur, was ohne sie geht.
 Ausgabe auf stdout (letzte Zeile): JSON {"ok": true, "datei": ..., ...}
 """
 import argparse
@@ -168,6 +175,93 @@ def trennen(eingabe, ziel, modelle):
     import shutil
     shutil.rmtree(roh, ignore_errors=True)          # große Zwischen-WAVs der Trennung nicht aufheben
     return teile_dir
+
+
+# ---------------------------------------------- 18. Nov 2026: Trommeln abziehen (53er-Modell entscheidet)
+def _stereo_lesen(pfad, n=None):
+    x, s = sf.read(pfad, always_2d=True)
+    if s != SR:
+        import librosa
+        x = librosa.resample(x.T.astype(np.float32), orig_sr=s, target_sr=SR).T
+    if x.shape[1] == 1:
+        x = np.repeat(x, 2, 1)
+    x = x[:, :2].astype(np.float32)
+    if n is not None:
+        x = x[:n] if len(x) >= n else np.pad(x, ((0, n - len(x)), (0, 0)))
+    return x
+
+
+def trommeln_abziehen(teile_dir, ziel, s53, bericht):
+    """Die Schlagzeug-Teilung (DrumSep) kennt nur Schlagzeug: Djembe, Conga, Bongo … landen bei Toms oder Snare und
+    werden dann als Tom nachgespielt. Das 53er-Modell kennt Toms und Snare UND Congas/Percussion als eigene
+    Instrumente. Darum wird hier jeder Klanganteil (Zeit × Frequenz) der Toms- und der Snare-Spur dem Instrument
+    zugeordnet, dem er laut 53er gehört (Wiener-Verteilung wie bei der 53er-Fassung 2):
+        Anteil fürs Schlagzeug = |Tom/Snare (53er)|² / (|Tom/Snare (53er)|² + |Congas + Percussion (53er)|²)
+    Wo beide 53er-Spuren still sind, bleibt die Schlagzeug-Spur unverändert (kein Ratespiel). Kick, Hi-Hat und Becken
+    bleiben unberührt. Ergebnis: neuer Teile-Ordner „teile_ohne_trommeln“ (Original-Teile bleiben erhalten)."""
+    import shutil
+    from scipy.ndimage import uniform_filter
+    from scipy.signal import stft, istft
+    trommel = [p for p in (s53.get("congas"), s53.get("percussion")) if p and os.path.exists(p)]
+    if not trommel:
+        return teile_dir
+    neu_dir = os.path.join(ziel, "teile_ohne_trommeln")
+    os.makedirs(neu_dir, exist_ok=True)
+    for f in os.listdir(teile_dir):
+        if f.endswith(".flac"):
+            shutil.copy2(os.path.join(teile_dir, f), os.path.join(neu_dir, f))
+    info = {"trommel_spuren": [os.path.basename(p) for p in trommel]}
+    N, H = 2048, 512
+    for teil in ("toms", "snare"):
+        bez = s53.get(teil)
+        pfad = os.path.join(teile_dir, teil + ".flac")
+        if not (bez and os.path.exists(bez) and os.path.exists(pfad)):
+            info[teil] = "keine 53er-Spur – unverändert"
+            continue
+        x = _stereo_lesen(pfad)
+        n = len(x)
+        tr = sum(_stereo_lesen(p, n) for p in trommel).mean(1)
+        b = _stereo_lesen(bez, n).mean(1)
+        _, _, B = stft(b, SR, nperseg=N, noverlap=N - H)
+        _, _, T = stft(tr, SR, nperseg=N, noverlap=N - H)
+        pb, pt = np.abs(B) ** 2, np.abs(T) ** 2
+        eps = 1e-3 * float(np.mean(pb + pt)) + 1e-12      # wo beide 53er-Spuren still sind: Maske ≈ 1
+        m = (pb + eps) / (pb + pt + eps)
+        m = np.clip(uniform_filter(m, size=(3, 3)), 0.02, 1.0)
+        aus = np.zeros_like(x)
+        for k in range(2):
+            _, _, X = stft(x[:, k], SR, nperseg=N, noverlap=N - H)
+            _, y = istft(X * m[:, :X.shape[1]], SR, nperseg=N, noverlap=N - H)
+            aus[:, k] = y[:n] if len(y) >= n else np.pad(y, (0, n - len(y)))
+        # Schritt 2 (18. Nov, Hörtest: Trommeln nur leiser, nicht weg): jeden Schlag einzeln entscheiden. Hört das
+        # 53er-Modell an der Stelle deutlich mehr Trommel als Snare/Tom (≥ 6 dB), fliegt der GANZE Schlag raus.
+        import librosa
+        hop = 256
+        on = librosa.onset.onset_detect(y=x.mean(1), sr=SR, hop_length=hop, backtrack=True, units="samples")
+        def _db(v, i):
+            w = v[i:i + int(0.06 * SR)]
+            return 20 * np.log10(np.sqrt(np.mean(w ** 2)) + 1e-9) if len(w) else -120.0
+        raus_schlaege = []
+        for k_, i in enumerate(on):
+            if _db(tr, i) - _db(b, i) >= 6.0 and _db(x.mean(1), i) > -60:
+                e_ = on[k_ + 1] if k_ + 1 < len(on) else n
+                e_ = min(e_, i + int(0.45 * SR))
+                a_ = max(0, i - int(0.01 * SR))
+                f_ = int(0.005 * SR)
+                g = np.ones(n, np.float32)
+                g[a_:e_] = 0.0
+                g[max(0, a_ - f_):a_] = np.linspace(1, 0, a_ - max(0, a_ - f_))
+                g[e_:min(n, e_ + f_)] = np.linspace(0, 1, min(n, e_ + f_) - e_)
+                aus *= g[:, None]
+                raus_schlaege.append(round(i / SR, 2))
+        raus = x - aus
+        e_vor = float(np.sum(x ** 2)) + 1e-12
+        info[teil] = {"entfernt_prozent": round(100 * float(np.sum(raus ** 2)) / e_vor, 1),
+                      "schlaege_raus": len(raus_schlaege), "zeiten": raus_schlaege[:200]}
+        sf.write(os.path.join(neu_dir, teil + ".flac"), aus, SR, subtype="PCM_24")
+        sf.write(os.path.join(ziel, f"trommeln_aus_{teil}.flac"), raus, SR, subtype="PCM_24")   # zum Gegenhören
+    bericht["trommeln_abgezogen"] = info
+    return neu_dir
 
 
 # ---------------------------------------------- optional: gestimmte Fremd-Trommel
@@ -982,6 +1076,8 @@ def main():
     ap.add_argument("--midi-bpm", type=float, default=120.0,
                     help="Tempo der MIDI-Datei (Standard 120 = neues Logic-Projekt; echtes Song-Tempo für richtiges Raster)")
     ap.add_argument("--modelle", default=os.path.expanduser("~/HELTECH_Stems/models/"))
+    for _t in ("toms", "snare", "congas", "percussion", "hh"):  # 18./19. Nov 2026: 53er-Spuren (Trommeln, Feinschliff)
+        ap.add_argument(f"--s53-{_t}", default=None)
     a = ap.parse_args()
     os.makedirs(a.ziel, exist_ok=True)
     try:
@@ -990,6 +1086,31 @@ def main():
         else:
             melde("… trenne Schlagzeug in Kick/Snare/Toms/Hi-Hat/Becken (dauert einige Minuten)")
             teile_dir = trennen(a.eingabe, a.ziel, a.modelle)
+        trommel_info = {}
+        s53 = {t: getattr(a, f"s53_{t}") for t in ("toms", "snare", "congas", "percussion", "hh")}
+        if not a.nur and (s53["congas"] or s53["percussion"]):
+            melde("… ziehe Trommeln (Congas/Percussion, 53er-Modell) aus Toms und Snare ab")
+            try:
+                roh_teile = teile_dir
+                teile_dir = trommeln_abziehen(teile_dir, a.ziel, s53, trommel_info)
+                t_ = trommel_info.get("trommeln_abgezogen", {})
+                melde("✔ Trommeln abgezogen – " + ", ".join(
+                    f"{k}: {v['entfernt_prozent']} % Klang entfernt" for k, v in t_.items() if isinstance(v, dict)))
+                # 18. Nov 2026 (Mehr-Song-Test): das 53er hört die echte Snare oft als „Percussion“ – die Haupt-Snare
+                # des Songs (regelmäßig auf dem Backbeat, eigener Klang) wird nie entfernt, sondern zurückgeholt
+                if teile_dir != roh_teile and os.path.exists(os.path.join(roh_teile, "snare.flac")):
+                    try:
+                        import snare_schutz
+                        sch = snare_schutz.wiederherstellen(os.path.join(roh_teile, "snare.flac"),
+                                                            os.path.join(teile_dir, "snare.flac"), a.eingabe)
+                        trommel_info.setdefault("trommeln_abgezogen", {})["snare_schutz"] = sch
+                        melde(f"✔ Haupt-Snare geschützt ({sch['haupt_snare_geschuetzt']} Schläge, "
+                              f"{sch['zurueckgeholt']} zurückgeholt)")
+                    except Exception as e:  # noqa: BLE001
+                        melde(f"… Haupt-Snare-Schutz übersprungen ({str(e)[:150]})")
+            except Exception as e:  # noqa: BLE001 – nie an diesem Zusatzschritt scheitern
+                melde(f"… Trommeln abziehen übersprungen ({str(e)[:150]})")
+                trommel_info = {"trommeln_abgezogen": {"fehler": str(e)[:200]}}
         weg = json.load(open(a.weg_json)) if a.weg_json else None
         info_fremd = None
         if a.fremd_trommel and not weg:
@@ -1000,6 +1121,31 @@ def main():
                                    vergleich=a.vergleich)
         if info_fremd:
             bericht["fremd_trommel"] = info_fremd
+        if not a.nur:                              # 19. Nov 2026: Feinschliff fürs ganze Schlagzeug
+            try:
+                import drum_feinschliff as fs
+                neu, fb = fs.feinschliff(a.eingabe, teile_dir, a.ziel, s53.get("snare"), s53.get("hh"), melde=melde)
+                for t, y in neu.items():
+                    sf.write(os.path.join(a.ziel, f"{t}_neu.flac"), np.clip(y, -1, 1), SR, subtype="PCM_24")
+                n_ = min(len(y) for y in neu.values())
+                mix = _begrenzen(sum(y[:n_, :2] for y in neu.values()))
+                sf.write(out, mix, SR, subtype="PCM_24")
+                bericht["feinschliff"] = fb
+                melde("✔ Feinschliff fertig (Hi-Hat-Muster, Snare, Kick, Toms, Becken)")
+            except Exception as e:  # noqa: BLE001 – dann bleibt die bisherige Reparatur
+                import traceback
+                traceback.print_exc()
+                bericht["feinschliff"] = {"fehler": str(e)[:300]}
+                melde(f"… Feinschliff übersprungen – bisherige Reparatur bleibt ({str(e)[:150]})")
+        if os.path.normpath(str(teile_dir)) == os.path.normpath(os.path.join(a.ziel, "teile_ohne_trommeln")):  # nur selbst erzeugte Zwischen-Teile löschen
+            import shutil
+            shutil.rmtree(teile_dir, ignore_errors=True)
+        if trommel_info or "feinschliff" in bericht:
+            bericht.update(trommel_info)
+            try:                                   # Bericht mit den neuen Einträgen erneut schreiben
+                json.dump(bericht, open(os.path.join(a.ziel, "bericht.json"), "w"), indent=1, ensure_ascii=False)
+            except OSError:
+                pass
         print(json.dumps({"ok": True, "datei": out, "ordner": a.ziel,
                           "schlaege": bericht.get("schlaege"), "hihat": bericht.get("hihat_lautstaerke")},
                          ensure_ascii=False))
