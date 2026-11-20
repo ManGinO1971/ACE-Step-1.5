@@ -1098,7 +1098,9 @@ def main():
                     f"{k}: {v['entfernt_prozent']} % Klang entfernt" for k, v in t_.items() if isinstance(v, dict)))
                 # 18. Nov 2026 (Mehr-Song-Test): das 53er hört die echte Snare oft als „Percussion“ – die Haupt-Snare
                 # des Songs (regelmäßig auf dem Backbeat, eigener Klang) wird nie entfernt, sondern zurückgeholt
-                if teile_dir != roh_teile and os.path.exists(os.path.join(roh_teile, "snare.flac")):
+                # 20. Nov 2026: AUS – kam erst nach dem Rise-Up-Hörtest 5b (18. Nov) dazu und holte dort Schläge zurück,
+                # die nicht in die Snare gehören. Stand = genau wie 5b. (snare_schutz.py bleibt liegen, wird nicht benutzt)
+                if False and teile_dir != roh_teile and os.path.exists(os.path.join(roh_teile, "snare.flac")):
                     try:
                         import snare_schutz
                         sch = snare_schutz.wiederherstellen(os.path.join(roh_teile, "snare.flac"),
@@ -1128,7 +1130,9 @@ def main():
                 for t, y in neu.items():
                     sf.write(os.path.join(a.ziel, f"{t}_neu.flac"), np.clip(y, -1, 1), SR, subtype="PCM_24")
                 n_ = min(len(y) for y in neu.values())
-                mix = _begrenzen(sum(y[:n_, :2] for y in neu.values()))
+                # 20. Nov 2026: wie am 18. Nov (Rise-Up-Hörtest 5b) – ganze Spur auf die Spitze angepasst, KEIN Begrenzer
+                mix = sum(y[:n_, :2] for y in neu.values())
+                mix = mix * 0.98 / (np.abs(mix).max() + 1e-9)
                 sf.write(out, mix, SR, subtype="PCM_24")
                 bericht["feinschliff"] = fb
                 melde("✔ Feinschliff fertig (Hi-Hat-Muster, Snare, Kick, Toms, Becken)")
