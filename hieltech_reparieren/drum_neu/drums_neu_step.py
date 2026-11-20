@@ -510,6 +510,7 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
             if bh:
                 bh = [h for h in bh if h["pegel"] > max(q["pegel"] for q in bh) - 25]
                 bh = _becken_uebersprechen(x, bh, karte, bericht)
+                bh = _becken_echt(teile_dir, bh, bericht)
             if schub_von:
                 for h in bh:
                     h["schub"] = schub_von(h["einsatz"])
@@ -527,10 +528,15 @@ def neu_spielen(eingabe, teile_dir, ziel, hh_ref=None, weg=None, nur=None, rimsh
                 libs = {"crash": (kr.bib_pfade(("Crash", "Splash", "China")), (49, 57)),
                         "ride": (kr.bib_pfade(("Ride",)) or kr.bib_pfade(("Ride_Glocke",)) or kr.bib_pfade(("Crash",)), (51,))}
                 y, ben = np.zeros((len(x), 2), np.float32), []
-                for _, (pfade, nn) in libs.items():
+                _pc = os.path.join(teile_dir, "crash.flac")      # 20. Nov 2026: Art des Crash nach der Crash-Spur wählen
+                _xc = d.lade(_pc) if os.path.exists(_pc) else None
+                for _art, (pfade, nn) in libs.items():
                     teil_h = [h for h, n_ in zip(bh, bn) if n_ in nn]
                     if teil_h and pfade:
-                        y_, b_ = kr.becken_spielen2(len(x), x, teil_h, kr.becken_bibliothek(None, pfade=pfade))
+                        _xq = x
+                        if _art == "crash" and _xc is not None:
+                            _xq = np.zeros_like(x); _m = min(len(x), len(_xc)); _xq[:_m] = _xc[:_m, :x.shape[1]]
+                        y_, b_ = kr.becken_spielen2(len(x), _xq, teil_h, kr.becken_bibliothek(None, pfade=pfade))
                         y += y_; ben += b_
                 ben.sort()
             elif kr.ROOTS and bh:
@@ -654,6 +660,59 @@ def _becken_uebersprechen(xb, bh, karte, bericht):
     gut = [h for h, l_ in zip(bh, lv) if l_ >= oben - 20 and all(_db(v, h["einsatz"]) < l_ - 1 for v in andere)]
     if len(gut) < len(bh):
         bericht["becken_uebersprechen_entfernt"] = len(bh) - len(gut)
+    return gut
+
+
+def _becken_echt(teile_dir, bh, bericht):
+    """20. Nov 2026 (Rise Up, App-Trennung): nur echte Becken spielen. (1) Schläge mehr als 12 dB unter dem kräftigsten
+    Becken des Songs sind Übersprechen. (2) Ein Schlag, der nur in der Ride-Spur steckt, während die Hi-Hat-Spur im selben
+    Moment fast genauso laut ist, ist durchgerutschte Hi-Hat – kein Becken. (3) Ebenso ein „Crash“, bei dem die
+    Hi-Hat-Spur im selben Moment klar lauter ist."""
+    pc = os.path.join(teile_dir, "crash.flac")
+    if os.path.exists(pc):
+        # Crash-Schläge direkt aus der Crash-Spur der Trennung (Zeitpunkt + Art wie im Original): kräftig (bis 12 dB unter
+        # dem stärksten) und je Sekunde nur einer – auch wenn Snare oder Hi-Hat im selben Moment mitspielen
+        xc = d.lade(pc)
+        ck = kr.becken_karte(xc)
+        if ck:
+            top_c = max(h["pegel"] for h in ck)
+            ck = [h for h in ck if h["pegel"] >= top_c - 12]
+            sel = []
+            for h in sorted(ck, key=lambda h: -h["pegel"]):
+                if all(abs(h["einsatz"] - q["einsatz"]) > SR for q in sel):
+                    sel.append(h)
+            nur_ride = [h for h in bh if all(abs(h["einsatz"] - q["einsatz"]) > 0.3 * SR for q in sel)]
+            bh = sorted(sel, key=lambda h: h["einsatz"]) + nur_ride
+            bh.sort(key=lambda h: h["einsatz"])
+            crash_ein = {h["einsatz"] for h in sel}
+        else:
+            crash_ein = set()
+    else:
+        crash_ein = set()
+    if not bh:
+        return bh
+    oben = max(h["pegel"] for h in bh)
+    def lv(name):
+        p = os.path.join(teile_dir, name + ".flac")
+        return kr._hf(d.lade(p).mean(1)) if os.path.exists(p) else None
+    cr, ri, hh = lv("crash"), lv("ride"), lv("hihat")
+    n50 = int(0.05 * SR)
+    def spitze(v, a):
+        return 20 * np.log10(np.abs(v[a:a + n50]).max() + 1e-9) if v is not None and len(v[a:a + n50]) else -140.0
+    gut, raus = [], []
+    for h in bh:
+        a = h["einsatz"]
+        c_, r_, h_ = spitze(cr, a), spitze(ri, a), spitze(hh, a)
+        ride_hh = ri is not None and r_ > c_ + 3 and h_ >= r_ - 10        # nur „Ride“, aber eigentlich Hi-Hat
+        crash_hh = cr is not None and hh is not None and r_ <= c_ + 3 and c_ < h_ - 3   # Hi-Hat lauter als das „Crash“
+        if h["einsatz"] in crash_ein:
+            gut.append(h); continue                                   # aus der Crash-Spur: echt
+        if h["pegel"] < oben - 12 or ride_hh or crash_hh:
+            raus.append(round(a / SR, 2))
+        else:
+            gut.append(h)
+    if raus:
+        bericht["becken_unecht_entfernt"] = raus
     return gut
 
 

@@ -152,6 +152,15 @@ def snare(d, n, ber, rep_ber):
     T = np.array(T)
     grenze = max(-2.0, float(np.median(T[:, 2])) + 6.0)       # hoch = klar mehr 650–820 Hz als normale Snare
     hoch = T[:, 2] > grenze
+    # 20. Nov 2026: die Haupt-Snare auf dem Backbeat bleibt immer die normale Snare. Hoch nur in Fills/Intro und bei
+    # Schlägen dicht an anderen – ein allein stehender Schlag im Abstand des Backbeats ist die Haupt-Snare.
+    if len(T) > 4:
+        nn = np.array([np.min(np.abs(np.delete(T[:, 0], k) - T[k, 0])) for k in range(len(T))])
+        takt = float(np.median(nn))
+        allein = nn >= 0.8 * takt
+        if (hoch & allein).any():
+            ber["snare_hoch_backbeat_normal"] = [round(float(t), 2) for t in T[hoch & allein, 0]]
+        hoch = hoch & ~allein
     ref_off = rep_ber.get("pegel_angeglichen_db", {}).get("snare", -3.4)
     sk = rep_ber.get("snare_klaenge", {}).get("snare_1", {}).get("klang", "Akustik/Snare/snare 2.flac")
     normal = sample(sk.replace("Akustik/", ""))
@@ -262,7 +271,7 @@ def toms(d, n, ber, norm_l):
 
 
 # ----------------------------------------------------------------------------------------------------- Becken
-def becken(d, n, ber):
+def becken(d, n, ber, norm_l=None):
     r = lese(f"{PFAD['rep']}/becken_neu.flac", n)
     hp = butter(4, 6000, "high", fs=SR, output="sos")
     B = sosfiltfilt(hp, lese(f"{PFAD['teile']}/becken.flac", n, True))
@@ -276,10 +285,21 @@ def becken(d, n, ber):
     anschl = [rms(t, t + 0.05) for t in gespielt] or [np.percentile([rms(t, t + 0.05) for t in np.arange(0, n / SR - 1, 0.05)], 99)]
     schwelle = float(np.median(anschl)) - 10
     neu = []
+    # 20. Nov 2026: nur echte Becken ergänzen – nicht, wo die Hi-Hat-Spur im selben Moment lauter ist (durchgerutschte
+    # Hi-Hat in der Ride-/Crash-Spur der Trennung)
+    def _sp(name):
+        p = f"{PFAD['teile']}/{name}.flac"
+        return sosfiltfilt(hp, lese(p, n, True)) if os.path.exists(p) else None
+    CR, RI, HH = _sp("crash"), _sp("ride"), _sp("hihat")
+    spz = lambda v, t: 20 * np.log10(np.abs(v[int(t * SR):int(t * SR) + int(0.05 * SR)]).max() + 1e-9)
     for i in ob:
         t = i / SR
         if t > n / SR - 1 or any(abs(t - g_) < 1.0 for g_ in gespielt + neu):
             continue
+        if HH is not None and (CR is not None or RI is not None):
+            c_ = max(spz(v, t) for v in (CR, RI) if v is not None)
+            if c_ < spz(HH, t) - 3:
+                continue
         a, nach = rms(t, t + 0.05), rms(t + 0.3, t + 0.4)
         if a > schwelle and nach > a - 8:
             neu.append(t)
@@ -292,6 +312,11 @@ def becken(d, n, ber):
     if alle:
         L = [lufs(y, t, 0.5) for t in alle]
         ziel = float(np.median(sorted(L)[len(L) // 2:]))          # so laut wie die kräftigen Becken
+        # 20. Nov 2026: Lautstärke wie im Hörtest vom 18. Nov (Rise Up 5b): Becken = normale Snare +2,6 dB – sonst
+        # hängt sie an der Trennung (htdemucs gibt die Becken viel leiser her)
+        if norm_l is not None and np.isfinite(norm_l):
+            ziel = float(norm_l) + 2.6
+            ber["becken_lautheit"] = round(ziel, 1)
         g = np.ones(n)
         for t, l in zip(alle, L):
             i = int(t * SR) - 220
@@ -452,7 +477,7 @@ def feinschliff(drums, teile, rep, s53_snare=None, s53_hh=None, melde=print):
     sn, info = snare(d, n, ber, rep_ber)
     melde("… Feinschliff Kick, Toms, Becken")
     teile_ = {"kick": kick(d, n, ber, rep_ber), "snare": sn, "toms": toms(d, n, ber, info.get("normal_lufs", -18)),
-              "becken": becken(d, n, ber)}
+              "becken": becken(d, n, ber, info.get("normal_lufs"))}
     melde("… Feinschliff Hi-Hat (Muster des Songs)")
     teile_["hihat"] = hihat(d, n, ber, rep_ber)
     return {k: v[:n] for k, v in teile_.items()}, ber
