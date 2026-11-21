@@ -67,7 +67,9 @@ dependencies = [
     # ueber torch, das bereits oben pro Plattform gepinnt ist) - "[gpu]"
     # wuerde zusaetzlich onnxruntime-gpu mit einer eigenen CUDA/cuDNN-
     # Erwartung installieren, ohne hier einen Nutzen zu haben.
-    "audio-separator[cpu]",
+    # 21. Nov 2026: fest auf die Mac-Fassung 0.44.5 – nur so trennt DrumSep auf der GPU genau wie auf dem Mac
+    # (Test: 1,0 statt 0,93). Zusatz hieltech_librosa_kompat.py, weil 0.44.5 librosa noch mit filename= aufruft.
+    "audio-separator[cpu]==0.44.5",
     "vector-quantize-pytorch>=1.27.15",
     "torchcodec>=0.9.1; platform_machine != 'aarch64'",
     "torchao>=0.16.0,<0.17.0; platform_machine != 'aarch64'",

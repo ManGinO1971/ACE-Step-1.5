@@ -31,6 +31,13 @@ COPY . /app/
 RUN uv lock
 RUN uv sync --frozen --no-dev --python python3.11
 
+# NEU (21. Nov 2026): audio-separator ist fest 0.44.5 (wie auf dem Mac). Diese Fassung ruft librosa.get_duration noch
+# mit filename= auf; der kleine Zusatz übersetzt das für das neue librosa (greift erst, wenn librosa geladen wird).
+RUN SP=$(/app/.venv/bin/python -c "import site; print(site.getsitepackages()[0])") \
+    && cp /app/hieltech_librosa_kompat.py "$SP/" \
+    && echo "import hieltech_librosa_kompat" > "$SP/zz_hieltech_kompat.pth" \
+    && /app/.venv/bin/python -c "import importlib.metadata as m, librosa, inspect; print('audio-separator', m.version('audio-separator'), '| librosa', librosa.__version__, '| filename ok:', 'filename' in str(inspect.signature(librosa.get_duration)))"
+
 # Separate, isolierte Python-3.10-venv NUR fuer die RVC-Stimmwechsel-
 # Abhaengigkeiten von rvc_convert_step.py (fairseq==0.12.2, rvc-python,
 # hydra-core==1.0.7, omegaconf==2.0.6). Per isoliertem Test bestaetigt
