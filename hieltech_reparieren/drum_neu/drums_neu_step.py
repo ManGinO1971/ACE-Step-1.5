@@ -138,6 +138,13 @@ def trennen(eingabe, ziel, modelle):
         if da and all(t in da for t in ("kick", "snare", "hh", "toms")):
             melde("… Schlagzeug-Trennung schon vorhanden (Zwischenspeicher) – wird wiederverwendet")
             dateien = list(da.values())
+    if dateien is None:                            # 21. Nov 2026: auf RunPod die Trennung wie auf dem Mac (audio-separator 0.44.5)
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.dirname(HIER)))
+            import hieltech_sep_aufruf
+            dateien = hieltech_sep_aufruf.trennen(eingabe, "MDX23C-DrumSep-aufr33-jarredou.ckpt", roh, modelle)
+        except Exception:  # noqa: BLE001 – auf dem Mac gibt es das nicht: wie bisher
+            dateien = None
     if dateien is None:
         import torch
         torch.backends.mps.is_available = lambda: False          # wie im App-Server: MPS macht hier Probleme

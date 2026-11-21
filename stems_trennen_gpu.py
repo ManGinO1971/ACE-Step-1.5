@@ -84,6 +84,16 @@ def alle_spuren_sichern(sep_obj, eingabe, roh, dateien):
 
 
 def sep(eingabe, modell, roh):
+    # 21. Nov 2026: zuerst die eigene Umgebung mit audio-separator 0.44.5 (dieselbe Fassung wie auf dem Mac – sonst
+    # trennt z. B. DrumSep hier anders: Snare nur 0,93 gleich). Fehlt sie oder geht etwas schief: wie bisher hier.
+    try:
+        sys.path.insert(0, HERE)
+        import hieltech_sep_aufruf
+        d = hieltech_sep_aufruf.trennen(eingabe, modell, roh, UVR_DIR)
+        if d:
+            return d
+    except Exception as e:  # noqa: BLE001
+        print(f"… eigene Trenn-Umgebung übersprungen ({str(e)[:150]})", flush=True)
     from audio_separator.separator import Separator
     import logging
     os.makedirs(UVR_DIR, exist_ok=True)

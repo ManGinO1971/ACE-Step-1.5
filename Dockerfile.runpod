@@ -31,13 +31,6 @@ COPY . /app/
 RUN uv lock
 RUN uv sync --frozen --no-dev --python python3.11
 
-# NEU (21. Nov 2026): audio-separator ist fest 0.44.5 (wie auf dem Mac). Diese Fassung ruft librosa.get_duration noch
-# mit filename= auf; der kleine Zusatz übersetzt das für das neue librosa (greift erst, wenn librosa geladen wird).
-RUN SP=$(/app/.venv/bin/python -c "import site; print(site.getsitepackages()[0])") \
-    && cp /app/hieltech_librosa_kompat.py "$SP/" \
-    && echo "import hieltech_librosa_kompat" > "$SP/zz_hieltech_kompat.pth" \
-    && /app/.venv/bin/python -c "import importlib.metadata as m, librosa, inspect; print('audio-separator', m.version('audio-separator'), '| librosa', librosa.__version__, '| filename ok:', 'filename' in str(inspect.signature(librosa.get_duration)))"
-
 # Separate, isolierte Python-3.10-venv NUR fuer die RVC-Stimmwechsel-
 # Abhaengigkeiten von rvc_convert_step.py (fairseq==0.12.2, rvc-python,
 # hydra-core==1.0.7, omegaconf==2.0.6). Per isoliertem Test bestaetigt
@@ -91,6 +84,20 @@ RUN ( python3.10 -m venv /opt/hieltech_noten_venv \
       && /opt/hieltech_noten_venv/bin/python -c "from basic_pitch.inference import predict; print('Basic Pitch bereit')" ) || true
 
 RUN /app/.venv/bin/python /app/prefetch_vocals_models.py || true
+
+# NEU (21. Nov 2026): eigene Umgebung NUR für audio-separator 0.44.5 – dieselbe Fassung wie auf dem Mac, damit die
+# Trennungen (z. B. DrumSep beim Schlagzeug) auf der GPU genau wie auf dem Mac rechnen. Getrennt, weil 0.44.5 numpy 2
+# braucht und die Hauptumgebung (DeepFilterNet) numpy 1. Die Hauptumgebung bleibt unverändert. Schlägt etwas fehl,
+# läuft der Build durch und es wird wie bisher in der Hauptumgebung getrennt.
+RUN ( python3.11 -m venv /opt/hieltech_sep_venv \
+      && /opt/hieltech_sep_venv/bin/pip install --no-cache-dir "pip==24.0" "setuptools<72" \
+      && /opt/hieltech_sep_venv/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+            "torch==2.7.1" "torchaudio==2.7.1" \
+      && /opt/hieltech_sep_venv/bin/pip install --no-cache-dir "audio-separator[cpu]==0.44.5" \
+      && SP=$(/opt/hieltech_sep_venv/bin/python -c "import site; print(site.getsitepackages()[0])") \
+      && cp /app/hieltech_librosa_kompat.py "$SP/" \
+      && echo "import hieltech_librosa_kompat" > "$SP/zz_hieltech_kompat.pth" \
+      && /opt/hieltech_sep_venv/bin/python -c "import importlib.metadata as m, librosa, inspect, torch; print('HIELTECH Trenn-Umgebung: audio-separator', m.version('audio-separator'), '| librosa', librosa.__version__, '| filename ok:', 'filename' in str(inspect.signature(librosa.get_duration)), '| torch', torch.__version__)" ) || true
 
 # NEU (10. Okt 2026): RVC-Basismodelle (hubert_base.pt, rmvpe.pt) laedt
 # rvc-python sonst bei JEDEM frischen Worker beim ersten Stimmwechsel erst
