@@ -261,6 +261,19 @@ def trommeln_abziehen(teile_dir, ziel, s53, bericht):
                 g[e_:min(n, e_ + f_)] = np.linspace(0, 1, min(n, e_ + f_) - e_)
                 aus *= g[:, None]
                 raus_schlaege.append(round(i / SR, 2))
+        # 22. Nov 2026 (Mehr-Song-Test): hält das 53er die HAUPT-Snare des Songs für Percussion (Stand The Ghetto: 90 %
+        # weg), bleibt die Snare-Spur unverändert – die Haupt-Snare (kräftige Schläge) wird nie abgezogen.
+        if teil == "snare":
+            xm, am = x.mean(1), aus.mean(1)
+            on_s = librosa.onset.onset_detect(y=xm, sr=SR, hop_length=hop, backtrack=True, units="samples")
+            pg = np.array([_db(xm, i) for i in on_s])
+            kraeftig = [i for i, p_ in zip(on_s, pg) if len(pg) and p_ > pg.max() - 8]
+            if kraeftig:
+                rest = np.median([_db(am, i) - _db(xm, i) for i in kraeftig])
+                info["snare_haupt_rest_db"] = round(float(rest), 1)
+                if rest < -6.0:                              # mehr als 3/4 der Haupt-Snare wäre weg
+                    aus = x.copy(); raus_schlaege = []
+                    info["snare_haupt_geschuetzt"] = True
         raus = x - aus
         e_vor = float(np.sum(x ** 2)) + 1e-12
         info[teil] = {"entfernt_prozent": round(100 * float(np.sum(raus ** 2)) / e_vor, 1),

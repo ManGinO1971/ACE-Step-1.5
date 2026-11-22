@@ -163,6 +163,87 @@ def _gruppen_wahl(LIB, ber, name, fam, hits, orig, nicht=(), k_trommel=6, max_gr
     return wahl
 
 
+
+def _tom_ton(m, s):
+    """Grundton einer Tom (pyin über den Ausklang 20–300 ms; sonst stärkste Spitze im Spektrum)."""
+    w = m[s + int(.02 * SR):s + int(.30 * SR)]
+    if len(w) > 2048:
+        try:
+            f0, v, _ = librosa.pyin(w, fmin=40, fmax=450, sr=SR, frame_length=2048, hop_length=256)
+            f0 = f0[v & np.isfinite(f0)]
+            if len(f0) >= 3:
+                return float(np.median(f0))
+        except Exception:
+            pass
+    return max(_merkmale(m, s)[1], 40.0)
+
+
+def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
+    """22. Nov 2026: so viele Toms, wie der Song hat. Ton je Schlag (im Original, am eigenen Einsatz); eine neue Tom
+    beginnt, wo der Ton um mehr als `sprung` Halbtöne springt. Jede Tom bekommt die Aufnahme mit dem nächsten eigenen
+    Ton (keine zwei Toms dieselbe, Reihenfolge tief->hoch bleibt), max. ±3 Halbtöne gestimmt, Stärken derselben Trommel
+    (±1 Halbton, gleiche Art) als Lagen. Fehlt eine passende Tom, steht das im Bericht."""
+    on = librosa.onset.onset_detect(y=orig, sr=SR, hop_length=128, units='samples', backtrack=True, delta=0.07)
+    hits_o = []
+    for s, l in hits:
+        j = int(np.argmin(np.abs(on - s))) if len(on) else 0
+        hits_o.append(int(on[j]) if len(on) and abs(on[j] - s) < 0.03 * SR else int(s))
+    ton = np.array([_tom_ton(orig, s) for s in hits_o])
+    st = 12 * np.log2(ton / 100.0)
+    o = np.argsort(st); grp = np.zeros(len(st), int); g = 0
+    for a, b in zip(o[:-1], o[1:]):
+        if st[b] - st[a] > sprung:
+            g += 1
+        grp[b] = g
+    # Einzel-Ausreißer (1 Schlag) zur nächsten Tom
+    for g_ in set(grp):
+        idx = np.where(grp == g_)[0]
+        if len(idx) == 1 and len(set(grp)) > 1:
+            andere = [h for h in set(grp) if h != g_]
+            grp[idx] = min(andere, key=lambda h: abs(np.median(st[grp == h]) - st[idx[0]]))
+    gruppen = sorted(set(grp), key=lambda g_: np.median(st[grp == g_]))
+    P = [s_ for s_ in LIB if s_['kat'].startswith('Toms/')]
+    for s_ in P:
+        if 'st' not in s_:
+            s_['st'] = 12 * np.log2(_tom_ton(s_['x'].mean(1), 0) / 100.0)
+    vergeben = set(); wahl = [None] * len(hits); info = {}; fehlt = []
+    for nr, g_ in enumerate(gruppen):
+        idx = np.where(grp == g_)[0]; ziel = float(np.median(st[idx])); hz = 100 * 2 ** (ziel / 12)
+        frei = [s_ for s_ in P if s_['name'] not in vergeben] or P
+        # Ton zuerst: alle Aufnahmen, die sich höchstens ±3 Halbtöne auf den Ton stimmen lassen; darunter entscheidet
+        # die Klangfarbe am Anschlag (wie bisher bei Rise Up). Sonst die mit dem nächsten Ton.
+        nah = [s_ for s_ in frei if abs(s_['st'] - ziel) <= max_stimmen]
+        mo = [_merkmale(orig, hits_o[i]) for i in idx]
+        ref_ton = float(np.median([m_[1] for m_ in mo]))
+        if nah:
+            haupt = min(nah, key=lambda s_: (np.mean([_abst(m_, s_['m'], tonw=3.0) for m_ in mo]), s_['name']))
+        else:
+            haupt = min(frei, key=lambda s_: (abs(s_['st'] - ziel), s_['name']))
+        lagen = [s_ for s_ in P if s_['kat'] == haupt['kat'] and abs(s_['st'] - haupt['st']) <= 1.0 and s_['name'] not in vergeben][:4] or [haupt]
+        for s_ in lagen:
+            vergeben.add(s_['name'])
+        if abs(haupt['st'] - ziel) > max_stimmen and 48 <= hz <= 450:
+            fehlt.append(round(hz))
+        tr = []
+        for s_ in lagen:
+            # Stimmen wie bisher (Spektrum-Spitze Original gegen Aufnahme); passt die nicht zum Tom-Ton, nach dem Tom-Ton
+            ht = 12 * np.log2(max(ref_ton, 40) / max(s_['m'][1], 40))
+            if abs(ht - (ziel - s_['st'])) > 2.0:
+                ht = ziel - s_['st']
+            ht = float(np.clip(ht, -max_stimmen, max_stimmen))
+            y_ = np.stack([librosa.effects.pitch_shift(s_['x'][:, c].copy(), sr=SR, n_steps=ht) for c in (0, 1)], 1) if abs(ht) > 0.05 else s_['x']
+            d_ = dict(s_); d_['x'] = y_; d_['name'] = s_['name'] + f' ({ht:+.1f} Halbtöne)'; tr.append(d_)
+        tr.sort(key=lambda s_: s_['m'][2])
+        lv = np.array([hits[i][1] for i in idx]); rk = lv.argsort().argsort() / max(1, len(idx) - 1); letzte = None
+        for j, i in enumerate(idx):
+            q = int(round(rk[j] * (len(tr) - 1))); c = [v for v in (q, q + 1, q - 1) if 0 <= v < len(tr)]
+            v = c[0] if tr[c[0]]['name'] != letzte or len(c) == 1 else c[1]; wahl[i] = tr[v]; letzte = tr[v]['name']
+        info[f'tom_{nr + 1}'] = dict(schlaege=len(idx), ton_original_hz=round(hz), art=haupt['kat'], dateien=[t['name'] for t in tr])
+    ber['toms'] = info
+    if fehlt:
+        ber['toms_fehlt_in_bibliothek_hz'] = fehlt
+    return wahl
+
 # ------------------------------------------------------------------------------------------------ Hi-Hat-Hörmodell
 _NF, _HOP = 1024, 128
 _fr = np.fft.rfftfreq(_NF, 1 / SR)
@@ -203,12 +284,20 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
 
     def stoert(s):
         return len(AND) and np.min(np.abs(AND - s)) < 0.06 * SR
+    # 22. Nov (Mehr-Song-Test): wie laut hört die 53er-Hi-Hat jede Stelle? (sie trennt Hi-Hat am saubersten)
+    e53 = np.abs(S53)
+    p53 = np.array([[20 * np.log10(e53[max(0, int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) - int(.05 * SR)):
+                                          int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) + int(.06 * SR)].max() + 1e-9)
+                     for k in range(4)] for i in range(len(beats) - 1)])
+    s53 = np.median(p53[aktiv], 0); s53 = s53 - s53.max()
     stellen = {}
     for k in range(4):
         idx = [i for i in range(len(R)) if aktiv[i] and lv[i, k] > gmax - 30]
         if len(idx) < 0.5 * aktiv.sum():
             continue
-        if np.mean([stoert(R[i][k][0]) for i in idx]) > 0.6:
+        if s53[k] <= -18:
+            continue                                        # die 53er-Hi-Hat hört hier (fast) nichts – keine Hi-Hat
+        if np.mean([stoert(R[i][k][0]) for i in idx]) > 0.6 and s53[k] <= -12:
             continue                                        # Übersprechen von Kick/Snare – keine Hi-Hat
         stellen[k] = idx
     ks = sorted(stellen)
@@ -259,7 +348,7 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
             dl = float(np.clip(lv[i, k] - gmax - pz, -1.5, 1.5)) if lv[i, k] > gmax - 30 and not stoert(R[i][k][0]) else 0.0
             plan.append(dict(t=int(ziel + 0.8 * eig), stelle=int(k), pegel=pz + dl))
     return dict(muster={str(k): v for k, v in muster.items()}, plan=plan, tempo=float(np.atleast_1d(tempo)[0]),
-                beats=[int(b) for b in beats])
+                beats=[int(b) for b in beats], stellen_53er_db=[round(float(v), 1) for v in s53])
 
 
 def _hh_spielen(HP, ref_pegel, n, korr=None):
@@ -350,8 +439,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
     spuren['snare'] = setze(sh, wahl_s)
     # Toms
     th = _schlaege(gm['toms'])
-    spuren['toms'] = setze(th, _gruppen_wahl(LIB, ber, 'toms', 'toms', th, ost('toms'), nicht=('Timbale',), max_gr=2,
-                                             tonw=3.0, stimmen=True, k_trommel=1, einzeln=True)) if th else np.zeros((n, 2), np.float32)
+    spuren['toms'] = setze(th, _toms_wahl(LIB, ber, th, ost('toms'))) if th else np.zeros((n, 2), np.float32)
     # Becken (vorerst wie G: Art aus G, aber voll ausklingend, Lautstärke über den Ausklang)
     melde('… Schlag für Schlag: Becken (voll ausklingend)')
     bx = gm['becken']; bt = fb.get('becken_gespielt') or []
@@ -415,5 +503,5 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         except Exception as e:  # noqa: BLE001 – ohne Selbstprüfung weiter
             melde(f'… Hi-Hat-Selbstprüfung übersprungen ({str(e)[:120]})')
     spuren['hihat'] = hh_y
-    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']))
+    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'))
     return spuren, ber
