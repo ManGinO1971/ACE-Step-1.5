@@ -4389,7 +4389,9 @@ _HIELTECH_REPARIEREN_MODULE = {
                            "--rimshot-note": 1, "--midi-bpm": 1,
                            # 21. Nov 2026: 53er-Spuren für Trommel-Abzug + Feinschliff (sonst „argumente_ungueltig“)
                            "--s53-toms": "datei", "--s53-snare": "datei", "--s53-congas": "datei",
-                           "--s53-percussion": "datei", "--s53-hh": "datei"}},
+                           "--s53-percussion": "datei", "--s53-hh": "datei",
+                           # 22. Nov 2026: Schlag für Schlag + Hi-Hat-Hörmodell (ganzer Song; Rückweg-Schalter)
+                           "--song": "datei", "--ohne-schlag-fuer-schlag": 0}},
     "bass": {"skript": os.path.join("bass_neu", "bass_neu_step.py"), "klang": ["bass_neu"], "modelle": False,
              "schalter": {"--klang-wie-original": 0, "--midi-bpm": 1, "--schlagzeug": "datei",
                           "--timing-fenster-ms": 1, "--timing-korrigieren": 0}},

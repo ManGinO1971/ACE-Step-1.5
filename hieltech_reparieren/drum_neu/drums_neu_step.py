@@ -1142,6 +1142,8 @@ def main():
     ap.add_argument("--midi-bpm", type=float, default=120.0,
                     help="Tempo der MIDI-Datei (Standard 120 = neues Logic-Projekt; echtes Song-Tempo für richtiges Raster)")
     ap.add_argument("--modelle", default=os.path.expanduser("~/HELTECH_Stems/models/"))
+    ap.add_argument("--song", default=None, help="ganzer Song (22. Nov 2026: Hi-Hat-Hörmodell, Becken-Pause)")
+    ap.add_argument("--ohne-schlag-fuer-schlag", action="store_true", help="nur Stand G (Rückweg)")
     for _t in ("toms", "snare", "congas", "percussion", "hh"):  # 18./19. Nov 2026: 53er-Spuren (Trommeln, Feinschliff)
         ap.add_argument(f"--s53-{_t}", default=None)
     a = ap.parse_args()
@@ -1152,6 +1154,7 @@ def main():
         else:
             melde("… trenne Schlagzeug in Kick/Snare/Toms/Hi-Hat/Becken (dauert einige Minuten)")
             teile_dir = trennen(a.eingabe, a.ziel, a.modelle)
+        teile_roh_sfs = teile_dir                    # 22. Nov 2026: Original-Trennung (vor Trommel-Abzug) für Schlag für Schlag
         trommel_info = {}
         s53 = {t: getattr(a, f"s53_{t}") for t in ("toms", "snare", "congas", "percussion", "hh")}
         if not a.nur and (s53["congas"] or s53["percussion"]):
@@ -1193,6 +1196,32 @@ def main():
             try:
                 import drum_feinschliff as fs
                 neu, fb = fs.feinschliff(a.eingabe, teile_dir, a.ziel, s53.get("snare"), s53.get("hh"), melde=melde)
+                # 22. Nov 2026: Schlag für Schlag + Hi-Hat-Hörmodell (Rise Up Test 8). Bei Fehler bleibt Stand G.
+                if not a.ohne_schlag_fuer_schlag:
+                    try:
+                        import schlag_fuer_schlag as sfs
+
+                        def _hh_trennen(mix):
+                            import tempfile
+                            import shutil as _sh
+                            td = tempfile.mkdtemp(prefix="sfs_pruef_")
+                            try:
+                                p_ = os.path.join(td, "ausschnitt.wav")
+                                sf.write(p_, mix, SR, subtype="PCM_24")
+                                td_ = trennen(p_, td, a.modelle)
+                                return sfs._mono(os.path.join(td_, "hihat.flac"))
+                            finally:
+                                _sh.rmtree(td, ignore_errors=True)
+                        neu2, sb = sfs.ausfuehren(neu, teile_roh_sfs, s53, a.song, a.eingabe, bericht, fb, kr.SAMPLES,
+                                                  trennen_fn=_hh_trennen, melde=melde)
+                        neu = neu2
+                        bericht["schlag_fuer_schlag"] = sb
+                        melde("✔ Schlag für Schlag fertig (eigene Bibliothek, Hi-Hat-Hörmodell)")
+                    except Exception as e:  # noqa: BLE001 – dann bleibt Stand G
+                        import traceback
+                        traceback.print_exc()
+                        bericht["schlag_fuer_schlag"] = {"fehler": str(e)[:300]}
+                        melde(f"… Schlag für Schlag übersprungen – Stand G bleibt ({str(e)[:150]})")
                 for t, y in neu.items():
                     sf.write(os.path.join(a.ziel, f"{t}_neu.flac"), np.clip(y, -1, 1), SR, subtype="PCM_24")
                 n_ = min(len(y) for y in neu.values())
