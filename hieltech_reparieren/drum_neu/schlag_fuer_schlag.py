@@ -267,6 +267,33 @@ def _hh_merk(x, s, W, p=None):
     return np.concatenate([form[0], form[1] * 0.7, form[2] * 0.5, np.array([L[1] - L[0], L[2] - L[0]]) * 2.0])
 
 
+
+def _raster_pruefen(HH, beats, vorsprung=0.10):
+    """22. Nov 2026 (abends, freigegeben): halbes/doppeltes Tempo prüfen. Drei Raster (erkannt, halb, doppelt); gewählt wird das,
+    bei dem die Hi-Hat-Schläge auf 16tel-Stellen liegen (Anteil daneben) und jedes Viertel dasselbe Muster hat
+    (Wechsel gerade/ungerade Viertel). Gewechselt wird nur, wenn das andere Raster klar besser ist (≥ vorsprung)."""
+    on = librosa.onset.onset_detect(y=HH, sr=SR, hop_length=128, units='samples', backtrack=False, delta=0.05)
+    if len(on) < 16 or len(beats) < 8:
+        return beats, None
+    pk = np.array([20 * np.log10(np.abs(HH[max(0, o - 200):o + 800]).max() + 1e-9) for o in on]); on = on[pk > np.percentile(pk, 99) - 24]
+    kand = {'erkannt': beats, 'halb': beats[::2], 'doppelt': np.sort(np.concatenate([beats, (beats[:-1] + beats[1:]) // 2]))}
+    pkt = {}
+    for k, b in kand.items():
+        q = np.diff(b); i = np.searchsorted(b, on) - 1; ok = (i >= 0) & (i < len(q)); i = i[ok]
+        if len(i) < 8:
+            pkt[k] = 9.0; continue
+        ph = (on[ok] - b[i]) / q[i] * 4; daneben = float(np.mean(np.abs(ph - np.round(ph)) > 0.25))
+        occ = np.zeros((len(q), 4))
+        for ii, p_ in zip(i, np.round(ph).astype(int) % 4):
+            occ[ii, p_] = 1
+        akt = np.where(occ.sum(1) > 0)[0]; o = occ[akt]
+        wechsel = float(np.abs(o[akt % 2 == 0].mean(0) - o[akt % 2 == 1].mean(0)).mean()) if len(akt) > 4 else 1.0
+        v = daneben + wechsel
+        pkt[k] = round(v, 3) if np.isfinite(v) else 9.0
+    best = min(pkt, key=pkt.get)
+    wahl = best if pkt['erkannt'] - pkt[best] >= vorsprung else 'erkannt'
+    return np.array(kand[wahl]), dict(punkte=pkt, wahl=wahl)
+
 def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
     """Muster der Hi-Hat aus dem ganzen Song. Rückgabe dict(muster, plan, tempo) wie im Test (plan2.json)."""
     n = min(map(len, (song, hh53, hhds, per)))
@@ -275,6 +302,10 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
     AND = np.array(andere)
     tempo, beats = librosa.beat.beat_track(y=song, sr=SR, units='samples', start_bpm=85); beats = np.array(beats)
     env = np.abs(HH)
+    raster_info = None
+    if os.environ.get('HH_RASTER', '1') == '1':
+        beats, raster_info = _raster_pruefen(HH, beats)
+        tempo = 60 * SR / float(np.median(np.diff(beats)))
 
     def spitze(s):
         a = max(0, s - int(.05 * SR)); w = env[a:s + int(.06 * SR)]; return a + int(np.argmax(w)), 20 * np.log10(w.max() + 1e-9)
@@ -306,7 +337,13 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
     for p in kette:
         s = p['start']; p['pk'] = s + int(np.argmax(np.abs(KH[s:s + int(.03 * SR)])))
         p['quelle'] = os.path.join(samples, p['datei'])
-    kette = [p for p in kette if os.path.isfile(p['quelle'])]
+    # 22. Nov abends (Inhaber): einzelne Hi-Hat-Aufnahmen passen nicht zu dieser Aufgabe (z. B. Nr0426-277: zu, aber
+    # nicht für Reggae) – sie stehen in sfs/hihat_gesperrt.json und werden vom Hörmodell nie gewählt.
+    try:
+        gesperrt = json.load(open(os.path.join(samples, 'sfs', 'hihat_gesperrt.json'), encoding='utf-8')).get('gesperrt', [])
+    except (OSError, ValueError):
+        gesperrt = []
+    kette = [p for p in kette if os.path.isfile(p['quelle']) and not any(g in p['name'] for g in gesperrt)]
     muster = {}
     for j, k in enumerate(ks):
         idx = stellen[k]; nxt = ks[(j + 1) % len(ks)]
@@ -348,7 +385,7 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
             dl = float(np.clip(lv[i, k] - gmax - pz, -1.5, 1.5)) if lv[i, k] > gmax - 30 and not stoert(R[i][k][0]) else 0.0
             plan.append(dict(t=int(ziel + 0.8 * eig), stelle=int(k), pegel=pz + dl))
     return dict(muster={str(k): v for k, v in muster.items()}, plan=plan, tempo=float(np.atleast_1d(tempo)[0]),
-                beats=[int(b) for b in beats], stellen_53er_db=[round(float(v), 1) for v in s53])
+                raster=raster_info, beats=[int(b) for b in beats], stellen_53er_db=[round(float(v), 1) for v in s53])
 
 
 def _hh_spielen(HP, ref_pegel, n, korr=None):
@@ -463,16 +500,41 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         rms = lambda a: 20 * np.log10(np.sqrt(np.mean(a ** 2)) + 1e-12)
         a0, a1 = int(.3 * SR), int(.8 * SR)
         bh.append([j, rms(bx[j + a0:j + a1]) - rms(cache[nm]['x'].mean(1)[a0:a1])]); wb.append(cache[nm])
-    stopp = [0] * len(bh)
-    if song is not None and bh:                           # nur bei echter Pause im ganzen Song abstoppen
-        H_ = int(.05 * SR); envdb = 20 * np.log10(np.array([np.sqrt(np.mean(song[j:j + H_] ** 2)) + 1e-9 for j in range(0, len(song) - H_, H_)]))
-        for i, (s, _) in enumerate(bh):
-            a = s // H_; vor = np.median(envdb[max(0, a - 40):a]) if a > 4 else envdb[min(a, len(envdb) - 1)]
-            for j in range(a + 3, min(len(envdb) - 8, a + 200)):
-                if (envdb[j:j + 8] < vor - 25).all():
-                    stopp[i] = (j - a) * H_; break
+    # 22. Nov abends (Inhaber): abgestoppt wird nur, was im ORIGINAL wirklich aufhört. Entscheidend ist das getrennte
+    # Original-Becken (crash+ride) selbst – Gesang oder Percussion, die weiterlaufen, spielen keine Rolle.
+    #  a) mit der Hand gehalten: kurz nach dem Schlag (bis 0,6 s) fällt das Original-Becken steil (≥ 15 dB in 100 ms)
+    #     und bleibt ≥ 20 dB unter seiner Spitze, bis es 0,3 s still ist oder der nächste Schlag kommt
+    #  b) ganze Song-Pause (wie bisher) – aber nur, wenn auch das Original-Becken dort ≥ 20 dB unter der Spitze ist
+    stopp = [0] * len(bh); stopp_grund = [None] * len(bh)
+    ob = None
+    try:
+        teile_b = [t for t in ('crash', 'ride') if os.path.isfile(os.path.join(teile_roh, t + '.flac'))]
+        ob = sum(ost(t) for t in teile_b) if teile_b else None
+    except Exception:
+        ob = None
+    if ob is not None and bh:
+        H_ = int(.01 * SR)
+        oenv = 20 * np.log10(np.array([np.sqrt(np.mean(ob[q:q + H_] ** 2)) + 1e-9 for q in range(0, len(ob) - H_, H_)]))
+        senv = None
+        if song is not None:
+            senv = 20 * np.log10(np.array([np.sqrt(np.mean(song[q:q + H_] ** 2)) + 1e-9 for q in range(0, len(song) - H_, H_)]))
+        for i, (s_, _) in enumerate(bh):
+            a = s_ // H_; nx = (bh[i + 1][0] // H_) if i + 1 < len(bh) else min(len(oenv), a + 1000)
+            nx = min(nx, len(oenv))
+            if nx - a < 15:
+                continue
+            spitze = float(oenv[a:a + 5].max())
+            for q in range(a + 3, min(a + 60, nx - 10)):            # a) Abstoppen mit der Hand
+                if oenv[q] - oenv[q + 10] >= 15 and (oenv[q + 10:min(nx, q + 40)] < spitze - 20).all():
+                    stopp[i] = (q + 3 - a) * H_; stopp_grund[i] = 'mit der Hand gehalten'; break
+            if stopp[i] or senv is None:
+                continue
+            vor = np.median(senv[max(0, a - 200):a]) if a > 20 else senv[min(a, len(senv) - 1)]
+            for q in range(a + 15, min(len(senv) - 40, nx - 40, a + 1000)):   # b) ganze Song-Pause
+                if (senv[q:q + 40] < vor - 25).all() and (oenv[q:q + 40] < spitze - 20).all():
+                    stopp[i] = (q - a) * H_; stopp_grund[i] = 'Song-Pause'; break
     spuren['becken'] = setze(bh, wb, stopp) if bh else np.zeros((n, 2), np.float32)
-    ber['becken'] = dict(schlaege=len(bh), klaenge=sorted(cache), abgestoppt_s=[round(v / SR, 2) if v else None for v in stopp])
+    ber['becken'] = dict(schlaege=len(bh), klaenge=sorted(cache), abgestoppt_s=[round(v / SR, 2) if v else None for v in stopp], abgestoppt_grund=stopp_grund)
     # Hi-Hat-Hörmodell
     melde('… Hi-Hat-Hörmodell: höre den ganzen Song (Muster, Gefühl, Timing)')
     hh_g = _schlaege(gm['hihat'], delta=0.05, unter=35)
@@ -503,5 +565,5 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         except Exception as e:  # noqa: BLE001 – ohne Selbstprüfung weiter
             melde(f'… Hi-Hat-Selbstprüfung übersprungen ({str(e)[:120]})')
     spuren['hihat'] = hh_y
-    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'))
+    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'), raster=HP.get('raster'))
     return spuren, ber
