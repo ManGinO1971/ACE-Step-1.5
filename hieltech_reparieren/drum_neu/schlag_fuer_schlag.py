@@ -434,6 +434,39 @@ def _hh_bild(X, beats, AND):
 
 
 # ------------------------------------------------------------------------------------------------ Hauptschritt
+
+def _an_original(hits, wahl, orig, teil, ber, min_ms=10, max_ms=45):
+    """23. Nov 2026 (freigegeben): jeden Schlag an den Original-Schlag legen. Verglichen wird der Anschlag (50 % der Spitze der
+    geglätteten Hülle) von Aufnahme und Original; beim Kick nur der Tiefbass (< 150 Hz), weil dort nur der Kick klingt.
+    Verschoben wird nur, wenn der Schlag 10–45 ms daneben liegt (App-Fehler, nicht das Spiel des Schlagzeugers)."""
+    from scipy.signal import butter, sosfiltfilt
+    def huelle(x):
+        if teil == 'kick':
+            x = sosfiltfilt(butter(4, 150 / (SR / 2), output='sos'), x)
+        h = int(.002 * SR); return np.convolve(np.abs(x), np.ones(h) / h, mode='same')
+    E = huelle(orig); gmax = np.percentile(E, 99.9) + 1e-12
+    anschlag = {}
+    neu = []; geschoben = []
+    for (s, lv), smp in zip(hits, wahl):
+        if smp is None:
+            neu.append([s, lv]); continue
+        nm = smp['name']
+        if nm not in anschlag:
+            e = huelle(smp['x'].mean(1)[:int(.15 * SR)]); anschlag[nm] = int(np.argmax(e > e.max() * 0.5))
+        a0 = max(0, s - int(max_ms / 1000 * SR)); a1 = min(len(E), s + int(max_ms / 1000 * SR) + anschlag[nm])
+        w = E[a0:a1]
+        if not len(w) or w.max() < gmax * 10 ** (-30 / 20):
+            neu.append([s, lv]); continue
+        ziel = a0 + int(np.argmax(w > w.max() * 0.5)) - anschlag[nm]
+        d = (ziel - s) / SR * 1000
+        if min_ms < abs(d) <= max_ms:
+            neu.append([int(ziel), lv]); geschoben.append(round(d, 1))
+        else:
+            neu.append([s, lv])
+    ber.setdefault('an_original', {})[teil] = dict(geschoben=len(geschoben), von=len(hits),
+                                                   median_ms=float(np.median(geschoben)) if geschoben else 0.0)
+    return neu
+
 def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, trennen_fn=None, melde=print):
     """G: Teile von Stand G (kick/snare/toms/becken/hihat, Stereo, gleiche Länge). teile_roh: Ordner der Original-
     Trennung (kick/snare/hihat/toms/crash/ride .flac). Rückgabe (neue Teile, Bericht)."""
@@ -445,8 +478,10 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
     LIB = bibliothek(samples)
     spuren = {}
 
-    def setze(hits, wahl, stopp=None):
+    def setze(hits, wahl, stopp=None, orig=None, teil=None):
         y = np.zeros((n + 40 * SR, 2), np.float32)
+        if orig is not None and os.environ.get('SFS_AN_ORIGINAL', '1') == '1':
+            hits = _an_original(hits, wahl, orig, teil, ber)
         for i, (s, lv) in enumerate(hits):
             smp = wahl[i]
             if smp is None:
@@ -460,7 +495,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
     # Kick
     melde('… Schlag für Schlag: Kick, Snare, Toms')
     kh = _schlaege(gm['kick'])
-    spuren['kick'] = setze(kh, _gruppen_wahl(LIB, ber, 'kick', 'kick', kh, ost('kick'), max_gr=1, tonw=1.0, k_trommel=1))
+    spuren['kick'] = setze(kh, _gruppen_wahl(LIB, ber, 'kick', 'kick', kh, ost('kick'), max_gr=1, tonw=1.0, k_trommel=1), orig=ost('kick'), teil='kick')
     # Snare: EINE Haupt-Snare, hohe Snare nur an G-Stellen
     sh = _schlaege(gm['snare'])
     hz = np.array(fb.get('snare_hoch_zeiten') or []) * SR
@@ -473,10 +508,10 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         w_ = _gruppen_wahl(LIB, ber, name_, 'snare', [sh[i] for i in sel], ost('snare'), max_gr=1, k_trommel=1, nur=nur_)
         for i, x_ in zip(sel, w_):
             wahl_s[i] = x_
-    spuren['snare'] = setze(sh, wahl_s)
+    spuren['snare'] = setze(sh, wahl_s, orig=ost('snare'), teil='snare')
     # Toms
     th = _schlaege(gm['toms'])
-    spuren['toms'] = setze(th, _toms_wahl(LIB, ber, th, ost('toms'))) if th else np.zeros((n, 2), np.float32)
+    spuren['toms'] = setze(th, _toms_wahl(LIB, ber, th, ost('toms')), orig=ost('toms'), teil='toms') if th else np.zeros((n, 2), np.float32)
     # Becken (vorerst wie G: Art aus G, aber voll ausklingend, Lautstärke über den Ausklang)
     melde('… Schlag für Schlag: Becken (voll ausklingend)')
     bx = gm['becken']; bt = fb.get('becken_gespielt') or []
