@@ -904,7 +904,8 @@ def hh_oeffnung(x, hits, bericht, xb=None):
 
 GM_NAMEN = {36: "Kick", 37: "Rimshot (Side Stick)", 38: "Snare", 41: "Tom tief (Standtom)", 42: "Hi-Hat zu",
             43: "Tom tief", 45: "Tom mittel", 46: "Hi-Hat offen", 47: "Tom mittel-hoch", 48: "Tom hoch",
-            49: "Crash 1", 50: "Tom sehr hoch", 57: "Crash 2", 40: "Rimshot (echt)", 51: "Ride"}
+            49: "Crash 1", 50: "Tom sehr hoch", 57: "Crash 2", 40: "Rimshot (echt)", 51: "Ride",
+            44: "Hi-Hat Fuß zu (Foot Close)", 52: "China", 55: "Splash"}
 
 
 def _tempo_schaetzen(eingabe):
@@ -918,7 +919,7 @@ def _tempo_schaetzen(eingabe):
     return round(t, 2)
 
 
-def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120.0):
+def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120.0, name_datei="drums_neu", titel=None):
     """Schreibt die gespielte Schlag-Karte als General-MIDI-Schlagzeug (Kanal 10): exakte Zeiten,
     Velocity aus der Lautstärke im Original (je Element skaliert). Ohne Zusatz-Bibliothek."""
     import struct
@@ -936,13 +937,15 @@ def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120
     tick = lambda s: int(round(s * tempo / 60.0 * ppq))  # noqa: E731
     vel = {}
     for teil in {n[3] for n in noten}:
-        p = np.array([n[2] for n in noten if n[3] == teil])
+        p = np.array([n[2] for n in noten if n[3] == teil and not (len(n) > 5 and n[5])])   # feste Velocity zählt nicht
         p95 = float(np.percentile(p, 95))
         vel[teil] = p95
     ev = []
     for t, note, pegel, teil, *rest in noten:
         v = int(np.clip(round(127 + 3.0 * (pegel - vel[teil])), 15, 127))
-        if rest:                                                    # Hi-Hat-Öffnung (CC4) direkt vor dem Schlag
+        if len(rest) > 1 and rest[1]:                               # feste Velocity (z. B. Hi-Hat Fuß zu)
+            v = int(rest[1])
+        if rest and rest[0] is not None:                            # Hi-Hat-Öffnung (CC4) direkt vor dem Schlag
             ev.append((tick(t), 0xB9, 4, int(rest[0])))
         ev.append((tick(t), 0x99, note, v))
         ev.append((tick(t) + ppq // 8, 0x89, note, 0))            # 1/32 lang – Schlagzeug klingt sowieso aus
@@ -959,7 +962,7 @@ def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120
         return b"MTrk" + struct.pack(">I", len(daten)) + daten
     usek = int(round(60_000_000 / tempo))
     t0 = b"\x00\xff\x51\x03" + usek.to_bytes(3, "big") + b"\x00\xff\x58\x04\x04\x02\x18\x08" + b"\x00\xff\x2f\x00"
-    name = "Schlagzeug repariert" + (f" ({nur})" if nur else "")
+    name = titel or ("Schlagzeug repariert" + (f" ({nur})" if nur else ""))
     nb = name.encode("utf-8")
     d = b"\x00\xff\x03" + vlq(len(nb)) + nb
     letzt = 0
@@ -967,26 +970,123 @@ def midi_schreiben(eingabe, noten, ziel, nur=None, rimshot_note=37, midi_bpm=120
         d += vlq(tk - letzt) + bytes([st, note, v])
         letzt = tk
     d += b"\x00\xff\x2f\x00"
-    datei = os.path.join(ziel, "drums_neu.mid")
+    datei = os.path.join(ziel, f"{name_datei}.mid")
     with open(datei, "wb") as f:
         f.write(b"MThd" + struct.pack(">IHHH", 6, 1, 2, ppq) + spur(t0) + spur(d))
     # Notenliste (wie bei den anderen Schlagzeug-MIDIs der App)
     from collections import Counter
     c = Counter(n[1] for n in noten)
-    zeilen = [f"Schlagzeug repariert – MIDI-Notenliste (General MIDI, Kanal 10), MIDI-Tempo {tempo:g} BPM", ""]
+    zeilen = [f"{name} – MIDI-Notenliste (General MIDI, Kanal 10), MIDI-Tempo {tempo:g} BPM", ""]
     zeilen += [f"Note {k:3d}  {GM_NAMEN.get(k, '?'):22s} {c[k]:5d} Schläge" for k in sorted(c)]
     zeilen += ["", "Passt direkt zu EZdrummer 3 / Logic Drum Kit Designer (Kick 36, Snare 38, Hi-Hat 42/46, Crash 49/57, Ride 51).",
-               "Hi-Hat-Öffnung zusätzlich als Controller CC4 vor jedem Hi-Hat-Schlag (127 = zu, 0 = offen) –",
-               "EZdrummer, Superior Drummer und Addictive Drums spielen damit auch halboffen.",
+               ("Hi-Hat: zu = Note 42, halb offen/offen = Note 46 (Open), danach schließt der Fuß mit Note 44 (Foot Close) –"
+                if any(n[1] == 44 for n in noten) or any(n[1] == 46 for n in noten) else "Hi-Hat: zu = Note 42."),
+               ("wie in Logic Drummer/Drum Kit Designer (z. B. SoCal) gespielt." if any(n[1] == 46 for n in noten) else ""),
                f"Rimshot liegt auf Note {rimshot_note} ({'echter Rimshot' if rimshot_note == 40 else 'GM Side Stick'}).",
                "",
                f"WICHTIG Tempo: Die Datei ist mit {tempo:g} BPM geschrieben. Logic-Projekt auf {tempo:g} BPM stellen,",
                "dann liegt das MIDI genau unter dem Audio (Logic übernimmt das Tempo der Datei beim Hineinziehen nicht).",
                (f"Automatisch geschätztes Song-Tempo: {geschaetzt:g} BPM (nur als Hinweis, kann daneben liegen)." if geschaetzt else "")]
-    with open(os.path.join(ziel, "drums_neu_Notenliste.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(ziel, f"{name_datei}_Notenliste.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(zeilen) + "\n")
     return {"datei": datei, "tempo_bpm": tempo, "tempo_geschaetzt": geschaetzt, "noten": len(noten)}
 
+
+
+def _gm_note_alt(ziel):
+    """Noten von Stand G (dessen drums_neu.mid) – liefert Becken-Art und Rimshot je Zeitpunkt."""
+    import struct
+    p = os.path.join(ziel, "drums_neu.mid")
+    try:
+        b = open(p, "rb").read()
+    except OSError:
+        return []
+    ppq = struct.unpack(">H", b[12:14])[0]; i = 14; tempo = 500000; out = []
+    while i < len(b) and b[i:i + 4] == b"MTrk":
+        L = struct.unpack(">I", b[i + 4:i + 8])[0]; d = b[i + 8:i + 8 + L]; i += 8 + L; j = 0; tk = 0; st = 0
+        while j < len(d):
+            v = 0
+            while True:
+                c = d[j]; j += 1; v = (v << 7) | (c & 0x7F)
+                if not c & 0x80:
+                    break
+            tk += v
+            if d[j] == 0xFF:
+                typ = d[j + 1]; j += 2; ln = 0
+                while True:
+                    c = d[j]; j += 1; ln = (ln << 7) | (c & 0x7F)
+                    if not c & 0x80:
+                        break
+                if typ == 0x51:
+                    tempo = int.from_bytes(d[j:j + 3], "big")
+                j += ln; continue
+            if d[j] & 0x80:
+                st = d[j]; j += 1
+            if st & 0xF0 in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
+                a1, a2 = d[j], d[j + 1]; j += 2
+                if st & 0xF0 == 0x90 and a2 > 0:
+                    out.append((tk * tempo / 1e6 / ppq, a1))
+            else:
+                j += 1
+    return out
+
+
+def _tom_note(hz):
+    for grenze, note in ((70, 41), (85, 43), (100, 45), (125, 47), (150, 48)):
+        if hz < grenze:
+            return note
+    return 50
+
+
+def midi_aus_gespielt(eingabe, gespielt, ziel, rimshot_note=37, midi_bpm=120.0):
+    """23. Nov 2026: MIDI aus genau den Schlägen, die „Schlag für Schlag“ spielt (Zeit = Einsatz der Aufnahme,
+    Velocity aus der gespielten Lautstärke). Schreibt drums_neu.mid (ganzes Schlagzeug) und je Spur <teil>_neu.mid,
+    alle mit denselben GM-Noten, demselben Tempo und derselben Zeitachse wie die Audio-Spuren."""
+    alt = _gm_note_alt(ziel)
+    def alt_note(t, erlaubt, sonst):
+        k = [(abs(t - ta), n) for ta, n in alt if n in erlaubt and abs(t - ta) < 0.06]
+        return min(k)[1] if k else sonst
+    noten = {}
+    for t_, lv, smp in gespielt.get("kick", []):
+        noten.setdefault("kick", []).append((t_ / SR, 36, lv, "kick"))
+    for t_, lv, smp in gespielt.get("snare", []):
+        n_ = alt_note(t_ / SR, {37, 40}, 38) if rimshot_note else 38
+        noten.setdefault("snare", []).append((t_ / SR, n_, lv, "snare"))
+    tom_hz = sorted({round(smp.get("tom_hz", 120)) for _, _, smp in gespielt.get("toms", [])})
+    tn = {}
+    for hz in tom_hz:                                   # tief -> hoch, jede Tom eigene Note, Reihenfolge bleibt
+        n_ = _tom_note(hz)
+        frei = [x for x in (41, 43, 45, 47, 48, 50) if x not in tn.values()]
+        tn[hz] = n_ if n_ not in tn.values() else (min([x for x in frei if x > n_] or frei or [n_]))
+    for t_, lv, smp in gespielt.get("toms", []):
+        noten.setdefault("toms", []).append((t_ / SR, tn.get(round(smp.get("tom_hz", 120)), 47), lv, "toms"))
+    for t_, lv, smp in gespielt.get("becken", []):
+        noten.setdefault("becken", []).append((t_ / SR, alt_note(t_ / SR, {49, 51, 52, 55, 57, 59}, 49), lv, "becken"))
+    # Hi-Hat (23. Nov 2026, Rise Up in Logic/SoCal geprüft, Fassung V3): je Stelle die Art ihres Hauptklangs –
+    # zu = 42; betonte Stelle mit halb offen / offen = 46 (Open) + Fuß schließt (44 Foot Close, Velocity 70) nach 60 % des Abstands
+    # zum nächsten Hi-Hat-Schlag; Fuß/Pedal = 44. Kein CC4 (Logic-Kits werten es nicht aus). Jeder Song bekommt so
+    # seine eigene Hi-Hat, weil Stellen und Klänge aus seinem Hörmodell kommen.
+    hh = sorted(gespielt.get("hihat", []), key=lambda x: x[0])
+    for j, eintrag in enumerate(hh):
+        t_, lv, name = eintrag[:3]
+        nm = name.lower()
+        betont = (eintrag[3] if len(eintrag) > 3 else 0.0) >= -6.0    # Stelle höchstens 6 dB unter der lautesten
+        if "fuss" in nm or "pedale" in nm:
+            noten.setdefault("hihat", []).append((t_ / SR, 44, lv, "hihat"))
+        elif betont and ("halb" in nm or "auf-zu" in nm or "offen" in nm or "aperto" in nm):   # leise halb offen = zu
+            noten.setdefault("hihat", []).append((t_ / SR, 46, lv, "hihat"))
+            nx = hh[j + 1][0] if j + 1 < len(hh) else t_ + int(0.5 * SR)
+            tz = t_ + int(0.6 * min(nx - t_, int(1.0 * SR)))
+            noten.setdefault("hihat", []).append((tz / SR, 44, lv, "hihat", None, 70))
+        else:
+            noten.setdefault("hihat", []).append((t_ / SR, 42, lv, "hihat"))
+    alle = sorted((x for v in noten.values() for x in v), key=lambda x: x[0])
+    info = {"ganz": midi_schreiben(eingabe, alle, ziel, None, rimshot_note, midi_bpm)}
+    namen = {"kick": "Kick", "snare": "Snare", "hihat": "Hi-Hat", "toms": "Toms", "becken": "Becken"}
+    for teil, v in noten.items():
+        info[teil] = midi_schreiben(eingabe, sorted(v, key=lambda x: x[0]), ziel, teil, rimshot_note, midi_bpm,
+                                    name_datei=f"{teil}_neu", titel=f"Schlagzeug repariert – {namen.get(teil, teil)}")
+    return info
 
 def hh_hoeren(eingabe, ziel):
     """Hör-Modell (EfficientAT, wie die Instrumenten-Erkennung) hört die GANZE Schlagzeugspur ab: wie sicher klingt
@@ -1231,7 +1331,13 @@ def main():
                         neu2, sb = sfs.ausfuehren(neu, teile_roh_sfs, s53, a.song, a.eingabe, bericht, fb, kr.SAMPLES,
                                                   trennen_fn=_hh_trennen, melde=melde, timing=a.timing_korrigieren)
                         neu = neu2
+                        gespielt = sb.pop("_gespielt", None)
                         bericht["schlag_fuer_schlag"] = sb
+                        if gespielt:                      # 23. Nov 2026: MIDI genau aus dem, was klingt (+ je Spur)
+                            try:
+                                bericht["midi"] = midi_aus_gespielt(a.eingabe, gespielt, a.ziel, a.rimshot_note, a.midi_bpm)
+                            except Exception as e_:  # noqa: BLE001 – dann bleibt das MIDI von Stand G
+                                bericht["midi_sfs_fehler"] = str(e_)[:200]
                         melde("✔ Schlag für Schlag fertig (eigene Bibliothek, Hi-Hat-Hörmodell)")
                     except Exception as e:  # noqa: BLE001 – dann bleibt Stand G
                         import traceback

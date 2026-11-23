@@ -232,7 +232,7 @@ def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
                 ht = ziel - s_['st']
             ht = float(np.clip(ht, -max_stimmen, max_stimmen))
             y_ = np.stack([librosa.effects.pitch_shift(s_['x'][:, c].copy(), sr=SR, n_steps=ht) for c in (0, 1)], 1) if abs(ht) > 0.05 else s_['x']
-            d_ = dict(s_); d_['x'] = y_; d_['name'] = s_['name'] + f' ({ht:+.1f} Halbtöne)'; tr.append(d_)
+            d_ = dict(s_); d_['x'] = y_; d_['name'] = s_['name'] + f' ({ht:+.1f} Halbtöne)'; d_['tom_hz'] = hz; tr.append(d_)
         tr.sort(key=lambda s_: s_['m'][2])
         lv = np.array([hits[i][1] for i in idx]); rk = lv.argsort().argsort() / max(1, len(idx) - 1); letzte = None
         for j, i in enumerate(idx):
@@ -403,15 +403,18 @@ def _hh_spielen(HP, ref_pegel, n, korr=None):
     if not plan_:
         return np.zeros((n, 2), np.float32), {}
     off = float(ref_pegel - np.percentile([p['pegel'] for p in plan_], 90))
-    y = np.zeros((n + 5 * SR, 2), np.float32); zaehl = {}
+    y = np.zeros((n + 5 * SR, 2), np.float32); zaehl = {}; schlaege = []
     for j_, p in enumerate(plan_):
         P_ = proben[str(p['stelle'])]; z = zaehl.get(p['stelle'], 0); zaehl[p['stelle']] = z + 1
         smp = P_[z % len(P_)]; st_ = max(0, p['t'] - smp['spitze']); g = 10 ** ((p['pegel'] + off + korr.get(str(p['stelle']), 0.0)) / 20)
         ende = (plan_[j_ + 1]['t'] - st_ + int(.01 * SR)) if j_ + 1 < len(plan_) else len(smp['x'])   # nächster Schlag schließt
         x_ = smp['x'][:max(1, ende)].copy() * g; f_ = min(len(x_), int(.012 * SR)); x_[-f_:] *= np.linspace(1, 0, f_)[:, None]
         y[st_:st_ + len(x_)] += x_
+        schlaege.append((int(st_), float(20 * np.log10(g + 1e-12)), smp['name'],
+                         float(MU[str(p['stelle'])]['pegel']) - max(float(m_['pegel']) for m_ in MU.values())))
     info = {k_: dict(pegel=round(m_['pegel'], 1), timing_ms=round(m_['timing_ms'], 1), klaenge=[p['name'] for p in proben[k_]])
             for k_, m_ in MU.items()}
+    info['_schlaege'] = schlaege
     return y[:n], info
 
 
@@ -500,6 +503,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
     LIB = bibliothek(samples)
     spuren = {}
 
+    gespielt = {}
     def setze(hits, wahl, stopp=None, orig=None, teil=None):
         y = np.zeros((n + 40 * SR, 2), np.float32)
         if orig is not None and os.environ.get('SFS_AN_ORIGINAL', '1') == '1':
@@ -510,6 +514,8 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             smp = wahl[i]
             if smp is None:
                 continue
+            if teil:
+                gespielt.setdefault(teil, []).append((int(s), float(lv), smp))   # 23. Nov: fürs MIDI (genau was klingt)
             x_ = smp['x'] * 10 ** (lv / 20)
             if stopp and stopp[i]:
                 L = min(len(x_), stopp[i]); f_ = int(.06 * SR); x_ = x_[:L].copy()
@@ -600,7 +606,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             for q in range(a + 15, min(len(senv) - 40, nx - 40, a + 1000)):   # b) ganze Song-Pause
                 if (senv[q:q + 40] < vor - 25).all() and (oenv[q:q + 40] < spitze - 20).all():
                     stopp[i] = (q - a) * H_; stopp_grund[i] = 'Song-Pause'; break
-    spuren['becken'] = setze(bh, wb, stopp) if bh else np.zeros((n, 2), np.float32)
+    spuren['becken'] = setze(bh, wb, stopp, teil='becken') if bh else np.zeros((n, 2), np.float32)
     ber['becken'] = dict(schlaege=len(bh), klaenge=sorted(cache), abgestoppt_s=[round(v / SR, 2) if v else None for v in stopp], abgestoppt_grund=stopp_grund)
     # Hi-Hat-Hörmodell
     melde('… Hi-Hat-Hörmodell: höre den ganzen Song (Muster, Gefühl, Timing)')
@@ -632,5 +638,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         except Exception as e:  # noqa: BLE001 – ohne Selbstprüfung weiter
             melde(f'… Hi-Hat-Selbstprüfung übersprungen ({str(e)[:120]})')
     spuren['hihat'] = hh_y
+    gespielt['hihat'] = hh_info.pop('_schlaege', [])
+    ber['_gespielt'] = gespielt          # 23. Nov: genau die gespielten Schläge -> MIDI (wird vor dem Bericht entfernt)
     ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'), raster=HP.get('raster'))
     return spuren, ber
