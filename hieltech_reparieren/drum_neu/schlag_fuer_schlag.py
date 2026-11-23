@@ -467,7 +467,29 @@ def _an_original(hits, wahl, orig, teil, ber, min_ms=10, max_ms=45):
                                                    median_ms=float(np.median(geschoben)) if geschoben else 0.0)
     return neu
 
-def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, trennen_fn=None, melde=print):
+
+def _wackeln_reparieren(hits, beats, teil, ber, grenze_ms=15, min_je_stelle=4):
+    """23. Nov 2026 (freigegeben, Checkbox „Timing korrigieren“): nur Wackeln reparieren, Gefühl behalten.
+    Raster = Viertel des Songs (nach Tempo-Prüfung) in 4 Stellen (1, e, &, a). Je Stelle der eigene typische Versatz
+    dieses Elements (Median = das Gefühl, z. B. e immer +30 ms). Ein Schlag, der mehr als 15 ms von diesem Gefühl
+    abweicht, wird genau auf Raster + Gefühl gesetzt; alle anderen bleiben unberührt."""
+    if len(beats) < 8 or not hits:
+        return hits
+    st = np.array([h[0] for h in hits]); i = np.searchsorted(beats, st) - 1
+    ok = (i >= 0) & (i < len(beats) - 1); i_ = np.clip(i, 0, len(beats) - 2)
+    q = beats[i_ + 1] - beats[i_]; ph = (st - beats[i_]) / q * 4; k = np.round(ph).astype(int)
+    rast = beats[i_] + q * k / 4; ab = (st - rast) / SR * 1000; pos = k % 4
+    gef = {p: float(np.median(ab[ok & (pos == p)])) for p in range(4) if (ok & (pos == p)).sum() >= min_je_stelle}
+    neu = []; n_ = 0
+    for j, (s_, l_) in enumerate(hits):
+        if ok[j] and pos[j] in gef and abs(ab[j] - gef[pos[j]]) > grenze_ms and abs(ph[j] - k[j]) < 0.4:
+            neu.append([int(rast[j] + gef[pos[j]] / 1000 * SR), l_]); n_ += 1
+        else:
+            neu.append([s_, l_])
+    ber.setdefault('timing_wackeln', {})[teil] = dict(repariert=n_, von=len(hits), gefuehl_ms={str(p): round(v, 1) for p, v in gef.items()})
+    return neu
+
+def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, trennen_fn=None, melde=print, timing=False):
     """G: Teile von Stand G (kick/snare/toms/becken/hihat, Stereo, gleiche Länge). teile_roh: Ordner der Original-
     Trennung (kick/snare/hihat/toms/crash/ride .flac). Rückgabe (neue Teile, Bericht)."""
     n = min(len(v) for v in G.values())
@@ -482,6 +504,8 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         y = np.zeros((n + 40 * SR, 2), np.float32)
         if orig is not None and os.environ.get('SFS_AN_ORIGINAL', '1') == '1':
             hits = _an_original(hits, wahl, orig, teil, ber)
+        if teil in ('kick', 'snare') and timing_raster is not None:     # Toms nicht (Fills, Triolen, Wirbel)
+            hits = _wackeln_reparieren(hits, timing_raster, teil, ber)
         for i, (s, lv) in enumerate(hits):
             smp = wahl[i]
             if smp is None:
@@ -494,6 +518,14 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         return y[:n]
     # Kick
     melde('… Schlag für Schlag: Kick, Snare, Toms')
+    timing_raster = None
+    if timing and song_pfad and os.path.isfile(song_pfad):        # Checkbox „Timing korrigieren“
+        try:
+            song_t = _mono(song_pfad, n)
+            _, bt_ = librosa.beat.beat_track(y=song_t, sr=SR, units='samples', start_bpm=85)
+            timing_raster, _ = _raster_pruefen(gm['hihat'], np.array(bt_))
+        except Exception:
+            timing_raster = None
     kh = _schlaege(gm['kick'])
     spuren['kick'] = setze(kh, _gruppen_wahl(LIB, ber, 'kick', 'kick', kh, ost('kick'), max_gr=1, tonw=1.0, k_trommel=1), orig=ost('kick'), teil='kick')
     # Snare: EINE Haupt-Snare, hohe Snare nur an G-Stellen

@@ -20,7 +20,7 @@ Aufruf:
         [--teile-ordner ORDNER]     schon getrennte Teile benutzen (überspringt Schritt 1)
         [--weg-json DATEI]          Zeiten (s) je Teil, die nicht nachgespielt werden
         [--rimshot-note 37|40]      MIDI-Note für Rimshot (37 Side Stick = Standard, 40 echter Rimshot)
-        [--timing-korrigieren]      Timing-Wackeln entfernen (Raster aus der Spur selbst)
+        [--timing-korrigieren]      Timing-Wackeln entfernen (Kick/Snare, Gefühl des Songs bleibt)
         [--midi-bpm 120]            Tempo der MIDI-Datei (Standard 120 wie ein neues Logic-Projekt)
         [--modelle ORDNER]          Modell-Ordner für audio-separator
         [--s53-toms/--s53-snare/--s53-congas/--s53-percussion/--s53-hh DATEI]
@@ -1201,7 +1201,10 @@ def main():
             melde("… suche gestimmte Fremd-Trommel")
             weg, info_fremd = fremd_trommel_finden(teile_dir)
         hh_ref = tuple(float(v) for v in a.hh_ref.split(",")) if a.hh_ref else None
-        out, bericht = neu_spielen(a.eingabe, teile_dir, a.ziel, hh_ref, weg, a.nur, a.rimshot_note, a.midi_bpm, a.timing_korrigieren,
+        # 23. Nov 2026: mit „Schlag für Schlag“ macht dieser Schritt die Timing-Korrektur selbst (Gefühl bleibt) – die alte
+        # 16tel-Korrektur von Stand G gilt nur noch ohne ihn (Rückweg oder einzelnes Teil)
+        g_timing = a.timing_korrigieren and (a.ohne_schlag_fuer_schlag or bool(a.nur))
+        out, bericht = neu_spielen(a.eingabe, teile_dir, a.ziel, hh_ref, weg, a.nur, a.rimshot_note, a.midi_bpm, g_timing,
                                    vergleich=a.vergleich)
         if info_fremd:
             bericht["fremd_trommel"] = info_fremd
@@ -1226,7 +1229,7 @@ def main():
                             finally:
                                 _sh.rmtree(td, ignore_errors=True)
                         neu2, sb = sfs.ausfuehren(neu, teile_roh_sfs, s53, a.song, a.eingabe, bericht, fb, kr.SAMPLES,
-                                                  trennen_fn=_hh_trennen, melde=melde)
+                                                  trennen_fn=_hh_trennen, melde=melde, timing=a.timing_korrigieren)
                         neu = neu2
                         bericht["schlag_fuer_schlag"] = sb
                         melde("✔ Schlag für Schlag fertig (eigene Bibliothek, Hi-Hat-Hörmodell)")
