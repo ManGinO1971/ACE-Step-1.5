@@ -1238,13 +1238,17 @@ def main():
                         traceback.print_exc()
                         bericht["schlag_fuer_schlag"] = {"fehler": str(e)[:300]}
                         melde(f"… Schlag für Schlag übersprungen – Stand G bleibt ({str(e)[:150]})")
-                for t, y in neu.items():
-                    sf.write(os.path.join(a.ziel, f"{t}_neu.flac"), np.clip(y, -1, 1), SR, subtype="PCM_24")
                 n_ = min(len(y) for y in neu.values())
                 # 20. Nov 2026: wie am 18. Nov (Rise-Up-Hörtest 5b) – ganze Spur auf die Spitze angepasst, KEIN Begrenzer
                 mix = sum(y[:n_, :2] for y in neu.values())
-                mix = mix * 0.98 / (np.abs(mix).max() + 1e-9)
+                faktor = 0.98 / (np.abs(mix).max() + 1e-9)
+                mix = mix * faktor
                 sf.write(out, mix, SR, subtype="PCM_24")
+                # 23. Nov 2026: Einzelspuren mit DEMSELBEN Faktor wie das ganze Schlagzeug und ohne Abschneiden –
+                # alle Spuren zusammen im Programm = 1:1 das ganze Schlagzeug (vorher +1,7 dB und Kick/Snare gekappt)
+                for t, y in neu.items():
+                    sf.write(os.path.join(a.ziel, f"{t}_neu.flac"), (y[:n_, :2] * faktor).astype(np.float32), SR, subtype="PCM_24")
+                bericht["einzelspuren_faktor_db"] = round(float(20 * np.log10(faktor)), 2)
                 bericht["feinschliff"] = fb
                 melde("✔ Feinschliff fertig (Hi-Hat-Muster, Snare, Kick, Toms, Becken)")
             except Exception as e:  # noqa: BLE001 – dann bleibt die bisherige Reparatur
