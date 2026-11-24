@@ -165,17 +165,63 @@ def _gruppen_wahl(LIB, ber, name, fam, hits, orig, nicht=(), k_trommel=6, max_gr
 
 
 def _tom_ton(m, s):
-    """Grundton einer Tom (pyin über den Ausklang 20–300 ms; sonst stärkste Spitze im Spektrum)."""
-    w = m[s + int(.02 * SR):s + int(.30 * SR)]
-    if len(w) > 2048:
-        try:
-            f0, v, _ = librosa.pyin(w, fmin=40, fmax=450, sr=SR, frame_length=2048, hop_length=256)
-            f0 = f0[v & np.isfinite(f0)]
-            if len(f0) >= 3:
-                return float(np.median(f0))
-        except Exception:
-            pass
-    return max(_merkmale(m, s)[1], 40.0)
+    """Grundton einer Tom: pyin über den Ausklang (30–300 ms) und stärkste Spitze im Spektrum (45–450 Hz). Stimmen
+    beide (±1,5 Halbtöne) überein, gilt pyin, sonst die Spitze (pyin springt bei Toms gern auf Obertöne)."""
+    w = m[s + int(.03 * SR):s + int(.30 * SR)]
+    if len(w) < 2048:
+        return max(_merkmale(m, s)[1], 40.0)
+    S = np.abs(np.fft.rfft(w * np.hanning(len(w)), 1 << 16)); fr = np.fft.rfftfreq(1 << 16, 1 / SR)
+    band = (fr > 45) & (fr < 450); spitze = float(fr[band][np.argmax(S[band])])
+    try:
+        f0, v, _ = librosa.pyin(w, fmin=40, fmax=450, sr=SR, frame_length=2048, hop_length=256)
+        f0 = f0[v & np.isfinite(f0)]
+        if len(f0) >= 3:
+            p_ = float(np.median(f0))
+            if p_ >= 46 and abs(12 * np.log2(p_ / spitze)) < 1.5:
+                return p_
+    except Exception:
+        pass
+    return spitze
+
+
+
+def _abkling_dbs(m, s, hz, bis=0.25):
+    """Wie schnell klingt der Grundton ab (dB/s, negativ), gemessen 60 ms bis `bis` nach dem Schlag."""
+    import scipy.signal as sg
+    w = m[s:s + int(0.6 * SR)]
+    if len(w) < int(0.2 * SR):
+        return None
+    y = sg.sosfiltfilt(sg.butter(2, [hz / 1.15, min(hz * 1.15, 0.45 * SR)], 'band', fs=SR, output='sos'), w)
+    h = int(.01 * SR); e = 20 * np.log10(np.array([np.abs(y[i:i + h]).max() for i in range(0, len(y) - h, h)]) + 1e-9)
+    t = np.arange(len(e)) * 0.01; msk = (t > 0.06) & (t < bis) & (e > e.max() - 50)
+    return float(np.polyfit(t[msk], e[msk], 1)[0]) if msk.sum() > 4 else None
+
+
+def _tom_abklingen_song(orig, starts, hz, alle_starts):
+    v = []
+    for s in starts:
+        nach = [a for a in alle_starts if a > s + int(.02 * SR)]
+        if nach and nach[0] - s < int(0.3 * SR):
+            continue                                    # nächster Schlag zu nah – Ausklang nicht messbar
+        k = _abkling_dbs(orig, s, hz)
+        if k is not None and k < -5:                    # steigt der Pegel, war es Übersprechen – nicht zählen
+            v.append(k)
+    return float(np.median(v)) if v else None
+
+
+def _tom_abklingen_lib(s_):
+    if 'abkl' not in s_:
+        x = s_['x'].mean(1); hz = 100 * 2 ** (s_['st'] / 12)
+        s_['abkl'] = _abkling_dbs(x, 0, hz) or -80.0
+    return s_['abkl']
+
+def _tom_satz(name):
+    """Aufnahme-Sitzung einer Tom-Datei (= dieselbe Trommel): z. B. Break_2148, Neu_0825, Nr0442, RotoTom, alt."""
+    import re
+    m = re.search(r'_(Break|Neu)_(\d{4})-', name) or re.search(r'(Nr\d+)-', name)
+    if m:
+        return '_'.join(g for g in m.groups() if g)
+    return 'RotoTom' if 'RotoTom' in name else ('alt' if 'alt' in name.lower() else name)
 
 
 def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
@@ -204,8 +250,10 @@ def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
     gruppen = sorted(set(grp), key=lambda g_: np.median(st[grp == g_]))
     P = [s_ for s_ in LIB if s_['kat'].startswith('Toms/')]
     for s_ in P:
-        if 'st' not in s_:
-            s_['st'] = 12 * np.log2(_tom_ton(s_['x'].mean(1), 0) / 100.0)
+        if 'st' not in s_:                              # Ton aus dem Dateinamen (sorgfältig gemessen), sonst messen
+            import re as _re
+            m_hz = _re.search(r'_(\d{2,3})Hz', s_['name'])
+            s_['st'] = 12 * np.log2((float(m_hz.group(1)) if m_hz else _tom_ton(s_['x'].mean(1), 0)) / 100.0)
     vergeben = set(); wahl = [None] * len(hits); info = {}; fehlt = []
     for nr, g_ in enumerate(gruppen):
         idx = np.where(grp == g_)[0]; ziel = float(np.median(st[idx])); hz = 100 * 2 ** (ziel / 12)
@@ -214,12 +262,25 @@ def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
         # die Klangfarbe am Anschlag (wie bisher bei Rise Up). Sonst die mit dem nächsten Ton.
         nah = [s_ for s_ in frei if abs(s_['st'] - ziel) <= max_stimmen]
         mo = [_merkmale(orig, hits_o[i]) for i in idx]
+        ab_o = None
         ref_ton = float(np.median([m_[1] for m_ in mo]))
         if nah:
-            haupt = min(nah, key=lambda s_: (np.mean([_abst(m_, s_['m'], tonw=3.0) for m_ in mo]), s_['name']))
+            # 24. Nov (Inhaber): genau die richtige Tom – Ton, Klangfarbe UND wie lange sie klingt (Abklingen wie im
+            # Original, gemessen am Grundton, nur an Schlägen ohne direkt folgenden Schlag)
+            ab_o = _tom_abklingen_song(orig, [hits_o[i] for i in idx], 100 * 2 ** (ziel / 12), [h_[0] for h_ in hits])
+            def wert(s_):
+                k = np.mean([_abst(m_, s_['m'], tonw=3.0) for m_ in mo])
+                # (Abklingen wird gemessen und angezeigt, zählt aber vorerst nicht – 24. Nov: Stand 8a bleibt)
+                return (k, s_['name'])
+            haupt = min(nah, key=wert)
         else:
             haupt = min(frei, key=lambda s_: (abs(s_['st'] - ziel), s_['name']))
-        lagen = [s_ for s_ in P if s_['kat'] == haupt['kat'] and abs(s_['st'] - haupt['st']) <= 1.0 and s_['name'] not in vergeben][:4] or [haupt]
+        # Stärken derselben Trommel: gleiche Aufnahme-Sitzung (gleiche Trommel), ±1 Halbton, gleicher Ausklang (kurz/lang)
+        satz = _tom_satz(haupt['name'])
+        lagen = [s_ for s_ in P if _tom_satz(s_['name']) == satz and abs(s_['st'] - haupt['st']) <= 1.0
+                 and ('_kurz_' in s_['name']) == ('_kurz_' in haupt['name']) and s_['name'] not in vergeben][:4] or [haupt]
+        if haupt not in lagen:
+            lagen = [haupt] + lagen[:3]
         for s_ in lagen:
             vergeben.add(s_['name'])
         if abs(haupt['st'] - ziel) > max_stimmen and 48 <= hz <= 450:
@@ -238,7 +299,8 @@ def _toms_wahl(LIB, ber, hits, orig, sprung=2.5, max_stimmen=3.0):
         for j, i in enumerate(idx):
             q = int(round(rk[j] * (len(tr) - 1))); c = [v for v in (q, q + 1, q - 1) if 0 <= v < len(tr)]
             v = c[0] if tr[c[0]]['name'] != letzte or len(c) == 1 else c[1]; wahl[i] = tr[v]; letzte = tr[v]['name']
-        info[f'tom_{nr + 1}'] = dict(schlaege=len(idx), ton_original_hz=round(hz), art=haupt['kat'], dateien=[t['name'] for t in tr])
+        info[f'tom_{nr + 1}'] = dict(schlaege=len(idx), ton_original_hz=round(hz), art=haupt['kat'], dateien=[t['name'] for t in tr],
+                                     abklingen_original_db_s=None if ab_o is None else round(ab_o), abklingen_gewaehlt_db_s=round(_tom_abklingen_lib(haupt)))
     ber['toms'] = info
     if fehlt:
         ber['toms_fehlt_in_bibliothek_hz'] = fehlt
@@ -517,6 +579,14 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             if teil:
                 gespielt.setdefault(teil, []).append((int(s), float(lv), smp))   # 23. Nov: fürs MIDI (genau was klingt)
             x_ = smp['x'] * 10 ** (lv / 20)
+            if teil == 'toms' and smp.get('tom_hz') is not None:
+                # 23. Nov (Inhaber): eine Tom klingt bis zum nächsten Schlag auf DIESELBE Tom (der stoppt sie),
+                # sonst voll bis zum Ende – nie mit der Hand gestoppt
+                nx = [h_[0] for j_, h_ in enumerate(hits) if j_ > i and wahl[j_] is not None
+                      and wahl[j_].get('tom_hz') == smp['tom_hz']]
+                if nx and nx[0] > s:
+                    f_ = int(.015 * SR); L = min(len(x_), nx[0] - s + f_); x_ = x_[:L].copy()
+                    x_[max(0, L - f_):] *= np.linspace(1, 0, min(f_, L))[:, None]
             if stopp and stopp[i]:
                 L = min(len(x_), stopp[i]); f_ = int(.06 * SR); x_ = x_[:L].copy()
                 x_[max(0, L - f_):] *= np.linspace(1, 0, min(f_, L))[:, None]
