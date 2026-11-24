@@ -862,13 +862,27 @@ def becken_noten(teile_dir, xb, hits, bericht):
     return noten
 
 
+def _steigung(t, e, ersatz):
+    """Gerade durch die Messpunkte (dB/s). 24. Nov 2026: neuer Song brach nach 40 min mit „SVD did not converge“
+    ab – ungültige Werte (NaN/unendlich) werden jetzt ausgelassen, und klappt es trotzdem nicht, gilt `ersatz`."""
+    t = np.asarray(t, np.float64); e = np.asarray(e, np.float64)
+    ok = np.isfinite(t) & np.isfinite(e)
+    if ok.sum() < 2:
+        return ersatz
+    try:
+        k = float(np.polyfit(t[ok], e[ok], 1)[0])
+        return k if np.isfinite(k) else ersatz
+    except (np.linalg.LinAlgError, ValueError):
+        return ersatz
+
+
 def hh_oeffnung(x, hits, bericht, xb=None):
     """Öffnung jeder Hi-Hat aus dem Abklingen der Höhen bis zum nächsten Schlag:
     zu ≈ −250 dB/s, offen ≈ −20 dB/s. Ergebnis je Schlag (GM-Note, CC4): CC4 127 = zu, 0 = offen
     (so lesen es EZdrummer, Superior Drummer, Addictive Drums). Note 42 bis halboffen, ab weit offen 46,
     damit auch Plugins ohne CC4 (Logic Drum Kit Designer) richtig klingen."""
-    hf = kr._hf(x.mean(1))
-    hb = kr._hf(xb.mean(1)) if xb is not None else None
+    hf = np.nan_to_num(kr._hf(x.mean(1)), nan=0.0, posinf=0.0, neginf=0.0)
+    hb = np.nan_to_num(kr._hf(xb.mean(1)), nan=0.0, posinf=0.0, neginf=0.0) if xb is not None else None
     k = int(0.005 * SR)
     aus = []
     unsicher = 0
@@ -880,7 +894,7 @@ def hh_oeffnung(x, hits, bericht, xb=None):
         if n >= 6:
             e = 20 * np.log10(np.sqrt((seg[:n * k].reshape(n, k) ** 2).mean(1)) + 1e-9)
             p = int(np.argmax(e[:6]))
-            steigung = float(np.polyfit(np.arange(n - p) * 0.005, e[p:], 1)[0])
+            steigung = _steigung(np.arange(n - p) * 0.005, e[p:], -250.0)   # 24. Nov: nie mehr Absturz (SVD)
             o = float(np.clip((steigung + 180.0) / (180.0 - 40.0), 0.0, 1.0))   # −180 dB/s zu … −40 dB/s offen
             # langer Ausklang nur glauben, wenn er wirklich von der Hi-Hat kommt: nicht wieder ansteigend
             # (= nächster/anderer Schlag) und klar (12 dB) über dem Becken, das in die HH-Spur hineinklingt
@@ -1377,6 +1391,12 @@ def main():
     except Exception as e:
         import traceback
         traceback.print_exc()
+        try:
+            import time                                   # 24. Nov 2026: ganzer Fehlerweg zum Nachlesen (Oberfläche zeigt nur das Ende)
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "letzter_fehler.txt"), "w", encoding="utf-8") as f_:
+                f_.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + " ".join(sys.argv) + "\n\n" + traceback.format_exc())
+        except Exception:  # noqa: BLE001
+            pass
         print(json.dumps({"ok": False, "fehler": str(e)}, ensure_ascii=False))
         sys.exit(1)
 

@@ -191,10 +191,19 @@ def _abkling_dbs(m, s, hz, bis=0.25):
     w = m[s:s + int(0.6 * SR)]
     if len(w) < int(0.2 * SR):
         return None
-    y = sg.sosfiltfilt(sg.butter(2, [hz / 1.15, min(hz * 1.15, 0.45 * SR)], 'band', fs=SR, output='sos'), w)
+    if not np.isfinite(hz) or hz <= 20:
+        return None
+    y = np.nan_to_num(sg.sosfiltfilt(sg.butter(2, [hz / 1.15, min(hz * 1.15, 0.45 * SR)], 'band', fs=SR, output='sos'), w))
     h = int(.01 * SR); e = 20 * np.log10(np.array([np.abs(y[i:i + h]).max() for i in range(0, len(y) - h, h)]) + 1e-9)
     t = np.arange(len(e)) * 0.01; msk = (t > 0.06) & (t < bis) & (e > e.max() - 50)
-    return float(np.polyfit(t[msk], e[msk], 1)[0]) if msk.sum() > 4 else None
+    msk &= np.isfinite(e)
+    if msk.sum() <= 4:
+        return None
+    try:                                                # 24. Nov: nie an einer Messung abstürzen (SVD)
+        k = float(np.polyfit(t[msk], e[msk], 1)[0])
+        return k if np.isfinite(k) else None
+    except (np.linalg.LinAlgError, ValueError):
+        return None
 
 
 def _tom_abklingen_song(orig, starts, hz, alle_starts):
