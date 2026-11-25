@@ -89,8 +89,26 @@ def lese(p, n=None, mono=False):
     return x.mean(1) if mono else x
 
 
+def _finde(rel):
+    """25. Nov 2026: „piatto aperto 2“ liegt im Ordner HiHat_halb_offen, nicht in HiHat_offen – Money Tumble Down
+    (Hi-Hat mit 2 offenen Stellen) brach deshalb den Feinschliff ab, und damit fiel „Schlag für Schlag“ ganz aus.
+    Fehlt eine Datei am erwarteten Ort, wird sie jetzt in der ganzen Akustik-Bibliothek nach Namen gesucht."""
+    if os.path.isfile(AK + rel):
+        return AK + rel
+    import glob
+    name = os.path.basename(rel)
+    treffer = sorted(glob.glob(os.path.join(AK, "**", name), recursive=True))
+    if treffer:
+        return treffer[0]
+    ordner = os.path.dirname(AK + rel)                  # gar nicht da: ein anderer Klang aus demselben Ordner
+    andere = sorted(glob.glob(os.path.join(ordner, "*.flac")))
+    if andere:
+        return andere[0]
+    raise FileNotFoundError(AK + rel)
+
+
 def sample(rel, lang=None):
-    y = lese(AK + rel)
+    y = lese(_finde(rel))
     i = int(np.argmax(np.abs(y).max(1) > np.abs(y).max() * 0.1))
     y = y[max(0, i - 22):]
     if lang:
