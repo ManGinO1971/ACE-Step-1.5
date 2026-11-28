@@ -228,6 +228,11 @@ def trommeln_abziehen(teile_dir, ziel, s53, bericht):
         x = _stereo_lesen(pfad)
         n = len(x)
         tr = sum(_stereo_lesen(p, n) for p in trommel).mean(1)
+        tr_cg = tr
+        if teil == "snare" and s53.get("congas") and os.path.exists(s53["congas"]):
+            # 26. Nov 2026 (Prüf-Sammlung Money + Stand The Ghetto): die 53er-„Percussion“ enthält oft den Rim/die Snare
+            # selbst (Money: −11 dB an jedem Kick-Schlag) – beim Aussortieren einzelner Schläge zählen nur die Congas
+            tr_cg = _stereo_lesen(s53["congas"], n).mean(1)
         b = _stereo_lesen(bez, n).mean(1)
         _, _, B = stft(b, SR, nperseg=N, noverlap=N - H)
         _, _, T = stft(tr, SR, nperseg=N, noverlap=N - H)
@@ -271,9 +276,44 @@ def trommeln_abziehen(teile_dir, ziel, s53, bericht):
             if kraeftig:
                 rest = np.median([_db(am, i) - _db(xm, i) for i in kraeftig])
                 info["snare_haupt_rest_db"] = round(float(rest), 1)
-                if rest < -6.0:                              # mehr als 3/4 der Haupt-Snare wäre weg
+                # 25. Nov 2026 (Money Tumble Down): der Schutz ist für Songs, in denen das 53er die echte Snare für
+                # „Percussion“ hält (Stand The Ghetto – dort sind keine Congas). Sind an den kräftigen Schlägen
+                # aber Congas/Hand-Trommeln deutlich zu hören, SIND die kräftigsten Schläge Trommeln: dann kein
+                # Schutz, sondern nur Schläge behalten, die auch die 53er-Snare klar hört.
+                cg = s53.get("congas")
+                cg_db = None
+                if cg and os.path.exists(cg):
+                    cgm = _stereo_lesen(cg, n).mean(1)
+                    cg_db = float(np.median([_db(cgm, i) for i in kraeftig]))
+                    info["congas_an_kraeftigen_db"] = round(cg_db, 1)
+                # 26. Nov (Zion Callin, keine Trommeln): Congas bei −44 dB sind nur Übersprechen – erst ab −35 dB echte Trommeln
+                if rest < -6.0 and (cg_db is None or cg_db < -35.0):    # mehr als 3/4 der Haupt-Snare wäre weg
                     aus = x.copy(); raus_schlaege = []
                     info["snare_haupt_geschuetzt"] = True
+                elif rest < -6.0:
+                    aus = x.copy(); raus_schlaege = []
+                    on_a = librosa.onset.onset_detect(y=xm, sr=SR, hop_length=hop, backtrack=True, units="samples")
+                    Bs = np.array([_db(b, i) for i in on_a]) if len(on_a) else np.zeros(0)
+                    ref_b = float(np.percentile(Bs, 95)) if len(Bs) else -120.0
+                    kp_ = os.path.join(teile_dir, "kick.flac")      # One Drop: Rim/Snare GENAU mit der Kick = Schlagzeug
+                    ko_ = (librosa.onset.onset_detect(y=_stereo_lesen(kp_, n).mean(1), sr=SR, hop_length=hop,
+                                                      units="samples", delta=0.2) if os.path.exists(kp_) else np.zeros(0))
+                    mit_kick = 0
+                    for k_, i in enumerate(on_a):
+                        echt = Bs[k_] > ref_b - 15 and Bs[k_] - _db(tr_cg, i) > -15     # die 53er-Snare hört ihn klar
+                        if not echt and len(ko_) and np.min(np.abs(ko_ - i)) < 0.025 * SR and _db(xm, i) - _db(tr_cg, i) > -6:
+                            echt = True; mit_kick += 1
+                        if echt or _db(xm, i) <= -60:
+                            continue
+                        e_ = min(on_a[k_ + 1] if k_ + 1 < len(on_a) else n, i + int(0.45 * SR))
+                        a_ = max(0, i - int(0.01 * SR)); f_ = int(0.005 * SR)
+                        g = np.ones(n, np.float32); g[a_:e_] = 0.0
+                        g[max(0, a_ - f_):a_] = np.linspace(1, 0, a_ - max(0, a_ - f_))
+                        g[e_:min(n, e_ + f_)] = np.linspace(0, 1, min(n, e_ + f_) - e_)
+                        aus *= g[:, None]
+                        raus_schlaege.append(round(i / SR, 2))
+                    info["snare_nur_53er_gestuetzt"] = True
+                    info["snare_mit_kick_behalten"] = mit_kick
         raus = x - aus
         e_vor = float(np.sum(x ** 2)) + 1e-12
         info[teil] = {"entfernt_prozent": round(100 * float(np.sum(raus ** 2)) / e_vor, 1),
@@ -1271,7 +1311,8 @@ def main():
     ap.add_argument("--modelle", default=os.path.expanduser("~/HELTECH_Stems/models/"))
     ap.add_argument("--song", default=None, help="ganzer Song (22. Nov 2026: Hi-Hat-Hörmodell, Becken-Pause)")
     ap.add_argument("--ohne-schlag-fuer-schlag", action="store_true", help="nur Stand G (Rückweg)")
-    for _t in ("toms", "snare", "congas", "percussion", "hh"):  # 18./19. Nov 2026: 53er-Spuren (Trommeln, Feinschliff)
+    ap.add_argument("--ohne-saeubern", action="store_true", help="Stem nicht auf Hand-Trommeln säubern (Rückweg)")
+    for _t in ("toms", "snare", "congas", "percussion", "hh", "tambourine"):  # 18./19. Nov: 53er-Spuren; 25. Nov: Tamburin (Hi-Hat)
         ap.add_argument(f"--s53-{_t}", default=None)
     a = ap.parse_args()
     os.makedirs(a.ziel, exist_ok=True)
@@ -1281,9 +1322,33 @@ def main():
         else:
             melde("… trenne Schlagzeug in Kick/Snare/Toms/Hi-Hat/Becken (dauert einige Minuten)")
             teile_dir = trennen(a.eingabe, a.ziel, a.modelle)
-        teile_roh_sfs = teile_dir                    # 22. Nov 2026: Original-Trennung (vor Trommel-Abzug) für Schlag für Schlag
         trommel_info = {}
-        s53 = {t: getattr(a, f"s53_{t}") for t in ("toms", "snare", "congas", "percussion", "hh")}
+        s53 = {t: getattr(a, f"s53_{t}") for t in ("toms", "snare", "congas", "percussion", "hh", "tambourine")}
+        # 28. Nov 2026 (Money Tumble Down, „gut, bauen“): spielen Hand-Trommeln (Congas/Djembe) laut und oft mit, wird
+        # der Schlagzeug-Stem erst gesäubert (Djembe-Bass als zweite Kick, Trommel-Reste als Snare/Toms) und dann noch
+        # einmal in Kick/Snare/… getrennt. Ohne Hand-Trommeln bleibt alles wie vorher.
+        saeubern_info = None
+        if not a.nur and s53.get("congas") and not a.ohne_saeubern:
+            try:
+                import stem_saeubern
+                melde("… prüfe auf Hand-Trommeln (Congas/Djembe) im Schlagzeug")
+                sauber = os.path.join(a.ziel, "schlagzeug_gesaeubert.wav")
+                saeubern_info = stem_saeubern.saeubern(a.eingabe, teile_dir, s53, sauber)
+                if saeubern_info.get("gesaeubert"):
+                    melde(f"✔ Hand-Trommeln gefunden ({saeubern_info['hand_trommeln']['laute_einsaetze_je_min']} je Minute) – "
+                          f"Schlagzeug gesäubert ({saeubern_info.get('tiefe_reste_weg', 0)} tiefe Trommel-Schläge raus), trenne neu")
+                    teile_dir = trennen(sauber, os.path.join(a.ziel, "gesaeubert"), a.modelle)
+                    a.eingabe = sauber
+                elif saeubern_info.get("grund"):
+                    melde(f"✔ {saeubern_info['grund']} – Schlagzeug bleibt wie getrennt")
+                else:
+                    melde("✔ keine Hand-Trommeln – Schlagzeug bleibt wie getrennt")
+            except Exception as e:  # noqa: BLE001 – nie an diesem Zusatzschritt scheitern
+                import traceback
+                traceback.print_exc()
+                saeubern_info = {"fehler": str(e)[:300]}
+                melde(f"… Säubern übersprungen ({str(e)[:150]})")
+        teile_roh_sfs = teile_dir                    # 22. Nov 2026: Original-Trennung (vor Trommel-Abzug) für Schlag für Schlag
         if not a.nur and (s53["congas"] or s53["percussion"]):
             melde("… ziehe Trommeln (Congas/Percussion, 53er-Modell) aus Toms und Snare ab")
             try:
@@ -1322,6 +1387,8 @@ def main():
                                    vergleich=a.vergleich)
         if info_fremd:
             bericht["fremd_trommel"] = info_fremd
+        if saeubern_info is not None:
+            bericht["saeubern"] = saeubern_info
         if not a.nur:                              # 19. Nov 2026: Feinschliff fürs ganze Schlagzeug
             try:
                 import drum_feinschliff as fs

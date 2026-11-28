@@ -16,6 +16,9 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.signal import firwin2, fftconvolve
 
 SR = 44100
+# 28. Nov 2026: wie weit die Hi-Hat dem getrennten Original-Schlag folgt (Test-Schalter; getrennte Spitzen wackeln)
+HH_FOLGE_MS = float(os.environ.get('HH_FOLGE_MS', '8'))
+HH_FOLGE_ANTEIL = float(os.environ.get('HH_FOLGE_ANTEIL', '0.5'))
 
 
 def _lade(p):
@@ -73,6 +76,11 @@ def bibliothek(samples):
         if e['element'] in _ALT and 'SnareHi_SP' not in e['datei'] and 'SnareDry_SP' not in e['datei']:
             L.append(dict(kat=_ALT[e['element']], quelle=os.path.join(ab, e['datei']), name='alt: ' + os.path.basename(e['datei'])))
     L = [s for s in L if os.path.isfile(s['quelle'])]
+    try:   # 26. Nov 2026: vom Inhaber gesperrte Klänge (alle Teile, z. B. Doppelschläge) – sfs/gesperrt.json
+        gs = json.load(open(os.path.join(samples, 'sfs', 'gesperrt.json'), encoding='utf-8')).get('gesperrt', [])
+    except (OSError, ValueError):
+        gs = []
+    L = [s for s in L if not any(g in s['name'] or g in s['quelle'] for g in gs)]
     for s in L:
         x = _lade(s['quelle']); a = np.abs(x).max(1); st = max(0, int(np.argmax(a > a.max() * 0.1)) - 44)
         x = x[st:]; s['x'] = x / (np.abs(x).max() + 1e-9); s['m'] = _merkmale(s['x'].mean(1))
@@ -365,11 +373,42 @@ def _raster_pruefen(HH, beats, vorsprung=0.10):
     wahl = best if pkt['erkannt'] - pkt[best] >= vorsprung else 'erkannt'
     return np.array(kand[wahl]), dict(punkte=pkt, wahl=wahl)
 
-def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
-    """Muster der Hi-Hat aus dem ganzen Song. Rückgabe dict(muster, plan, tempo) wie im Test (plan2.json)."""
+def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print, tamb=None, kick=None):
+    """Muster der Hi-Hat aus dem ganzen Song. Rückgabe dict(muster, plan, tempo) wie im Test (plan2.json).
+    25. Nov 2026 (Money Tumble Down): `tamb` = 53er-Tamburin. Die DrumSep-Hi-Hat enthält ein Tamburin mit, dann
+    klingelt es auf den schwachen Sechzehnteln lang und das Hörmodell spielte dort halboffene Hi-Hats. Ist ein
+    Tamburin da, wird Klang/Länge nur aus der 53er-Hi-Hat gehört, und Stellen, an denen das Tamburin klar lauter
+    ist als die 53er-Hi-Hat, gelten nicht als Hi-Hat. Ohne Tamburin bleibt alles wie vorher."""
     n = min(map(len, (song, hh53, hhds, per)))
     song, S53, DS, PE = song[:n], hh53[:n], hhds[:n], per[:n]
-    HH = 0.5 * (S53 / (np.abs(S53).max() + 1e-9) + DS / (np.abs(DS).max() + 1e-9)); PEn = PE / (np.abs(S53).max() + 1e-9) * 0.5
+    TB = None
+    if tamb is not None and len(tamb):
+        TB = np.zeros(n, np.float32); TB[:min(n, len(tamb))] = tamb[:n]
+        if np.abs(TB).max() < 0.1 * (np.abs(S53).max() + 1e-9):      # unter −20 dB der Hi-Hat: kein echtes Tamburin
+            TB = None
+    if TB is None:
+        HH = 0.5 * (S53 / (np.abs(S53).max() + 1e-9) + DS / (np.abs(DS).max() + 1e-9))
+    else:
+        HH = S53 / (np.abs(S53).max() + 1e-9)                       # Tamburin im Song: nur die saubere 53er-Hi-Hat
+    hh_luecken = None
+    if TB is not None:
+        # 26. Nov 2026 (Zion Callin): das 53er verliert die Hi-Hat abschnittsweise (ab 0:30 −76 dB, sie landet dann im
+        # „Tamburin“), DrumSep hört sie durchgehend. Wo die 53er-Hi-Hat fehlt, aber DrumSep klar Hi-Hat hat → DrumSep nehmen.
+        DSn = DS / (np.abs(DS).max() + 1e-9)
+        w_ = int(SR * 0.5); k_ = np.ones(w_) / w_
+        eS = np.sqrt(np.convolve(HH.astype(np.float64) ** 2, k_, 'same')) + 1e-12
+        eD = np.sqrt(np.convolve(DSn.astype(np.float64) ** 2, k_, 'same')) + 1e-12
+        pS, pD = np.percentile(eS, 90), np.percentile(eD, 90)
+        rS, rD = 20 * np.log10(eS / pS), 20 * np.log10(eD / pD)
+        luecke = (rS < rD - 12) & (rD > -20)          # 53er hört dort deutlich weniger Hi-Hat als DrumSep
+        if luecke.mean() > 0.02:
+            wl = np.convolve(luecke.astype(np.float64), np.ones(int(SR * .2)) / int(SR * .2), 'same')
+            HH = ((1 - wl) * HH + wl * DSn * (pS / pD)).astype(np.float32)
+            gr = np.flatnonzero(np.diff(np.r_[0, luecke.astype(np.int8), 0]))
+            hh_luecken = [[round(gr[i] / SR, 1), round(gr[i + 1] / SR, 1)] for i in range(0, len(gr), 2)
+                          if gr[i + 1] - gr[i] > SR][:30]
+            melde(f"… Hi-Hat: 53er-Hi-Hat fehlt in {100 * luecke.mean():.0f} % des Songs – dort DrumSep-Hi-Hat")
+    PEn = PE / (np.abs(S53).max() + 1e-9) * 0.5
     AND = np.array(andere)
     tempo, beats = librosa.beat.beat_track(y=song, sr=SR, units='samples', start_bpm=85); beats = np.array(beats)
     env = np.abs(HH)
@@ -377,6 +416,22 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
     if os.environ.get('HH_RASTER', '1') == '1':
         beats, raster_info = _raster_pruefen(HH, beats)
         tempo = 60 * SR / float(np.median(np.diff(beats)))
+    if len(beats) > 12 and os.environ.get('HH_RASTER_GLATT', '1') == '1':
+        beats = _beats_glatt(beats)
+    zaehlung = None
+    if kick is not None and len(kick) >= 8 and len(beats) > 8:
+        # 26. Nov 2026 (Plan Stufe 0): die Kick fällt bei Reggae auf einen Schlag. Liegt sie meistens auf Stelle 2,
+        # zählt die App eine Achtel verschoben (Money Tumble Down: 98 %) – dann Zählung um eine Achtel verschieben.
+        kk = np.array(sorted(kick)); q_ = np.diff(beats); i_ = np.searchsorted(beats, kk) - 1
+        ok_ = (i_ >= 0) & (i_ < len(q_))
+        st_ = np.round((kk[ok_] - beats[i_[ok_]]) / q_[i_[ok_]] * 4).astype(int) % 4
+        if len(st_) >= 8:
+            a0, a2 = float(np.mean(st_ == 0)), float(np.mean(st_ == 2))
+            zaehlung = dict(kick_auf_stelle_0=round(a0, 2), kick_auf_stelle_2=round(a2, 2), verschoben=False)
+            if a2 >= 0.6 and a0 < 0.2:
+                beats = ((beats[:-1] + beats[1:]) // 2).astype(beats.dtype)
+                zaehlung['verschoben'] = True
+                melde('… Hi-Hat: Grundschlag eine Achtel verschoben gezählt – korrigiert (Kick)')
 
     def spitze(s):
         a = max(0, s - int(.05 * SR)); w = env[a:s + int(.06 * SR)]; return a + int(np.argmax(w)), 20 * np.log10(w.max() + 1e-9)
@@ -391,8 +446,21 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
     p53 = np.array([[20 * np.log10(e53[max(0, int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) - int(.05 * SR)):
                                           int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) + int(.06 * SR)].max() + 1e-9)
                      for k in range(4)] for i in range(len(beats) - 1)])
-    s53 = np.median(p53[aktiv], 0); s53 = s53 - s53.max()
+    s53_abs = np.median(p53[aktiv], 0)
+    s53 = s53_abs - s53_abs.max()
+    tb_db = None
+    if TB is not None:                                      # Tamburin-Pegel je Stelle (gleiche Messung, gleiches Modell)
+        eT = np.abs(TB)
+        pT = np.array([[20 * np.log10(eT[max(0, int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) - int(.05 * SR)):
+                                         int(beats[i] + (beats[i + 1] - beats[i]) * k / 4) + int(.06 * SR)].max() + 1e-9)
+                        for k in range(4)] for i in range(len(beats) - 1)])
+        tb_db = np.median(pT[aktiv], 0) - s53_abs           # > 0: Tamburin lauter als die Hi-Hat an dieser Stelle
+    # 28. Nov 2026 (Money, gesäuberter Stem): ist das Tamburin an ALLEN Stellen viel lauter als die Hi-Hat (Median ≥ 12 dB),
+    # kann der Vergleich nicht mehr sagen, wo die Hi-Hat fehlt – dann entscheidet nur die 53er-Hi-Hat (≤ −18 dB = keine).
+    # Vorher kippte Stelle 0 bei −9,1 statt −9,0 dB weg, und der halbe Hi-Hat-Grundschlag fehlte (klang wie falsches Timing).
+    tb_ueberall = tb_db is not None and float(np.median(tb_db)) >= 12
     stellen = {}
+    tamb_stellen = []
     for k in range(4):
         idx = [i for i in range(len(R)) if aktiv[i] and lv[i, k] > gmax - 30]
         if len(idx) < 0.5 * aktiv.sum():
@@ -401,7 +469,80 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
             continue                                        # die 53er-Hi-Hat hört hier (fast) nichts – keine Hi-Hat
         if np.mean([stoert(R[i][k][0]) for i in idx]) > 0.6 and s53[k] <= -12:
             continue                                        # Übersprechen von Kick/Snare – keine Hi-Hat
+        if tb_db is not None and tb_db[k] >= 6 and s53[k] <= -9 and not tb_ueberall:   # 28. Nov: s. tb_ueberall
+            tamb_stellen.append(k)
+            continue                                        # 25. Nov: hier spielt das Tamburin, nicht die Hi-Hat
         stellen[k] = idx
+    # ---- 25. Nov 2026: Katalog aller Reggae-Hi-Hat-Figuren (hihat_figuren.py, Plan mit dem Inhaber) ----------------
+    # Je Stelle wird gemessen, wie laut und wie lang die Hi-Hat klingt (bei Tamburin nur aus der 53er-Hi-Hat), daraus die
+    # Spielweise (zu / halb offen vom Fuß / offen) – und die ähnlichste Figur des Katalogs gewählt. Die Figur bestimmt,
+    # WELCHE Stellen gespielt werden und mit welcher Spielweise; Lautstärke, Timing und Tempo kommen weiter aus dem Song.
+    figur, fig_art, fig_klaenge, fig_info, fig_len = None, {}, {}, None, {}
+    try:
+        import hihat_figuren as HF
+        envH = np.abs(HH)
+        mess = []
+        for k in range(4):
+            lens = []
+            for i in np.where(aktiv)[0]:
+                p_ = R[i][k][0]; h_ = int(.01 * SR)
+                e_ = np.array([np.sqrt(np.mean(HH[p_ + q * h_:p_ + (q + 1) * h_] ** 2)) for q in range(50)]) + 1e-12
+                if TB is not None:
+                    # 26. Nov 2026 (Money): der Ausklang der Hi-Hat folgt dem Tamburin (Korrelation ~0,8) – dessen
+                    # Anteil abziehen, sonst wirkt jeder leise Schlag 300–400 ms lang statt der echten 160–190 ms
+                    eT = np.array([np.sqrt(np.mean(TB[p_ + q * h_:p_ + (q + 1) * h_] ** 2)) for q in range(50)]) + 1e-12
+                    g_ = float(np.min(e_[3:30] / eT[3:30])) * 0.9
+                    e_ = np.maximum(e_ - g_ * eT, 1e-12)
+                e_ = 20 * np.log10(e_ / (e_[0] + 1e-12) + 1e-9)
+                lens.append(int(np.argmax(e_ < -15)) * 10 if (e_ < -15).any() else 500)
+            mess.append(float(np.median(lens)) if lens else 0.0)
+        pegel_k = (s53 if TB is not None else np.median(lv[aktiv], 0) - np.median(lv[aktiv], 0).max())
+        # Übertönt das Tamburin die Hi-Hat klar, ist die Länge unsicher (Rest-Tamburin) – „halb offen“ dann erst ab 250 ms
+        # (26. Nov, Money: 150/190 ms gemessen, der Inhaber hört aber den Rise-Up-Stil = alles zu)
+        b_ab = 250 if (tb_db is not None and float(np.median(tb_db)) >= 12) else 130
+        art_k = ['A' if L_ < b_ab else 'B' if L_ <= 450 else 'D' for L_ in mess]
+        # gespielt: was das Hörmodell ohnehin als Hi-Hat-Stelle erkannt hat – dazu leise, aber LANG klingende Stellen
+        # (halb offen/offen sind von Natur aus leise Zischer; leise kurze „Ticks“ sind dagegen oft nur Übersprechen)
+        # dazu die schwachen Sechzehntel (Stelle 1/3), wenn sie klar zu hören sind (> −20 dB) – sie sind der Groove
+        da_k = [bool(k in stellen or (art_k[k] in 'BCD' and pegel_k[k] > -24) or (k in (1, 3) and pegel_k[k] > -20))
+                for k in range(4)]
+        beste = None
+        for fn, f in HF.FIGUREN.items():
+            if f.get('triolen'):
+                continue
+            t4 = f['takt'][:4]
+            pkt = 0.0
+            for k in range(4):
+                fd = t4[k] is not None
+                pkt += 2.0 if fd == da_k[k] else 0.0
+                if fd and da_k[k]:
+                    fa = t4[k][0]
+                    pkt += 1.0 if fa == art_k[k] or (fa in 'BC' and art_k[k] in 'BC') else (0.5 if fa in 'BCD' and art_k[k] in 'BCD' else 0.0)
+            if beste is None or pkt > beste[0]:
+                beste = (pkt, fn)
+        figur = beste[1]
+        if os.environ.get('HIELTECH_HH_FIGUR') in HF.FIGUREN:        # nur für Tests: Figur vorgeben
+            figur = os.environ['HIELTECH_HH_FIGUR']
+            if os.environ.get('HIELTECH_HH_ALLE_STELLEN'):
+                da_k = [bool(HF.FIGUREN[figur]['takt'][k] is not None and pegel_k[k] > -24) for k in range(4)]
+        t4 = HF.FIGUREN[figur]['takt'][:4]
+        # Gespielt wird, was im Song gehört wurde; die Figur legt die Spielweise je Stelle fest (wo sie nichts sagt: gemessen)
+        fig_art = {k: (t4[k][0] if t4[k] is not None else art_k[k]) for k in range(4) if da_k[k]}
+        fig_len = {k: mess[k] for k in range(4)}
+        auswahl = json.load(open(os.path.join(samples, 'sfs', 'hihat_plan_auswahl.json'), encoding='utf-8'))['gruppen']
+        for g_, liste in auswahl.items():
+            fig_klaenge[g_[0]] = [os.path.basename(p_).split('_')[-1].split('.')[0] for p_ in liste]   # z. B. Nr0426-287
+        neu_st = {}
+        for k in fig_art:
+            neu_st[k] = stellen.get(k) or [i for i in range(len(R)) if aktiv[i] and lv[i, k] > gmax - 40]
+        stellen = {k: v for k, v in neu_st.items() if v}
+        fig_info = dict(figur=figur, name=HF.FIGUREN[figur]['name'], punkte=beste[0], von=12,
+                        gemessen=[dict(stelle=k, pegel_db=round(float(pegel_k[k]), 1), lang_ms=int(mess[k]), spielweise=art_k[k],
+                                       gespielt=da_k[k]) for k in range(4)])
+        melde(f"… Hi-Hat-Katalog: Figur „{HF.FIGUREN[figur]['name']}“ ({beste[0]:.0f}/12 Punkte)")
+    except Exception as e_:  # noqa: BLE001 – ohne Katalog wie bisher
+        figur = None
+        fig_info = dict(fehler=str(e_)[:200])
     ks = sorted(stellen)
     kette = json.load(open(os.path.join(samples, 'sfs', 'hihat_kette.json'), encoding='utf-8'))
     KH = _mono(os.path.join(samples, 'sfs', 'hihat_kette_getrennt_hh.flac'))
@@ -433,7 +574,12 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
 
         def ab(p):
             return float(np.sqrt(np.mean((hull(KH, p['pk']) - Hk) ** 2))) + 0.3 * float(np.sqrt(np.mean((_hh_merk(KH, max(0, p['pk'] - int(.004 * SR)), W) - F) ** 2)))
-        kand = sorted(((ab(p), p['name'], p['kat'], p['quelle']) for p in kette))
+        kette_k = kette
+        if figur is not None and k in fig_art:
+            # 25. Nov 2026 (Katalog-Plan): nur die vom Inhaber ausgewählten Klänge der erkannten Spielweise
+            ids = fig_klaenge.get(fig_art[k], [])
+            kette_k = [p for p in kette if any(i_ in p['name'] for i_ in ids)] or kette
+        kand = sorted(((ab(p), p['name'], p['kat'], p['quelle']) for p in kette_k))
         ziel = np.array([beats[i] + (beats[i + 1] - beats[i]) * k / 4 for i in idx]); ist = np.array([R[i][k][0] for i in idx])
         takt = {}
         for b in range(4):
@@ -445,18 +591,43 @@ def hihat_hoermodell(song, hh53, hhds, per, andere, samples, melde=print):
                          pegel_je_zaehlzeit=takt, pegel=float(np.median(list(takt.values()))),
                          timing_ms=float(np.median(ist - ziel) / SR * 1000), streuung_ms=float(np.std(ist - ziel) / SR * 1000),
                          anzahl=len(idx))
+        if figur is not None and fig_art.get(k) in ('B', 'C'):
+            muster[k]['fuss_ms'] = int(max(80, fig_len[k]))     # 26. Nov: der Fuß stoppt nach der gemessenen Länge
+    # 26. Nov 2026: feste Klänge + Reihenfolge je Stil (hihat_figuren.FESTE_KLAENGE, vom Inhaber an Rise Up bestätigt)
+    try:
+        import hihat_figuren as HF
+        fest = HF.FESTE_KLAENGE.get(figur) if figur is not None else None
+        if fest and muster:
+            rang = sorted(muster, key=lambda k_: -muster[k_]['pegel'])
+            for r_, k_ in enumerate(rang, 1):
+                ids = fest.get(r_) or fest[max(fest)]
+                neu = []
+                for i_ in ids:
+                    p_ = next((p for p in kette if i_ in p['name']), None)
+                    if p_ is not None:
+                        neu.append(dict(name=p_['name'], kat=p_['kat'], quelle=p_['quelle'], abstand=0.0))
+                if neu:
+                    muster[k_]['klang'] = neu
+                    muster[k_]['fest_rang'] = r_
+            if fig_info is not None:
+                fig_info['feste_klaenge'] = True
+    except Exception:  # noqa: BLE001
+        pass
     plan = []
     for i in range(len(R)):
         if not aktiv[i]:
             continue
         for k in ks:
             m = muster[k]; ziel = beats[i] + (beats[i + 1] - beats[i]) * k / 4 + m['timing_ms'] / 1000 * SR
-            eig = float(np.clip(R[i][k][0] - ziel, -.010 * SR, .010 * SR)) if lv[i, k] > gmax - 30 and not stoert(R[i][k][0]) else 0.0
+            eig = float(np.clip(R[i][k][0] - ziel, -HH_FOLGE_MS / 1000 * SR, HH_FOLGE_MS / 1000 * SR)) if lv[i, k] > gmax - 30 and not stoert(R[i][k][0]) else 0.0
             pz = m['pegel_je_zaehlzeit'].get(i % 4, m['pegel'])
             dl = float(np.clip(lv[i, k] - gmax - pz, -1.5, 1.5)) if lv[i, k] > gmax - 30 and not stoert(R[i][k][0]) else 0.0
-            plan.append(dict(t=int(ziel + 0.8 * eig), stelle=int(k), pegel=pz + dl))
+            plan.append(dict(t=int(ziel + HH_FOLGE_ANTEIL * eig), stelle=int(k), pegel=pz + dl))
     return dict(muster={str(k): v for k, v in muster.items()}, plan=plan, tempo=float(np.atleast_1d(tempo)[0]),
-                raster=raster_info, beats=[int(b) for b in beats], stellen_53er_db=[round(float(v), 1) for v in s53])
+                raster=raster_info, beats=[int(b) for b in beats], stellen_53er_db=[round(float(v), 1) for v in s53],
+                katalog=fig_info, zaehlung=zaehlung, hh_53er_luecken_s=hh_luecken,
+                tamburin=None if TB is None else dict(stellen_tamburin_minus_hihat_db=[round(float(v), 1) for v in tb_db],
+                                                      als_tamburin_weggelassen=tamb_stellen))
 
 
 def _hh_spielen(HP, ref_pegel, n, korr=None):
@@ -479,6 +650,9 @@ def _hh_spielen(HP, ref_pegel, n, korr=None):
         P_ = proben[str(p['stelle'])]; z = zaehl.get(p['stelle'], 0); zaehl[p['stelle']] = z + 1
         smp = P_[z % len(P_)]; st_ = max(0, p['t'] - smp['spitze']); g = 10 ** ((p['pegel'] + off + korr.get(str(p['stelle']), 0.0)) / 20)
         ende = (plan_[j_ + 1]['t'] - st_ + int(.01 * SR)) if j_ + 1 < len(plan_) else len(smp['x'])   # nächster Schlag schließt
+        fm = MU[str(p['stelle'])].get('fuss_ms')
+        if fm:                                                  # 26. Nov: halb offen – der Fuß stoppt nach gemessener Länge
+            ende = min(ende, smp['spitze'] + int(fm / 1000 * SR))
         x_ = smp['x'][:max(1, ende)].copy() * g; f_ = min(len(x_), int(.012 * SR)); x_[-f_:] *= np.linspace(1, 0, f_)[:, None]
         y[st_:st_ + len(x_)] += x_
         schlaege.append((int(st_), float(20 * np.log10(g + 1e-12)), smp['name'],
@@ -542,6 +716,104 @@ def _an_original(hits, wahl, orig, teil, ber, min_ms=10, max_ms=45):
     return neu
 
 
+def _beats_glatt(beats, halb=4):
+    """28. Nov 2026: die Beat-Erkennung wackelt von Schlag zu Schlag (Money: ±15 ms), der Schlagzeuger nicht.
+    Jeder Beat wird auf eine gerade Linie durch seine 9 Nachbarn gelegt – Tempo-Änderungen bleiben, das Wackeln geht."""
+    b = np.asarray(beats, float)
+    # 28. Nov 2026 (Money, Inhaber: Hi-Hat am Anfang nicht gleichmäßig): am Song-Anfang/-Ende verliert die Beat-Erkennung
+    # das Tempo (Money 0:00–0:06: 78 statt 72,8 BPM). Beats, deren Abstand mehr als 4 %
+    # vom Tempo des Songs abweicht (kürzer als 24 Beats), sind unsicher; sie werden aus den sicheren Beats weitergezählt.
+    d = np.diff(b)
+    if len(d) >= 12:
+        q_ = float(np.median(d)); ab_ = np.abs(d / q_ - 1) > 0.04
+        # nur kurze Abweichungen (< 24 Beats) sind Fehler der Erkennung; längere sind ein echter Tempowechsel
+        gr_ = np.flatnonzero(np.diff(np.r_[0, ab_.astype(np.int8), 0])); gut_d = np.ones(len(d), bool)
+        for a_, e_ in zip(gr_[::2], gr_[1::2]):
+            if e_ - a_ < 24:
+                gut_d[a_:e_] = False
+        # Abschnitte mit sicheren Abständen; ein kurzer Abschnitt (< 16 Beats) zwischen/neben Fehlern ist meist um einen
+        # halben Beat verrutscht (Money: 639 + 592 ms statt 2 × 824) – er wird mit dem langen Abschnitt weitergezählt
+        gr_ = np.flatnonzero(np.diff(np.r_[0, gut_d.astype(np.int8), 0]))
+        lang = np.zeros(len(b), bool)
+        for a_, e_ in zip(gr_[::2], gr_[1::2]):         # Intervalle a_..e_-1 → Beats a_..e_
+            if e_ - a_ >= 16:
+                lang[a_:e_ + 1] = True
+        g = np.flatnonzero(lang)
+        if len(g) >= 8 and len(g) < len(b):
+            for j in np.flatnonzero(~lang):
+                nb = g[np.argsort(np.abs(g - j))[:8]]           # die 8 nächsten sicheren Beats
+                k_, c_ = np.polyfit(nb, b[nb], 1)
+                b[j] = k_ * j + c_
+    out = b.copy(); i_ = np.arange(len(b))
+    for j in range(len(b)):
+        a, e = max(0, j - halb), min(len(b), j + halb + 1)
+        k, d = np.polyfit(i_[a:e], b[a:e], 1)
+        out[j] = k * j + d
+    out = out[out >= 0]                                  # weitergezählte Beats vor dem Song-Anfang weglassen
+    return np.round(out).astype(np.asarray(beats).dtype)
+
+
+def _anschlag_versatz(neu, orig, lo, hi):
+    """Anschlag (50 % der Hülle) der neuen Spur minus Original, nur an klaren Schlägen beider Spuren."""
+    import scipy.signal as sg
+    n = min(len(neu), len(orig))
+    def E(x):
+        x = sg.sosfiltfilt(sg.butter(4, [lo, hi], 'band', fs=SR, output='sos'), x[:n]); h = int(.001 * SR)
+        return np.convolve(np.abs(x), np.ones(h) / h, 'same')
+    en, eo = E(neu), E(orig)
+    pk, _ = sg.find_peaks(en, height=en.max() * 0.05, distance=int(.08 * SR))
+    w = int(.03 * SR); d = []
+    for p in pk:
+        a = max(0, p - w); so, sn = eo[a:p + w], en[a:p + w]
+        if not len(so) or so.max() < eo.max() * 0.05:
+            continue
+        d.append((int(np.argmax(sn > sn.max() * .5)) - int(np.argmax(so > so.max() * .5))) / SR * 1000)
+    if len(d) < 8:
+        return None
+    d = np.array(d)
+    return dict(median_ms=round(float(np.median(d)), 1), streuung_ms=round(float(np.std(d)), 1), schlaege=len(d))
+
+
+def _kick_grundmuster(kh, kick_orig, congas, song, ber, anteil=0.35, laut_db=-6.0, congas_db=-30.0):
+    """28. Nov 2026 (Plan Stufe 2, Money): ein Reggae-Schlagzeuger wiederholt sein Kick-Muster. Die Kicks werden auf
+    8 Stellen je 4 Schläge des Songs gelegt; Stellen mit mindestens 35 % der Kicks der stärksten Stelle sind das Grundmuster.
+    Eine Kick außerhalb des Musters bleibt nur, wenn sie laut ist (höchstens 6 dB unter den lauten Kicks) UND dort keine
+    Hand-Trommel tief klingt (Congas/Djembe mindestens 30 dB leiser) – z. B. die Kick am Anfang einer Phrase.
+    Leise Kicks außerhalb des Musters mit Djembe/Congas daneben sind Trennreste und werden nicht gespielt."""
+    if song is None or len(kh) < 16:
+        return kh
+    try:
+        import scipy.signal as sg
+        _, bt = librosa.beat.beat_track(y=song, sr=SR, units='samples', hop_length=256)
+        bt = np.asarray(bt, float)
+        if len(bt) < 16:
+            return kh
+        lp = lambda x: sg.sosfiltfilt(sg.butter(4, [40, 150], 'band', fs=SR, output='sos'), x)
+        kl = lp(kick_orig); cl = lp(congas) if congas is not None else None
+        sp = lambda x, s: 20 * np.log10(np.abs(x[max(0, s - 200):s + int(.05 * SR)]).max() + 1e-9)
+        st = np.array([h[0] for h in kh], float)
+        ph = np.round((np.interp(st, bt, np.arange(len(bt))) % 4) * 2).astype(int) % 8
+        zahl = np.bincount(ph, minlength=8)
+        muster = [int(i) for i in np.where(zahl >= anteil * zahl.max())[0]]
+        if not muster:
+            return kh
+        lv = np.array([sp(kl, int(s)) for s in st]); ref = float(np.percentile(lv, 90))
+        neu, raus = [], []
+        for h, p_, l_ in zip(kh, ph, lv):
+            if p_ in muster:
+                neu.append(h); continue
+            c_ = sp(cl, int(h[0])) - l_ if cl is not None else -99.0
+            if l_ >= ref + laut_db and c_ <= congas_db:
+                neu.append(h)
+            else:
+                raus.append(round(h[0] / SR, 2))
+        ber['kick_grundmuster'] = dict(stellen=muster, je_stelle=[int(z) for z in zahl], raus=len(raus), zeiten_raus=raus)
+        return neu
+    except Exception as e:  # noqa: BLE001
+        ber['kick_grundmuster'] = dict(fehler=str(e)[:200])
+        return kh
+
+
 def _wackeln_reparieren(hits, beats, teil, ber, grenze_ms=15, min_je_stelle=4):
     """23. Nov 2026 (freigegeben, Checkbox „Timing korrigieren“): nur Wackeln reparieren, Gefühl behalten.
     Raster = Viertel des Songs (nach Tempo-Prüfung) in 4 Stellen (1, e, &, a). Je Stelle der eigene typische Versatz
@@ -581,9 +853,22 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             hits = _an_original(hits, wahl, orig, teil, ber)
         if teil in ('kick', 'snare') and timing_raster is not None:     # Toms nicht (Fills, Triolen, Wirbel)
             hits = _wackeln_reparieren(hits, timing_raster, teil, ber)
+        if teil == 'snare' and gespielt.get('kick'):
+            # 26. Nov 2026 (Zion Callin, Inhaber): Kick + Rim/Snare auf DEMSELBEN Schlag (One Drop) liegen im Original genau
+            # zusammen; durch Trennung/Erzeugung lagen sie 5–10 ms auseinander → klang wie ein Doppelschlag. Liegt eine
+            # Snare näher als 25 ms an einer gespielten Kick, kommt sie genau auf die Kick.
+            kz = np.array(sorted(k_[0] for k_ in gespielt['kick']))
+            neu_h, zus = [], 0
+            for (s_, lv_) in hits:
+                j_ = int(np.argmin(np.abs(kz - s_))) if len(kz) else -1
+                if j_ >= 0 and 0 < abs(kz[j_] - s_) < 0.025 * SR:
+                    s_ = int(kz[j_]); zus += 1
+                neu_h.append((s_, lv_))
+            hits = neu_h
+            ber['snare_auf_kick'] = zus
         for i, (s, lv) in enumerate(hits):
             smp = wahl[i]
-            if smp is None:
+            if smp is None or s < 0 or s >= len(y):            # 26. Nov (mix0): Schlag hinter dem Song-Ende → überspringen
                 continue
             if teil:
                 gespielt.setdefault(teil, []).append((int(s), float(lv), smp))   # 23. Nov: fürs MIDI (genau was klingt)
@@ -599,7 +884,7 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             if stopp and stopp[i]:
                 L = min(len(x_), stopp[i]); f_ = int(.06 * SR); x_ = x_[:L].copy()
                 x_[max(0, L - f_):] *= np.linspace(1, 0, min(f_, L))[:, None]
-            y[s:s + len(x_)] += x_
+            y[s:s + len(x_)] += x_[:len(y) - s]
         return y[:n]
     # Kick
     melde('… Schlag für Schlag: Kick, Snare, Toms')
@@ -612,22 +897,105 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
         except Exception:
             timing_raster = None
     kh = _schlaege(gm['kick'])
+    kh = _kick_grundmuster(kh, ost('kick'), _mono(s53['congas'], n) if s53.get('congas') and os.path.isfile(s53['congas']) else None,
+                           _mono(song_pfad, n) if song_pfad and os.path.isfile(song_pfad) else None, ber)
     spuren['kick'] = setze(kh, _gruppen_wahl(LIB, ber, 'kick', 'kick', kh, ost('kick'), max_gr=1, tonw=1.0, k_trommel=1), orig=ost('kick'), teil='kick')
     # Snare: EINE Haupt-Snare, hohe Snare nur an G-Stellen
     sh = _schlaege(gm['snare'])
+    # 26. Nov 2026 (Prüf-Sammlung, Plan Stufe 2): One Drop selbst erkennen. Liegt in der Snare-Spur an den Kick-Schlägen
+    # ein klarer Anschlag (1–5 kHz höchstens 25 dB unter dem Kick-Bauch; Money −17, Zion −11, Songs ohne: −45…−52 dB),
+    # spielt der Schlagzeuger Rim/Snare GENAU mit der Kick. Dann bekommt jeder solche Kick-Schlag seinen Rim/Snare-Schlag,
+    # auch wenn die Trennung ihn verloren oder als Trommel aussortiert hat.
+    try:
+        import scipy.signal as sg
+        sn_r = ost('snare'); kk_r = ost('kick')
+        bnd = lambda x_, lo, hi: sg.sosfiltfilt(sg.butter(4, [lo, hi], 'band', fs=SR, output='sos'), x_)
+        s_hi, k_lo = bnd(sn_r, 1000, 5000), bnd(kk_r, 40, 120)
+        def _sp(x_, i_):
+            w_ = x_[max(0, i_ - 200):i_ + int(.03 * SR)]
+            return 20 * np.log10(np.abs(w_).max() + 1e-9) if len(w_) else -120.0
+        verh = [(s_, _sp(s_hi, s_) - _sp(k_lo, s_)) for s_, _ in kh]
+        med = float(np.median([v_ for _, v_ in verh])) if verh else -99.0
+        od = dict(snare_an_kick_db=round(med, 1), one_drop=bool(med > -25))
+        if od['one_drop']:
+            st_ = np.array([x_[0] for x_ in sh]) if sh else np.zeros(0)
+            neu_ = 0
+            ref_s = float(np.percentile([l_ for _, l_ in sh], 90)) if sh else -20.0
+            for s_, v_ in verh:
+                if v_ > -25 and (not len(st_) or np.min(np.abs(st_ - s_)) > 0.025 * SR):
+                    lv_ = _sp(sn_r, s_)                     # gleiche Einheit wie _schlaege (dB der Spur)
+                    sh.append([int(s_), float(min(ref_s, lv_))]); neu_ += 1
+            sh.sort(key=lambda h_: h_[0])
+            od['dazu'] = neu_
+        ber['one_drop'] = od
+    except Exception as e_:  # noqa: BLE001
+        ber['one_drop'] = dict(fehler=str(e_)[:200])
     hz = np.array(fb.get('snare_hoch_zeiten') or []) * SR
     ist_hoch = [bool(len(hz)) and np.min(np.abs(hz - s)) < 0.04 * SR for s, _ in sh]
     wahl_s = [None] * len(sh)
-    for name_, sel, nur_ in (('snare_haupt', [i for i in range(len(sh)) if not ist_hoch[i]], ['Snare/1_Normal']),
-                             ('snare_hoch', [i for i in range(len(sh)) if ist_hoch[i]], ['Snare/4_Hohe', 'Snare/2_Hell'])):
+    # 26. Nov 2026 (Inhaber, Zion/Money): für den durchgehenden Grundschlag nur echte Einzelschläge (per Gehör bestätigt,
+    # sfs/standard_klaenge.json) – oder Rim/Cross-Stick. Was dem Original-Schlag im Klang näher ist, gewinnt.
+    try:
+        std_ = json.load(open(os.path.join(samples, 'sfs', 'standard_klaenge.json'), encoding='utf-8'))
+    except (OSError, ValueError):
+        std_ = None
+    LIB_g = LIB
+    nur_g = ['Snare/1_Normal']
+    if std_:
+        wl_ = std_.get('snare_grundschlag') or []
+        rl_ = std_.get('rim_grundschlag')
+        LIB_g = [x_ for x_ in LIB if any(w_ in x_['name'] or w_ in x_['quelle'] for w_ in wl_)
+                 or (x_['kat'].startswith('Rim/') and (rl_ is None or any(w_ in x_['name'] for w_ in rl_)))]
+        nur_g = ['Snare/', 'Rim/']
+    for name_, sel, nur_, lib_ in (('snare_haupt', [i for i in range(len(sh)) if not ist_hoch[i]], nur_g, LIB_g),
+                                   ('snare_hoch', [i for i in range(len(sh)) if ist_hoch[i]], ['Snare/4_Hohe', 'Snare/2_Hell'], LIB)):
         if not sel:
             continue
-        w_ = _gruppen_wahl(LIB, ber, name_, 'snare', [sh[i] for i in sel], ost('snare'), max_gr=1, k_trommel=1, nur=nur_)
+        w_ = _gruppen_wahl(lib_, ber, name_, 'snare', [sh[i] for i in sel], ost('snare'), max_gr=1, k_trommel=1, nur=nur_)
+        if name_ == 'snare_haupt' and (ber.get('one_drop') or {}).get('one_drop'):
+            # 26. Nov 2026: beim One Drop (Kick + Schlag genau zusammen) ist es meist der Rim (Money, Zion) – Rim gewinnt,
+            # wenn er im Klang höchstens 25 % weiter weg ist als die beste Snare
+            try:
+                b_tmp = {}
+                w_r = _gruppen_wahl([x_ for x_ in lib_ if x_['kat'].startswith('Rim/')], b_tmp, name_, 'snare',
+                                    [sh[i] for i in sel], ost('snare'), max_gr=1, k_trommel=1, nur=['Rim/'])
+                a_s = (ber.get(name_) or {}).get('gruppe_1', {}).get('abstand')
+                a_r = (b_tmp.get(name_) or {}).get('gruppe_1', {}).get('abstand')
+                ber['one_drop']['abstand_snare_rim'] = [a_s, a_r]
+                if a_s is not None and a_r is not None and a_r <= 1.25 * a_s and any(w_r):
+                    w_ = w_r; ber[name_] = b_tmp[name_]; ber['one_drop']['rim_gewaehlt'] = True
+            except Exception as e_:  # noqa: BLE001
+                ber['one_drop']['rim_fehler'] = str(e_)[:200]
         for i, x_ in zip(sel, w_):
             wahl_s[i] = x_
     spuren['snare'] = setze(sh, wahl_s, orig=ost('snare'), teil='snare')
     # Toms
     th = _schlaege(gm['toms'])
+    # 26. Nov 2026 (Plan Stufe 1, Prüf-Sammlung): ein Tom-Schlag zählt nur, wenn BEIDE Trennungen ihn klar hören
+    # (DrumSep-Tom ≥ −20 dB und 53er-Tom ≥ −30 dB unter der Schlagzeug-Spitze) und die Hand-Trommeln dort nicht
+    # deutlich lauter sind. Echte Toms (Rise Up, Zion): −5…−10 dB; Reste (Stand The Ghetto, mix0): −45…−70 dB.
+    if th and s53.get('toms') and os.path.isfile(s53['toms']):
+        try:
+            dr_ = _mono(eingabe, n); t5_ = _mono(s53['toms'], n); ds_ = ost('toms')
+            tr_ = np.zeros(n, np.float32)
+            for k_ in ('congas', 'percussion'):
+                if s53.get(k_) and os.path.isfile(s53[k_]):
+                    tr_ = tr_ + _mono(s53[k_], n)
+            def _pdb(x_, i_):
+                w_ = x_[max(0, i_ - int(.01 * SR)):i_ + int(.08 * SR)]
+                return 20 * np.log10(np.sqrt(np.mean(w_ ** 2)) + 1e-9) if len(w_) else -120.0
+            ref_ = float(np.percentile([_pdb(dr_, i_) for i_ in range(0, max(1, n - SR), SR // 8)], 99))
+            behalten, raus_ = [], []
+            for (s_, lv_) in th:
+                a_, b_, c_ = _pdb(ds_, s_) - ref_, _pdb(t5_, s_) - ref_, _pdb(tr_, s_) - ref_
+                if a_ >= -20 and b_ >= -30 and c_ - max(a_, b_) < 6:
+                    behalten.append((s_, lv_))
+                else:
+                    raus_.append(round(s_ / SR, 2))
+            ber['toms_bestaetigt'] = dict(vorher=len(th), behalten=len(behalten), raus_s=raus_[:60])
+            th = behalten
+        except Exception as e_:  # noqa: BLE001
+            ber['toms_bestaetigt'] = dict(fehler=str(e_)[:200])
     spuren['toms'] = setze(th, _toms_wahl(LIB, ber, th, ost('toms')), orig=ost('toms'), teil='toms') if th else np.zeros((n, 2), np.float32)
     # Becken (vorerst wie G: Art aus G, aber voll ausklingend, Lautstärke über den Ausklang)
     melde('… Schlag für Schlag: Becken (voll ausklingend)')
@@ -695,7 +1063,9 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
     song_hm = song if song is not None else _mono(eingabe, n)
     q53 = _mono(s53['hh'], n) if s53.get('hh') and os.path.isfile(s53['hh']) else ost('hihat')
     per = _mono(s53['percussion'], n) if s53.get('percussion') and os.path.isfile(s53['percussion']) else np.zeros(n, np.float32)
-    HP = hihat_hoermodell(song_hm, q53, ost('hihat'), per, andere, samples, melde)
+    tamb = _mono(s53['tambourine'], n) if s53.get('tambourine') and os.path.isfile(s53['tambourine']) and \
+        s53.get('hh') and os.path.isfile(s53['hh']) else None       # 25. Nov: Tamburin nur mit echter 53er-Hi-Hat
+    HP = hihat_hoermodell(song_hm, q53, ost('hihat'), per, andere, samples, melde, tamb=tamb, kick=[s for s, _ in kh])
     hh_y, hh_info = _hh_spielen(HP, ref90, n)
     korr = {}
     if trennen_fn is not None and HP['plan']:             # Selbstprüfung: Ausschnitt trennen, Pegel je Stelle angleichen
@@ -718,6 +1088,35 @@ def ausfuehren(G, teile_roh, s53, song_pfad, eingabe, rep_ber, fb, samples, tren
             melde(f'… Hi-Hat-Selbstprüfung übersprungen ({str(e)[:120]})')
     spuren['hihat'] = hh_y
     gespielt['hihat'] = hh_info.pop('_schlaege', [])
+    # 28. Nov 2026 (Money, Inhaber: „Timing stimmt an manchen Stellen nicht“): jede Spur wird nachgehört. Der Anschlag
+    # (50 % der Hülle) jedes klaren Schlags wird mit dem Original verglichen; der typische Versatz (Median, kommt vom
+    # Anschlag der Aufnahme, nicht vom Schlagzeuger) wird für die ganze Spur ausgeglichen.
+    try:
+        ref_ = dict(kick=(ost('kick'), 40, 150), snare=(ost('snare'), 1000, 5000), hihat=(q53, 6000, 14000))
+        vs_ = {}
+        for t_, (o_, lo_, hi_) in ref_.items():
+            if t_ not in spuren:
+                continue
+            d_ = _anschlag_versatz(spuren[t_].mean(1), o_, lo_, hi_)
+            if t_ == 'snare' and d_ is not None and ber.get('snare_auf_kick', 0) >= 0.3 * max(1, len(gespielt.get('snare', []))):
+                # Kick + Rim/Snare auf demselben Schlag bleiben GENAU zusammen (Inhaber, Zion: sonst Doppelschlag) –
+                # die Snare bekommt dann denselben Ausgleich wie die Kick
+                d_ = dict(d_, median_ms=(vs_.get('kick') or {}).get('median_ms', 0.0), wie_kick=True)
+            vs_[t_] = d_
+            if d_ is not None and 2.0 <= abs(d_['median_ms']) <= 25.0:
+                sh_ = -int(round(d_['median_ms'] / 1000 * SR))
+                y_ = np.zeros_like(spuren[t_])
+                if sh_ < 0:
+                    y_[:sh_] = spuren[t_][-sh_:]
+                else:
+                    y_[sh_:] = spuren[t_][:len(y_) - sh_]
+                spuren[t_] = y_
+                gespielt[t_] = [(int(g_[0]) + sh_,) + tuple(g_[1:]) for g_ in gespielt.get(t_, [])]
+                d_['ausgeglichen_ms'] = round(-sh_ / SR * 1000, 1)
+        ber['timing_selbstpruefung'] = vs_
+    except Exception as e_:  # noqa: BLE001
+        ber['timing_selbstpruefung'] = dict(fehler=str(e_)[:200])
     ber['_gespielt'] = gespielt          # 23. Nov: genau die gespielten Schläge -> MIDI (wird vor dem Bericht entfernt)
-    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'), raster=HP.get('raster'))
+    ber['hihat'] = dict(muster=hh_info, korrektur_db=korr, tempo=round(HP['tempo'], 1), schlaege=len(HP['plan']), stellen_53er_db=HP.get('stellen_53er_db'), raster=HP.get('raster'), tamburin=HP.get('tamburin'), katalog=HP.get('katalog'), zaehlung=HP.get('zaehlung'),
+                       hh_53er_luecken_s=HP.get('hh_53er_luecken_s'))
     return spuren, ber
